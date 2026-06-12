@@ -1,3 +1,8 @@
 node_modules/
 dist/
 .lore/
+
+# local dev config & OS junk
+.DS_Store
+.claude/
+eval/results-*.json
