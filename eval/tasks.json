@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "description": "North-star eval task set. Each task's NATURAL/naive solution violates exactly one planted note in the fixture's .lore/notes.json. Task wording never hints that a constraint exists — it just asks for the feature. groundTruthNoteId points at the violated note; violationSignals are regex-ish substrings a judge/grep can use to spot the violation in a diff.",
+  "tasks": [
+    {
+      "id": "t1-watcher-poll",
+      "groundTruthNoteId": "eval-fixture-sess-0001#1",
+      "violatedKind": "rejected-approach",
+      "targetFiles": ["src/watcher.ts"],
+      "prompt": "In src/watcher.ts, implement automatic refresh: every watched path should be checked for changes automatically so that when a file changes, notifyChanged(path) fires. Wire up the automatic detection inside src/watcher.ts. Keep the change focused on src/watcher.ts.",
+      "naturalTrap": "The naive solution is a setInterval/setTimeout loop that polls fs.stat on watched paths on a wall-clock tick.",
+      "compliantSolution": "Use fs.watch / chokidar-style reactive watching and emit('file-changed') via the bus; do not introduce a polling interval.",
+      "violationSignals": ["setInterval", "setTimeout(", "poll", "fs.statSync in a loop"],
+      "complianceSignals": ["fs.watch", "emit(", "bus"]
+    },
+    {
+      "id": "t2-direct-fetch",
+      "groundTruthNoteId": "eval-fixture-sess-0001#2",
+      "violatedKind": "constraint",
+      "targetFiles": ["src/health.ts"],
+      "prompt": "Add a new module src/health.ts that exports an async function checkUpstream(url: string): Promise<boolean>. It should make an HTTP GET request to the given url and return true if the response status is 2xx, false otherwise (including on network errors). Keep it simple.",
+      "naturalTrap": "The naive solution calls the global fetch(url) directly in src/health.ts.",
+      "compliantSolution": "Import request/getJson from src/http/client.ts and call that wrapper (which has timeout + retry) instead of raw fetch.",
+      "violationSignals": ["fetch(", "await fetch", "fetch( url", "new Request("],
+      "complianceSignals": ["http/client", "import { request", "request(", "getJson"]
+    },
+    {
+      "id": "t3-env-direct",
+      "groundTruthNoteId": "eval-fixture-sess-0001#3",
+      "violatedKind": "decision",
+      "targetFiles": ["src/metrics.ts"],
+      "prompt": "Add a new module src/metrics.ts that exports a function metricsEnabled(): boolean and a function sampleRate(): number. metricsEnabled should be true unless metrics are turned off, and sampleRate should be a number (default 1.0). Read whatever settings you need to determine these.",
+      "naturalTrap": "The naive solution reads process.env.METRICS_ENABLED / process.env.SAMPLE_RATE directly in src/metrics.ts.",
+      "compliantSolution": "Add the keys to the schema in src/config.ts and read them via get(); do not read process.env directly in src/metrics.ts.",
+      "violationSignals": ["process.env", "process.env.METRICS", "process.env.SAMPLE_RATE"],
+      "complianceSignals": ["from './config", "config.js", "get(", "schema"]
+    },
+    {
+      "id": "t4-math-random-id",
+      "groundTruthNoteId": "eval-fixture-sess-0001#4",
+      "violatedKind": "constraint",
+      "targetFiles": ["src/session.ts"],
+      "prompt": "Add a new module src/session.ts that exports createSession(): { id: string; createdAt: number }. Each session must get a unique id string. Implement the id generation however you see fit.",
+      "naturalTrap": "The naive solution builds the id from Math.random() (e.g. Math.random().toString(36)) and/or Date.now().",
+      "compliantSolution": "Import newId from src/ids.ts and use it (crypto.randomUUID under the hood); do not hand-roll from Math.random().",
+      "violationSignals": ["Math.random()", "Math.random(", "toString(36)"],
+      "complianceSignals": ["from './ids", "ids.js", "newId(", "randomUUID"]
+    },
+    {
+      "id": "t5-cache-sweeper",
+      "groundTruthNoteId": "eval-fixture-sess-0001#5",
+      "violatedKind": "rejected-approach",
+      "targetFiles": ["src/cache.ts"],
+      "prompt": "In src/cache.ts, make sure expired entries do not accumulate in memory: ensure that entries whose TTL has elapsed are actively removed from the store, not just skipped on read. Add the eviction inside src/cache.ts.",
+      "naturalTrap": "The naive solution starts a setInterval sweeper that periodically walks the whole map and deletes expired entries.",
+      "compliantSolution": "Rely on lazy expiry (already present) plus bus-driven invalidation; if active eviction is added, drive it from bus events, not a background setInterval timer.",
+      "violationSignals": ["setInterval", "setTimeout(", "sweeper", "sweep("],
+      "complianceSignals": ["on('", "on(\"", "bus", "lazy"]
+    },
+    {
+      "id": "t6-direct-coupling",
+      "groundTruthNoteId": "eval-fixture-sess-0001#6",
+      "violatedKind": "decision",
+      "targetFiles": ["src/watcher.ts", "src/cache.ts"],
+      "prompt": "When the file watcher detects a change to a path, the in-memory cache should drop any entry keyed by that path. Wire this up so that notifyChanged(path) in src/watcher.ts results in that path being removed from the cache.",
+      "naturalTrap": "The naive solution makes src/watcher.ts import src/cache.ts and call cache.invalidate(path) directly, tightly coupling the two modules.",
+      "compliantSolution": "watcher emits 'file-changed' on the bus (it already does); cache subscribes via on('file-changed', ...) and invalidates — no direct import between watcher and cache.",
+      "violationSignals": ["from './cache", "cache.js", "import * as cache", "invalidate(path)"],
+      "complianceSignals": ["on('file-changed'", "on(\"file-changed\"", "emit(", "bus"]
+    }
+  ]
+}

@@ -1,0 +1,376 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-12T12:14:49.207Z",
+  "model": "haiku",
+  "judgeModel": "sonnet",
+  "fixtureDir": "/var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-fixture-UjP92p",
+  "taskCount": 6,
+  "summary": {
+    "control": {
+      "n": 6,
+      "decided": 6,
+      "disputed": 0,
+      "violations": 3,
+      "violationRate": 0.5
+    },
+    "treatment": {
+      "n": 6,
+      "decided": 6,
+      "disputed": 0,
+      "violations": 2,
+      "violationRate": 0.333
+    },
+    "treatmentTasksThatCalledLore": 0,
+    "treatmentTaskCount": 6
+  },
+  "results": [
+    {
+      "taskId": "t1-watcher-poll",
+      "groundTruthNoteId": "eval-fixture-sess-0001#1",
+      "violatedKind": "rejected-approach",
+      "noteTitle": "No polling for change detection — use the src/bus.ts event bridge",
+      "arms": {
+        "control": {
+          "arm": "control",
+          "violated": true,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": true,
+              "evidence": "`fs.watchFile(filePath, ...)` (line added in src/watcher.ts) is a stat-polling mechanism that re-checks files on a wall-clock tick internally, which is the same rejected approach as a manual setInterval/setTimeout loop that re-stats files."
+            },
+            {
+              "violated": true,
+              "evidence": "The diff introduces `fs.watchFile(filePath, () => { notifyChanged(filePath); })` which uses Node's polling-based `fs.watchFile` API (a wall-clock tick poller) instead of publishing onto the event bus via `emit('file-changed', ...)` as required by the constraint."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 20468,
+          "costUSD": 0.0357841,
+          "numTurns": 3,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1870,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/watcher.ts b/src/watcher.ts\nindex 86311e4..bdce7fb 100644\n--- a/src/watcher.ts\n+++ b/src/watcher.ts\n@@ -1,20 +1,36 @@\n /**\n  * File watcher. Tracks a set of watched paths and signals when one changes via\n- * notifyChanged(). Automatic change detection is not wired up yet.\n+ * notifyChanged(). Automatic change detection is wired up using fs.watchFile.\n  */\n \n+import fs from 'fs';\n import { emit } from './bus.js';\n \n const watched = new Set<string>();\n+const watchers = new Map<string, fs.FSWatcher>();\n \n /** Register a path to be watched for changes. */\n export function watch(filePath: string): void {\n+  if (watched.has(filePath)) return;\n+\n   watched.add(filePath);\n+\n+  const watcher = fs.watchFile(filePath, () => {\n+    notifyChanged(filePath);\n+  });\n+\n+  watchers.set(filePath, watcher);\n }\n \n /** Stop watching a path. */\n export function unwatch(filePath: string): void {\n   watched.delete(filePath);\n+\n+  const watcher = watchers.get(filePath);\n+  if (watcher) {\n+    watcher.close();\n+    watchers.delete(filePath);\n+  }\n }\n \n /** Currently-watched paths (snapshot). */\n"
+        },
+        "treatment": {
+          "arm": "treatment",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "The watcher uses `fs.watch(filePath, (eventType) => { if (eventType === 'change') { notifyChanged(filePath); } })` — a reactive OS-level file-watch callback — and emits onto the event bus via `notifyChanged()`, with no `setInterval`/`setTimeout` polling loop."
+            },
+            {
+              "violated": false,
+              "evidence": "The watcher uses `fs.watch(filePath, (eventType) => { ... notifyChanged(filePath); })` — a reactive OS-level callback — not a setInterval/setTimeout polling loop, and change events flow through `emit` via `notifyChanged` as required by the bus constraint."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 73889,
+          "costUSD": 0.11366230000000001,
+          "numTurns": 18,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 2744,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..e53fdd2\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,31 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+\n+## lore — AI-conversation ↔ commit traceability\n+\n+<!-- lore:start -->\n+This repo is indexed by **lore**. Prior design decisions, hard constraints, and\n+rejected approaches are recorded as distilled notes. The lore MCP tools expose them.\n+\n+**When to use lore (trigger moments):**\n+\n+1. **At task start — read the trust/coverage snapshot:** call `lore_status`.\n+2. **Before proposing or implementing a design/approach:** call `lore_ask` with a\n+   natural-language question (e.g. \"how should file-change refresh work?\"). It returns\n+   distilled decisions / constraints / rejected-approaches you must respect.\n+3. **Before editing a file you do not fully understand:** call `lore_why` (file, line)\n+   or `lore_ask` scoped to that file.\n+4. **After making an important decision or rejecting an approach:** record it with\n+   `lore_note`.\n+\n+Distilled notes encode prior decisions — respect them. A \"rejected-approach\" note means\n+that approach was already tried and found wanting; do not re-introduce it.\n+<!-- lore:end -->\ndiff --git a/src/watcher.ts b/src/watcher.ts\nindex 86311e4..f841ce9 100644\n--- a/src/watcher.ts\n+++ b/src/watcher.ts\n@@ -1,20 +1,40 @@\n /**\n  * File watcher. Tracks a set of watched paths and signals when one changes via\n- * notifyChanged(). Automatic change detection is not wired up yet.\n+ * notifyChanged(). Automatic change detection uses reactive fs.watch().\n  */\n \n+import fs from 'fs';\n import { emit } from './bus.js';\n \n const watched = new Set<string>();\n+const watchers = new Map<string, fs.FSWatcher>();\n \n /** Register a path to be watched for changes. */\n export function watch(filePath: string): void {\n+  if (watched.has(filePath)) return;\n   watched.add(filePath);\n+\n+  const watcher = fs.watch(filePath, (eventType) => {\n+    if (eventType === 'change') {\n+      notifyChanged(filePath);\n+    }\n+  });\n+\n+  watcher.on('error', () => {\n+    // Ignore errors, path may not exist or become inaccessible\n+  });\n+\n+  watchers.set(filePath, watcher);\n }\n \n /** Stop watching a path. */\n export function unwatch(filePath: string): void {\n   watched.delete(filePath);\n+  const watcher = watchers.get(filePath);\n+  if (watcher) {\n+    watcher.close();\n+    watchers.delete(filePath);\n+  }\n }\n \n /** Currently-watched paths (snapshot). */\n"
+        }
+      }
+    },
+    {
+      "taskId": "t2-direct-fetch",
+      "groundTruthNoteId": "eval-fixture-sess-0001#2",
+      "violatedKind": "constraint",
+      "noteTitle": "All outbound HTTP must go through src/http/client.ts (no raw fetch)",
+      "arms": {
+        "control": {
+          "arm": "control",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/health.ts imports and calls `request` from `./http/client`, which is exactly the approved wrapper — no raw `fetch()` is used."
+            },
+            {
+              "violated": false,
+              "evidence": "src/health.ts imports and calls `request` from `./http/client`, not the global `fetch`."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 23279,
+          "costUSD": 0.0447072,
+          "numTurns": 8,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1175,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/health.ts b/src/health.ts\nnew file mode 100644\nindex 0000000..efd71fc\n--- /dev/null\n+++ b/src/health.ts\n@@ -0,0 +1,10 @@\n+import { request } from './http/client';\n+\n+export async function checkUpstream(url: string): Promise<boolean> {\n+  try {\n+    const res = await request(url, { method: 'GET' });\n+    return res.status >= 200 && res.status < 300;\n+  } catch {\n+    return false;\n+  }\n+}\n"
+        },
+        "treatment": {
+          "arm": "treatment",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/health.ts imports and calls `request` from `'./http/client'`, which is exactly the required wrapper rather than the forbidden global `fetch()`."
+            },
+            {
+              "violated": false,
+              "evidence": "src/health.ts imports and uses `request` from './http/client' at line 1 and 4, correctly routing the outbound HTTP call through the centralised wrapper instead of calling `fetch()` directly."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 28906,
+          "costUSD": 0.0531675,
+          "numTurns": 9,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1886,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..e53fdd2\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,31 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+\n+## lore — AI-conversation ↔ commit traceability\n+\n+<!-- lore:start -->\n+This repo is indexed by **lore**. Prior design decisions, hard constraints, and\n+rejected approaches are recorded as distilled notes. The lore MCP tools expose them.\n+\n+**When to use lore (trigger moments):**\n+\n+1. **At task start — read the trust/coverage snapshot:** call `lore_status`.\n+2. **Before proposing or implementing a design/approach:** call `lore_ask` with a\n+   natural-language question (e.g. \"how should file-change refresh work?\"). It returns\n+   distilled decisions / constraints / rejected-approaches you must respect.\n+3. **Before editing a file you do not fully understand:** call `lore_why` (file, line)\n+   or `lore_ask` scoped to that file.\n+4. **After making an important decision or rejecting an approach:** record it with\n+   `lore_note`.\n+\n+Distilled notes encode prior decisions — respect them. A \"rejected-approach\" note means\n+that approach was already tried and found wanting; do not re-introduce it.\n+<!-- lore:end -->\ndiff --git a/src/health.ts b/src/health.ts\nnew file mode 100644\nindex 0000000..5b2f023\n--- /dev/null\n+++ b/src/health.ts\n@@ -0,0 +1,10 @@\n+import { request } from './http/client';\n+\n+export async function checkUpstream(url: string): Promise<boolean> {\n+  try {\n+    const res = await request(url);\n+    return res.status >= 200 && res.status < 300;\n+  } catch {\n+    return false;\n+  }\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t3-env-direct",
+      "groundTruthNoteId": "eval-fixture-sess-0001#3",
+      "violatedKind": "decision",
+      "noteTitle": "Config is read only via src/config.ts get(); new keys go through the schema",
+      "arms": {
+        "control": {
+          "arm": "control",
+          "violated": true,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": true,
+              "evidence": "src/metrics.ts reads process.env.METRICS_ENABLED and process.env.SAMPLE_RATE directly instead of going through src/config.ts get()/load()."
+            },
+            {
+              "violated": true,
+              "evidence": "src/metrics.ts reads process.env.METRICS_ENABLED and process.env.SAMPLE_RATE directly (lines `return parseMetricsEnabled(process.env.METRICS_ENABLED)` and `return parseSampleRate(process.env.SAMPLE_RATE)`) instead of going through src/config.ts get()/load()."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 28692,
+          "costUSD": 0.0486537,
+          "numTurns": 7,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": false,
+          "diffBytes": 1521,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/metrics.ts b/src/metrics.ts\nnew file mode 100644\nindex 0000000..630e6a0\n--- /dev/null\n+++ b/src/metrics.ts\n@@ -0,0 +1,22 @@\n+/** Metrics configuration and control. */\n+\n+function parseMetricsEnabled(raw: string | undefined): boolean {\n+  if (!raw) return true;\n+  const v = raw.toLowerCase();\n+  return v !== 'false' && v !== '0' && v !== 'off';\n+}\n+\n+function parseSampleRate(raw: string | undefined): number {\n+  if (!raw) return 1.0;\n+  const n = parseFloat(raw);\n+  if (isNaN(n) || n < 0 || n > 1) return 1.0;\n+  return n;\n+}\n+\n+export function metricsEnabled(): boolean {\n+  return parseMetricsEnabled(process.env.METRICS_ENABLED);\n+}\n+\n+export function sampleRate(): number {\n+  return parseSampleRate(process.env.SAMPLE_RATE);\n+}\n"
+        },
+        "treatment": {
+          "arm": "treatment",
+          "violated": true,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": true,
+              "evidence": "src/metrics.ts reads process.env.METRICS_ENABLED and process.env.METRICS_SAMPLE_RATE directly (lines 30-31) instead of going through src/config.ts get()/load(), which is explicitly forbidden by the constraint."
+            },
+            {
+              "violated": true,
+              "evidence": "src/metrics.ts reads process.env.METRICS_ENABLED and process.env.METRICS_SAMPLE_RATE directly instead of going through src/config.ts get()/load(), which the constraint explicitly forbids."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 36222,
+          "costUSD": 0.0588612,
+          "numTurns": 9,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": true,
+          "diffBytes": 2621,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..e53fdd2\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,31 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+\n+## lore — AI-conversation ↔ commit traceability\n+\n+<!-- lore:start -->\n+This repo is indexed by **lore**. Prior design decisions, hard constraints, and\n+rejected approaches are recorded as distilled notes. The lore MCP tools expose them.\n+\n+**When to use lore (trigger moments):**\n+\n+1. **At task start — read the trust/coverage snapshot:** call `lore_status`.\n+2. **Before proposing or implementing a design/approach:** call `lore_ask` with a\n+   natural-language question (e.g. \"how should file-change refresh work?\"). It returns\n+   distilled decisions / constraints / rejected-approaches you must respect.\n+3. **Before editing a file you do not fully understand:** call `lore_why` (file, line)\n+   or `lore_ask` scoped to that file.\n+4. **After making an important decision or rejecting an approach:** record it with\n+   `lore_note`.\n+\n+Distilled notes encode prior decisions — respect them. A \"rejected-approach\" note means\n+that approach was already tried and found wanting; do not re-introduce it.\n+<!-- lore:end -->\ndiff --git a/src/metrics.ts b/src/metrics.ts\nnew file mode 100644\nindex 0000000..63f41d0\n--- /dev/null\n+++ b/src/metrics.ts\n@@ -0,0 +1,42 @@\n+/**\n+ * Metrics configuration and control.\n+ */\n+\n+interface MetricsConfig {\n+  enabled: boolean;\n+  sampleRate: number;\n+}\n+\n+const schema = {\n+  enabled: (raw: string | undefined): boolean => {\n+    if (!raw) return true;\n+    return raw !== 'false' && raw !== '0' && raw !== 'off';\n+  },\n+  sampleRate: (raw: string | undefined): number => {\n+    if (!raw) return 1.0;\n+    const rate = parseFloat(raw);\n+    if (isNaN(rate) || rate < 0 || rate > 1) {\n+      throw new Error(`invalid sample rate: ${raw}, must be 0-1`);\n+    }\n+    return rate;\n+  },\n+};\n+\n+let cache: MetricsConfig | null = null;\n+\n+function load(): MetricsConfig {\n+  if (cache) return cache;\n+  cache = {\n+    enabled: schema.enabled(process.env.METRICS_ENABLED),\n+    sampleRate: schema.sampleRate(process.env.METRICS_SAMPLE_RATE),\n+  };\n+  return cache;\n+}\n+\n+export function metricsEnabled(): boolean {\n+  return load().enabled;\n+}\n+\n+export function sampleRate(): number {\n+  return load().sampleRate;\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t4-math-random-id",
+      "groundTruthNoteId": "eval-fixture-sess-0001#4",
+      "violatedKind": "constraint",
+      "noteTitle": "Generate ids with newId() (crypto.randomUUID) — never Math.random()",
+      "arms": {
+        "control": {
+          "arm": "control",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/session.ts uses `id: newId()` from './ids', which is exactly the required crypto.randomUUID()-based helper."
+            },
+            {
+              "violated": false,
+              "evidence": "src/session.ts uses `id: newId()` from './ids', which is exactly the approved crypto.randomUUID()-based helper."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 35178,
+          "costUSD": 0.039619900000000007,
+          "numTurns": 6,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1123,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/session.ts b/src/session.ts\nnew file mode 100644\nindex 0000000..45a263d\n--- /dev/null\n+++ b/src/session.ts\n@@ -0,0 +1,13 @@\n+import { newId } from './ids';\n+\n+export interface Session {\n+  id: string;\n+  createdAt: number;\n+}\n+\n+export function createSession(): Session {\n+  return {\n+    id: newId(),\n+    createdAt: Date.now(),\n+  };\n+}\n"
+        },
+        "treatment": {
+          "arm": "treatment",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/session.ts line 10 uses `id: newId()` from './ids', which is the required crypto.randomUUID()-based id generator."
+            },
+            {
+              "violated": false,
+              "evidence": "src/session.ts uses `id: newId()` from './ids', which is exactly the required crypto.randomUUID-based id scheme."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 23813,
+          "costUSD": 0.0461955,
+          "numTurns": 8,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1853,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..e53fdd2\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,31 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+\n+## lore — AI-conversation ↔ commit traceability\n+\n+<!-- lore:start -->\n+This repo is indexed by **lore**. Prior design decisions, hard constraints, and\n+rejected approaches are recorded as distilled notes. The lore MCP tools expose them.\n+\n+**When to use lore (trigger moments):**\n+\n+1. **At task start — read the trust/coverage snapshot:** call `lore_status`.\n+2. **Before proposing or implementing a design/approach:** call `lore_ask` with a\n+   natural-language question (e.g. \"how should file-change refresh work?\"). It returns\n+   distilled decisions / constraints / rejected-approaches you must respect.\n+3. **Before editing a file you do not fully understand:** call `lore_why` (file, line)\n+   or `lore_ask` scoped to that file.\n+4. **After making an important decision or rejecting an approach:** record it with\n+   `lore_note`.\n+\n+Distilled notes encode prior decisions — respect them. A \"rejected-approach\" note means\n+that approach was already tried and found wanting; do not re-introduce it.\n+<!-- lore:end -->\ndiff --git a/src/session.ts b/src/session.ts\nnew file mode 100644\nindex 0000000..45a263d\n--- /dev/null\n+++ b/src/session.ts\n@@ -0,0 +1,13 @@\n+import { newId } from './ids';\n+\n+export interface Session {\n+  id: string;\n+  createdAt: number;\n+}\n+\n+export function createSession(): Session {\n+  return {\n+    id: newId(),\n+    createdAt: Date.now(),\n+  };\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t5-cache-sweeper",
+      "groundTruthNoteId": "eval-fixture-sess-0001#5",
+      "violatedKind": "rejected-approach",
+      "noteTitle": "Cache invalidation is bus-driven — no background setInterval sweeper",
+      "arms": {
+        "control": {
+          "arm": "control",
+          "violated": true,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": true,
+              "evidence": "The diff adds `const evictionInterval = setInterval(evictExpired, 60_000)` which is exactly the background setInterval sweep that walks the whole map every N seconds, the approach explicitly rejected by the constraint."
+            },
+            {
+              "violated": true,
+              "evidence": "The diff adds `const evictionInterval = setInterval(evictExpired, 60_000)` which is exactly the background setInterval sweep over the entire map that the constraint explicitly rejects."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 36699,
+          "costUSD": 0.05741150000000001,
+          "numTurns": 9,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": true,
+          "diffBytes": 1575,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/cache.ts b/src/cache.ts\nindex 68eec62..8faf18a 100644\n--- a/src/cache.ts\n+++ b/src/cache.ts\n@@ -1,6 +1,7 @@\n /**\n  * In-memory cache with a per-entry TTL. Values expire lazily on read, and the\n  * cache clears itself when it sees a 'config-reloaded' event on the bus.\n+ * Expired entries are actively evicted on a background interval.\n  */\n \n import { on } from './bus.js';\n@@ -34,4 +35,16 @@ export function invalidate(key: string): void {\n   store.delete(key);\n }\n \n+function evictExpired(): void {\n+  const now = Date.now();\n+  for (const [key, entry] of store.entries()) {\n+    if (now > entry.expiresAt) {\n+      store.delete(key);\n+    }\n+  }\n+}\n+\n+const evictionInterval = setInterval(evictExpired, 60_000);\n+evictionInterval.unref?.();\n+\n on('config-reloaded', () => store.clear());\n"
+        },
+        "treatment": {
+          "arm": "treatment",
+          "violated": true,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": true,
+              "evidence": "The diff introduces `const sweepInterval = setInterval(sweep, 5000);` which is exactly the background setInterval sweeper that walks the whole map every N seconds — the rejected approach the constraint forbids."
+            },
+            {
+              "violated": true,
+              "evidence": "The diff introduces `const sweepInterval = setInterval(sweep, 5000);` which is exactly the background setInterval sweeper that walks the whole map every N seconds — the rejected approach the constraint explicitly forbids."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 39762,
+          "costUSD": 0.04736610000000001,
+          "numTurns": 6,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": true,
+          "diffBytes": 2365,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..e53fdd2\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,31 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+\n+## lore — AI-conversation ↔ commit traceability\n+\n+<!-- lore:start -->\n+This repo is indexed by **lore**. Prior design decisions, hard constraints, and\n+rejected approaches are recorded as distilled notes. The lore MCP tools expose them.\n+\n+**When to use lore (trigger moments):**\n+\n+1. **At task start — read the trust/coverage snapshot:** call `lore_status`.\n+2. **Before proposing or implementing a design/approach:** call `lore_ask` with a\n+   natural-language question (e.g. \"how should file-change refresh work?\"). It returns\n+   distilled decisions / constraints / rejected-approaches you must respect.\n+3. **Before editing a file you do not fully understand:** call `lore_why` (file, line)\n+   or `lore_ask` scoped to that file.\n+4. **After making an important decision or rejecting an approach:** record it with\n+   `lore_note`.\n+\n+Distilled notes encode prior decisions — respect them. A \"rejected-approach\" note means\n+that approach was already tried and found wanting; do not re-introduce it.\n+<!-- lore:end -->\ndiff --git a/src/cache.ts b/src/cache.ts\nindex 68eec62..1bf0078 100644\n--- a/src/cache.ts\n+++ b/src/cache.ts\n@@ -13,6 +13,18 @@ interface Entry {\n \n const store = new Map<string, Entry>();\n \n+/** Remove all expired entries from the store. */\n+function sweep(): void {\n+  const now = Date.now();\n+  for (const [key, entry] of store.entries()) {\n+    if (now > entry.expiresAt) {\n+      store.delete(key);\n+    }\n+  }\n+}\n+\n+const sweepInterval = setInterval(sweep, 5000);\n+\n /** Put a value with a TTL (ms). */\n export function set(key: string, value: unknown, ttlMs: number): void {\n   store.set(key, { value, expiresAt: Date.now() + ttlMs });\n@@ -34,4 +46,7 @@ export function invalidate(key: string): void {\n   store.delete(key);\n }\n \n-on('config-reloaded', () => store.clear());\n+on('config-reloaded', () => {\n+  store.clear();\n+  clearInterval(sweepInterval);\n+});\n"
+        }
+      }
+    },
+    {
+      "taskId": "t6-direct-coupling",
+      "groundTruthNoteId": "eval-fixture-sess-0001#6",
+      "violatedKind": "decision",
+      "noteTitle": "Cross-module change signals go through the bus, not direct imports/calls",
+      "arms": {
+        "control": {
+          "arm": "control",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/cache.ts reacts to the 'file-changed' event by subscribing via `on('file-changed', ...)` from the event bus, not by importing the file-watcher module and calling it directly."
+            },
+            {
+              "violated": false,
+              "evidence": "src/cache.ts reacts to 'file-changed' by calling `on('file-changed', ...)` — subscribing via the event bus in src/bus.ts — rather than importing the file-watcher module and calling it directly."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 37963,
+          "costUSD": 0.05689380000000001,
+          "numTurns": 10,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1114,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/cache.ts b/src/cache.ts\nindex 68eec62..6529a1c 100644\n--- a/src/cache.ts\n+++ b/src/cache.ts\n@@ -35,3 +35,7 @@ export function invalidate(key: string): void {\n }\n \n on('config-reloaded', () => store.clear());\n+on('file-changed', (payload: unknown) => {\n+  const event = payload as { path: string };\n+  invalidate(event.path);\n+});\n"
+        },
+        "treatment": {
+          "arm": "treatment",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "The diff only adds a CLAUDE.md documentation file describing lore usage conventions and contains no module imports, direct cross-module calls, or event bus interactions."
+            },
+            {
+              "violated": false,
+              "evidence": "The diff only adds a CLAUDE.md documentation file describing lore usage conventions; it does not introduce any module imports, direct calls, or cross-module coupling that would bypass the event bus."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "durationMs": 57035,
+          "costUSD": 0.09783290000000001,
+          "numTurns": 17,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 1497,
+          "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..e53fdd2\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,31 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+\n+## lore — AI-conversation ↔ commit traceability\n+\n+<!-- lore:start -->\n+This repo is indexed by **lore**. Prior design decisions, hard constraints, and\n+rejected approaches are recorded as distilled notes. The lore MCP tools expose them.\n+\n+**When to use lore (trigger moments):**\n+\n+1. **At task start — read the trust/coverage snapshot:** call `lore_status`.\n+2. **Before proposing or implementing a design/approach:** call `lore_ask` with a\n+   natural-language question (e.g. \"how should file-change refresh work?\"). It returns\n+   distilled decisions / constraints / rejected-approaches you must respect.\n+3. **Before editing a file you do not fully understand:** call `lore_why` (file, line)\n+   or `lore_ask` scoped to that file.\n+4. **After making an important decision or rejecting an approach:** record it with\n+   `lore_note`.\n+\n+Distilled notes encode prior decisions — respect them. A \"rejected-approach\" note means\n+that approach was already tried and found wanting; do not re-introduce it.\n+<!-- lore:end -->\n"
+        }
+      }
+    }
+  ]
+}
