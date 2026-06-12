@@ -10,6 +10,7 @@
 
 import { TOKENS_CSS } from './ui/tokens.js';
 import { SHELL_HTML, SHELL_CSS, SHELL_JS } from './ui/shell.js';
+import { INTRO_CSS, INTRO_JS } from './ui/intro.js';
 import * as story from './ui/view-story.js';
 import * as graph from './ui/view-graph.js';
 import * as map from './ui/view-map.js';
@@ -27,6 +28,7 @@ export function buildPage(): string {
 <style>
 ${TOKENS_CSS}
 ${SHELL_CSS}
+${INTRO_CSS}
 ${VIEWS.map((v) => v.CSS).join('\n')}
 </style>
 </head>
@@ -42,6 +44,7 @@ function showCdnError() {
 <script>
 window.LORE_VIEWS = [];
 ${VIEWS.map((v) => v.JS).join('\n')}
+${INTRO_JS}
 ${SHELL_JS}
 </script>
 </body>

@@ -24,8 +24,11 @@ export const SHELL_HTML = `
     <div class="brand">lore<span class="brand-dot">.</span></div>
     <span class="chip" id="repo-chip"></span>
     <span class="chip" id="stats-chip"></span>
+    <button id="intro-replay" class="btn" title="Replay intro" aria-label="replay intro">?</button>
     <nav id="view-switch" role="tablist"></nav>
   </header>
+
+  <div id="view-subtitle"></div>
 
   <main id="stage"></main>
 
@@ -54,6 +57,21 @@ export const SHELL_CSS = `
 }
 .brand { font-size: 17px; font-weight: 700; letter-spacing: 0.02em; margin-right: 4px; }
 .brand-dot { color: var(--green); }
+
+#intro-replay {
+  width: 24px; height: 24px; padding: 0; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 13px; line-height: 1; border-radius: 50%;
+}
+
+#view-subtitle {
+  position: absolute; top: 74px; left: 30px; right: 30px; z-index: 28;
+  font-size: 12px; color: var(--text-dim);
+  letter-spacing: 0.01em; pointer-events: none;
+  opacity: 0; transform: translateY(-3px);
+  transition: opacity var(--t-med), transform var(--t-med);
+}
+#view-subtitle.show { opacity: 1; transform: translateY(0); }
 
 #view-switch {
   margin-left: auto;
@@ -143,6 +161,51 @@ export const SHELL_JS = `
 // LORE_VIEWS 由组装器在视图脚本之前初始化（视图先注册、shell 后启动）。
 window.LORE_VIEWS = window.LORE_VIEWS || [];
 
+// ── i18n：shell 持字典，按 navigator.language 选 zh/en ─────────────────
+// 视图与 intro 通过 window.LORE_T(key) 取文案，且都做了 LORE_T 不存在的兜底。
+(function () {
+  var EN = {
+    'intro.headline': 'Software is made between commits.',
+    'intro.sub': 'In this repo, {sessions} conversations with AI agents shaped {commits} commits. Every glowing commit remembers the conversation that made it.',
+    'intro.watch': 'Watch the story',
+    'intro.skip': 'Skip',
+    'intro.keys': '<kbd>1</kbd>–<kbd>4</kbd> views <span class="sepdot">·</span> <kbd>Space</kbd> play <span class="sepdot">·</span> <kbd>Esc</kbd> close',
+    'story.subtitle': 'Who made what, and why — on one timeline',
+    'graph.subtitle': 'Explore how conversations, commits and files connect',
+    'map.subtitle': 'Which code has memory — and which is a black hole',
+    'decisions.subtitle': 'Decisions, constraints and rejected paths — with their full history',
+    'stats.template': '{s} conversations · {c} commits · {n} decisions',
+    'coachmark': 'This is the conversation that wrote this commit.',
+    'map.legend': 'AI memory coverage',
+  };
+  var ZH = {
+    'intro.headline': '软件诞生于提交之间。',
+    'intro.sub': '在这个仓库里，{sessions} 段与 AI 的对话塑造了 {commits} 个 commit。每个发光的 commit，都记得造就它的那段对话。',
+    'intro.watch': '看看这段历史',
+    'intro.skip': '跳过',
+    'intro.keys': '<kbd>1</kbd>–<kbd>4</kbd> 视图 <span class="sepdot">·</span> <kbd>Space</kbd> 播放 <span class="sepdot">·</span> <kbd>Esc</kbd> 关闭',
+    'story.subtitle': '谁在什么时候、为什么做了什么——一条时间轴讲完',
+    'graph.subtitle': '探索对话、提交与文件如何相连',
+    'map.subtitle': '哪片代码有记忆，哪片是黑洞',
+    'decisions.subtitle': '决策、约束与被否决的路——以及它们的完整历史',
+    'stats.template': '{s} 段对话 · {c} 个 commit · {n} 条决策',
+    'coachmark': '这就是写出这个 commit 的对话。',
+    'map.legend': 'AI 记忆覆盖度',
+  };
+  var lang = 'en';
+  try {
+    var nav = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
+    if (nav.indexOf('zh') === 0) lang = 'zh';
+  } catch (e) {}
+  var dict = lang === 'zh' ? ZH : EN;
+  window.LORE_LANG = lang;
+  window.LORE_T = function (key) {
+    if (dict && Object.prototype.hasOwnProperty.call(dict, key)) return dict[key];
+    if (Object.prototype.hasOwnProperty.call(EN, key)) return EN[key];
+    return key;
+  };
+})();
+
 async function bootShell() {
   let payload;
   try {
@@ -202,14 +265,38 @@ async function bootShell() {
   // ── 头部信息 ────────────────────────────────────────────────────
   document.getElementById('repo-chip').textContent = (payload.repo || '').split('/').pop();
   const g = payload.graph;
-  document.getElementById('stats-chip').textContent =
-    g.sessions.length + ' sessions · ' + g.commits.length + ' commits · ' + payload.notes.length + ' decisions';
+  // 人话模板：{s} 段对话 · {c} 个 commit · {n} 条决策（LORE_T 不存在时英文兜底）
+  const statsTmpl = (typeof window.LORE_T === 'function')
+    ? window.LORE_T('stats.template')
+    : '{s} conversations · {c} commits · {n} decisions';
+  document.getElementById('stats-chip').textContent = String(statsTmpl)
+    .replace('{s}', g.sessions.length)
+    .replace('{c}', g.commits.length)
+    .replace('{n}', payload.notes.length);
 
   // ── 视图切换 ────────────────────────────────────────────────────
   const stage = document.getElementById('stage');
   const nav = document.getElementById('view-switch');
+  const subtitleEl = document.getElementById('view-subtitle');
   const mounted = new Set();
   let activeView = null;
+
+  // 副标题：切视图时淡入。视图对象可带 subtitleKey（走 LORE_T），否则不显示。
+  function renderSubtitle(view) {
+    if (!subtitleEl) return;
+    let text = '';
+    const key = view && view.subtitleKey;
+    if (key && typeof window.LORE_T === 'function') {
+      const t = window.LORE_T(key);
+      if (t && t !== key) text = t;
+    }
+    // 淡出 → 换字 → 淡入（即使切到无副标题的视图也优雅消失）
+    subtitleEl.classList.remove('show');
+    setTimeout(() => {
+      subtitleEl.textContent = text;
+      if (text) subtitleEl.classList.add('show');
+    }, 90);
+  }
 
   function activate(view) {
     activeView = view;
@@ -222,10 +309,15 @@ async function bootShell() {
       try { view.mount(view._section, ctx); } catch (e) { console.error('view mount failed:', view.id, e); }
     }
     if (view.onShow) try { view.onShow(); } catch (e) { console.error(e); }
+    renderSubtitle(view);
     location.hash = view.id;
   }
 
   for (const view of window.LORE_VIEWS) {
+    // 副标题键：视图可显式提供 subtitleKey，否则按 '<id>.subtitle' 约定兜底，
+    // 这样即使视图模块尚未更新也能显示对应文案。
+    if (!view.subtitleKey) view.subtitleKey = view.id + '.subtitle';
+
     const section = document.createElement('section');
     section.className = 'view';
     section.id = 'view-' + view.id;
@@ -272,18 +364,77 @@ async function bootShell() {
   scrubber.addEventListener('pointermove', ev => { if (dragging) applyFrac(fracFromEvent(ev)); });
   scrubber.addEventListener('pointerup', () => { dragging = false; });
 
-  function stopPlay() {
+  // ── 导览：从 payload.excerpts 选摘录总字符数最大的 commit ─────────────
+  function pickDemoCommit() {
+    const ex = payload.excerpts || {};
+    let best = null, bestLen = -1;
+    for (const hash in ex) {
+      if (!Object.prototype.hasOwnProperty.call(ex, hash)) continue;
+      const list = ex[hash] || [];
+      let len = 0;
+      for (let i = 0; i < list.length; i++) len += (list[i] && list[i].text ? list[i].text.length : 0);
+      if (len > bestLen) { bestLen = len; best = hash; }
+    }
+    // 兜底：无 excerpts 时取归因数最高的 commit
+    if (!best) {
+      let bn = -1;
+      for (const h of attributionIndex.keys()) {
+        const n = (attributionIndex.get(h) || []).length;
+        if (n > bn) { bn = n; best = h; }
+      }
+    }
+    return best;
+  }
+  function dispatchDemo() {
+    const hash = pickDemoCommit();
+    if (!hash) return;
+    try { window.dispatchEvent(new CustomEvent('lore:demo', { detail: { commitHash: hash } })); }
+    catch (e) {}
+  }
+
+  // ── 电影化回放：8s，d3.easeCubicInOut 缓动驱动 applyFrac ───────────────
+  const PLAY_MS = 8000;
+  let playRAF = null, playStartTs = 0;
+
+  function stopPlay(opts) {
+    const wasPlaying = playing;
     playing = false; playBtn.textContent = '▶';
     if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    if (playRAF) { cancelAnimationFrame(playRAF); playRAF = null; }
+    if (wasPlaying) {
+      try { window.dispatchEvent(new CustomEvent('lore:play-end')); } catch (e) {}
+      // 自然播完才导览（用户中途暂停不打扰）
+      if (opts && opts.completed) dispatchDemo();
+    }
   }
+
+  function startPlay() {
+    if (playing) return;
+    playing = true; playBtn.textContent = '⏸';
+    applyFrac(0);
+    try { window.dispatchEvent(new CustomEvent('lore:play-start')); } catch (e) {}
+    const easeFn = (typeof d3 !== 'undefined' && d3.easeCubicInOut)
+      ? d3.easeCubicInOut
+      : function (t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+    playStartTs = 0;
+    function frame(ts) {
+      if (!playing) return;
+      if (!playStartTs) playStartTs = ts;
+      const p = Math.min(1, (ts - playStartTs) / PLAY_MS);
+      applyFrac(easeFn(p));
+      if (p < 1) {
+        playRAF = requestAnimationFrame(frame);
+      } else {
+        applyFrac(1);
+        stopPlay({ completed: true });
+      }
+    }
+    playRAF = requestAnimationFrame(frame);
+  }
+
   playBtn.addEventListener('click', () => {
     if (playing) { stopPlay(); return; }
-    playing = true; playBtn.textContent = '⏸';
-    if (frac >= 1) applyFrac(0);
-    playTimer = setInterval(() => {
-      if (frac >= 1) { stopPlay(); return; }
-      applyFrac(frac + 0.004);
-    }, 40);
+    startPlay();
   });
 
   // ── 键盘 ────────────────────────────────────────────────────────
@@ -301,11 +452,50 @@ async function bootShell() {
     }
   });
 
+  // ── intro overlay 开场 ──────────────────────────────────────────
+  // attributed 数 = excerpts 的 key 数（缺省用 attributionIndex.size）
+  function attributedCount() {
+    const ex = payload.excerpts;
+    if (ex && typeof ex === 'object') {
+      const n = Object.keys(ex).length;
+      if (n > 0) return n;
+    }
+    return attributionIndex.size;
+  }
+  function openIntro() {
+    if (!window.LORE_INTRO || typeof window.LORE_INTRO.open !== 'function') return false;
+    window.LORE_INTRO.open({
+      sessions: g.sessions.length,
+      commits: g.commits.length,
+      decisions: payload.notes.length,
+      attributed: attributedCount(),
+      onWatch: function () {
+        // 确保 story 视图是当前视图（电影感主场）
+        const story = window.LORE_VIEWS.find(v => v.id === 'story') || window.LORE_VIEWS[0];
+        if (story && activeView !== story) activate(story);
+        startPlay();
+      },
+      onSkip: function () { dispatchDemo(); },
+    });
+    return true;
+  }
+
+  // topbar "?" 随时重看
+  const replayBtn = document.getElementById('intro-replay');
+  if (replayBtn) replayBtn.addEventListener('click', () => { openIntro(); });
+
   // ── 启动 ────────────────────────────────────────────────────────
   applyFrac(1, false);
   const initial = window.LORE_VIEWS.find(v => '#' + v.id === location.hash) || window.LORE_VIEWS[0];
   if (initial) activate(initial);
   document.getElementById('loading').classList.add('done');
+
+  // loading 淡出后：未看过 intro 则显示，否则直进视图。
+  const introSeen = (window.LORE_INTRO && typeof window.LORE_INTRO.seen === 'function')
+    ? window.LORE_INTRO.seen() : false;
+  setTimeout(() => {
+    if (!introSeen) openIntro();
+  }, 420);
 }
 
 bootShell();

@@ -125,6 +125,78 @@ export const CSS = `
 .excerpt-anchor { font-family: var(--mono); font-size: 10px; color: var(--text-faint); }
 .excerpt-ts { margin-left: auto; font-size: 10px; color: var(--text-faint); }
 .excerpt-text { font-size: 12.5px; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+
+/* ── 电影化：入场 / 回放 / 导览 ───────────────────────────────────────── */
+
+/* 入场前的初始压制态：commit 方块 opacity 0 + 缩小；加 .entered 后过渡到常态。
+   stagger 用 transition-delay 实现（render 时按 x 排序设 inline delay）。 */
+.story-commit.enter-init {
+  opacity: 0 !important;
+}
+.story-commit.enter-init rect {
+  transform: scale(0.3);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.story-commit.enter-go {
+  transition: opacity 360ms var(--ease);
+}
+.story-commit.enter-go rect {
+  transition: transform 360ms var(--ease);
+  transform: scale(1);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* 丝带抽出：入场后触发一次（dashoffset 归零）。 */
+.story-ribbon.draw-init {
+  transition: none;
+}
+.story-ribbon.draw-go {
+  transition: stroke-dashoffset 800ms var(--ease), opacity var(--t-fast);
+}
+
+/* 越过播放头的脉冲（一次性 class，animationend 移除）。 */
+@keyframes story-pulse {
+  0%   { transform: scale(1); }
+  45%  { transform: scale(1.6); }
+  100% { transform: scale(1); }
+}
+.story-commit.pulse rect {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: story-pulse 300ms var(--ease);
+}
+
+/* coachmark 导览气泡（glass 小卡 + 指向箭头 + 轻微浮动）。 */
+@keyframes story-coach-float {
+  0%   { transform: translateY(0); }
+  50%  { transform: translateY(-4px); }
+  100% { transform: translateY(0); }
+}
+.story-coachmark {
+  position: absolute; z-index: 35; max-width: 220px;
+  padding: 9px 13px;
+  font-size: 12px; line-height: 1.45; color: var(--text);
+  pointer-events: none;
+  animation: story-coach-float 2.4s var(--ease) infinite;
+  opacity: 0; transition: opacity var(--t-med);
+}
+.story-coachmark.show { opacity: 1; }
+.story-coachmark .cm-arrow {
+  position: absolute; left: -7px; top: 18px;
+  width: 0; height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-right: 7px solid var(--border-strong);
+}
+.story-coachmark .cm-arrow::after {
+  content: ''; position: absolute; left: 1px; top: -5px;
+  width: 0; height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-right: 6px solid var(--panel-solid);
+}
 `;
 
 export const JS = `
@@ -147,6 +219,7 @@ export const JS = `
   LORE_VIEWS.push({
     id: 'story',
     label: 'Story',
+    subtitleKey: 'story.subtitle',
 
     mount: function (el, ctx) {
       this.ctx = ctx;
@@ -329,6 +402,91 @@ export const JS = `
           svg.transition().duration(500).call(zoom.transform, t);
         }
       }
+
+      // ── 电影化运行态 ─────────────────────────────────────────────────
+      this.playbackActive = false;
+      this.lastCutoff = null;
+      this.coachShown = false;
+
+      // window 事件监听（回放强化 + 导览）。保存引用以便（理论上）解绑。
+      var view = this;
+      this._onPlayStart = function () { view.enterPlayback(); };
+      this._onPlayEnd = function () { view.exitPlayback(); };
+      this._onDemo = function (ev) {
+        var hash = ev && ev.detail && ev.detail.commitHash;
+        if (hash) view.runDemo(hash);
+      };
+      try {
+        window.addEventListener('lore:play-start', this._onPlayStart);
+        window.addEventListener('lore:play-end', this._onPlayEnd);
+        window.addEventListener('lore:demo', this._onDemo);
+      } catch (e) {}
+
+      // 入场动画：首次渲染完成后触发一次（commit stagger + 丝带抽出）。
+      this.playEntrance();
+    },
+
+    // ── 入场动画 ─────────────────────────────────────────────────────
+    // commit 方块按 x 排序 stagger（opacity/scale），总长封顶 900ms；
+    // 丝带 dashoffset 抽出（800ms）。用 CSS transition + 延迟类切换实现。
+    playEntrance: function () {
+      if (!this.svg || this._entranceDone) return;
+      this._entranceDone = true;
+      var self = this, x = this.x;
+
+      // 1) commit 方块：按当前 x 排序，分配 stagger delay（封顶 900ms）。
+      var nodes = [];
+      this.gCommits.selectAll('g.story-commit').each(function (c) {
+        nodes.push({ el: this, px: x(new Date(c.authorDate)) });
+      });
+      nodes.sort(function (a, b) { return a.px - b.px; });
+      var n = nodes.length;
+      var maxDelay = 900;
+      for (var i = 0; i < n; i++) {
+        var node = d3.select(nodes[i].el);
+        var delay = n > 1 ? Math.round((i / (n - 1)) * maxDelay) : 0;
+        if (delay > maxDelay) delay = maxDelay;
+        node.classed('enter-init', true);
+        node.style('transition-delay', delay + 'ms');
+        node.select('rect').style('transition-delay', delay + 'ms');
+      }
+      // 强制 reflow 后切到目标态（下一帧），使过渡生效。
+      try { void this.gCommits.node().getBoundingClientRect(); } catch (e) {}
+      requestAnimationFrame(function () {
+        self.gCommits.selectAll('g.story-commit.enter-init')
+          .classed('enter-go', true)
+          .classed('enter-init', false);
+        // 过渡结束后清理 inline delay（避免后续 hover 受影响）。
+        setTimeout(function () {
+          self.gCommits.selectAll('g.story-commit')
+            .classed('enter-go', false)
+            .style('transition-delay', null)
+            .select('rect').style('transition-delay', null);
+        }, maxDelay + 420);
+      });
+
+      // 2) 丝带抽出：测每条路径长度，设 dasharray=dashoffset=len，下一帧归零。
+      this.gRibbons.selectAll('path.story-ribbon').each(function () {
+        var len = 0;
+        try { len = this.getTotalLength(); } catch (e) { len = 0; }
+        if (!len || !isFinite(len)) return;
+        var p = d3.select(this).classed('draw-init', true);
+        p.style('stroke-dasharray', len + ' ' + len)
+         .style('stroke-dashoffset', len);
+      });
+      requestAnimationFrame(function () {
+        self.gRibbons.selectAll('path.story-ribbon.draw-init')
+          .classed('draw-init', false)
+          .classed('draw-go', true)
+          .style('stroke-dashoffset', 0);
+        // 抽出后清理 dash 样式，回到常态（避免 zoom 重算路径时残留）。
+        setTimeout(function () {
+          self.gRibbons.selectAll('path.story-ribbon')
+            .classed('draw-go', false)
+            .style('stroke-dasharray', null)
+            .style('stroke-dashoffset', null);
+        }, 900);
+      });
     },
 
     // 计算当前尺寸并设定 range
@@ -554,21 +712,214 @@ export const JS = `
     },
 
     // ── 时间轴回放：cutoff 右侧元素淡出 + 当前时刻竖线 ────────────────
-    onTimeline: function (cutoffMs) { this.applyCutoff(cutoffMs); },
+    onTimeline: function (cutoffMs) {
+      // 回放态：先 diff 出本次新越过播放头的 commit（脉冲 + 丝带显形），
+      // 再交给 applyCutoff 落定稳态透明度（避免两套逻辑打架）。
+      if (this.playbackActive) {
+        this.pulseCrossed(this.lastCutoff, cutoffMs);
+      }
+      this.lastCutoff = cutoffMs;
+      this.applyCutoff(cutoffMs);
+    },
+
+    // ── 进入回放态：所有 commit 先压到 0.07，等待播放头逐个唤醒 ────────
+    enterPlayback: function () {
+      if (!this.svg) return;
+      this.playbackActive = true;
+      // 以 shell 当前 cutoff 为基准（play 通常从 0 重启，但防御读取实际值）。
+      this.lastCutoff = this.ctx.cutoffMs;
+      this.gCommits.selectAll('g.story-commit')
+        .interrupt()
+        .style('opacity', 0.07);
+      this.gRibbons.selectAll('path.story-ribbon')
+        .interrupt()
+        .style('opacity', 0.07);
+    },
+
+    // ── 退出回放态：恢复常态（按当前 cutoff 落定）。 ──────────────────
+    exitPlayback: function () {
+      if (!this.svg) return;
+      this.playbackActive = false;
+      this.applyCutoff(this.ctx.cutoffMs);
+    },
+
+    // 本次 cutoff 相对上次新越过播放头的 commit：脉冲一次；其归因丝带显形。
+    pulseCrossed: function (prevCutoff, cutoffMs) {
+      if (!this.svg) return;
+      var self = this;
+      // prev=null 视为 -∞（开播首帧不回溯全量，避免一次性全脉冲）。
+      var lo = (prevCutoff == null) ? -Infinity : +prevCutoff;
+      var hi = (cutoffMs == null) ? Infinity : +cutoffMs;
+      if (!(hi > lo)) return;
+      // 首帧（lo=-Infinity）只把 hi 之前的当作"已在场"，不脉冲历史；
+      // 仅当 prev 是有限值、播放头确有推进时才脉冲新越过的。
+      if (lo === -Infinity) return;
+
+      this.gCommits.selectAll('g.story-commit').each(function (c) {
+        var t = +new Date(c.authorDate);
+        if (t > lo && t <= hi) {
+          var node = d3.select(this);
+          // 越过播放头：从压制态 0.07 显形到常态，并脉冲一次。
+          var target = self.ctx.attributionIndex.has(c.hash) ? 1 : 0.35;
+          node.interrupt().transition().duration(300).style('opacity', target);
+          node.classed('pulse', true);
+          var rectEl = node.select('rect').node();
+          if (rectEl) {
+            var onEnd = function () {
+              node.classed('pulse', false);
+              rectEl.removeEventListener('animationend', onEnd);
+            };
+            rectEl.addEventListener('animationend', onEnd);
+          } else {
+            // 无 rect 兜底：定时移除。
+            setTimeout(function () { node.classed('pulse', false); }, 360);
+          }
+        }
+      });
+
+      // 归因丝带：commit 越过时其丝带 0.07→常态（300ms 过渡）。
+      this.gRibbons.selectAll('path.story-ribbon').each(function (r) {
+        var t = +new Date(r.commit.authorDate);
+        if (t > lo && t <= hi) {
+          d3.select(this)
+            .interrupt()
+            .transition().duration(300)
+            .style('opacity', 0.45);
+        }
+      });
+    },
+
+    // ── 导览：定位 demo commit、平滑带入视野、开抽屉、贴 coachmark ──────
+    runDemo: function (commitHash) {
+      if (!this.svg) return;
+      var self = this;
+      var c = this.commitByHash[commitHash];
+      if (!c) return;
+
+      // 1) 若该 commit 在视野外或贴边，用 zoom.transform 平移到视野中部偏左
+      //    （右侧给抽屉 ~380px 留白），缩放比例不变；否则原地不动。
+      var cx = this.x(new Date(c.authorDate));
+      var drawerGutter = 380; // 抽屉占据右侧的大致宽度
+      var visibleLeft = this.innerLeft + 40;
+      var visibleRight = this.innerRight - drawerGutter;
+      var needMove = cx < visibleLeft || cx > visibleRight;
+
+      // 一次性 afterMove：开抽屉 + 贴 coachmark（transition end 与兜底定时只跑一次）。
+      var ran = false;
+      var afterMove = function () {
+        if (ran) return;
+        ran = true;
+        self.openCommit(c);
+        self.showCoachmark(c); // coachmark 用当前（可能已变）x 定位
+      };
+
+      if (needMove && this.zoom && this.transform) {
+        // 目标：把节点落到可见区中部偏左（~38%），右侧给抽屉留白；缩放比例不变。
+        var targetPx = this.innerLeft + (visibleRight - this.innerLeft) * 0.38;
+        var k = this.transform.k;
+        // 当前 transform: screenX = k * baseX + tx。令 baseX 落到 targetPx 解出 tx。
+        var baseX = this.xBase(new Date(c.authorDate));
+        var newTx = targetPx - k * baseX;
+        var t = d3.zoomIdentity.translate(newTx, 0).scale(k);
+        this.svg.transition().duration(600)
+          .call(this.zoom.transform, t)
+          .on('end', afterMove);
+        // 防御：transition 'end' 偶发不触发，兜底定时（afterMove 自带去重）。
+        setTimeout(afterMove, 760);
+      } else {
+        afterMove();
+      }
+    },
+
+    // coachmark：节点旁的 glass 气泡 + 指向箭头，文案走 LORE_T 防御缺省英文，
+    // 点击任意处或 8s 后消失，localStorage 限一次。
+    showCoachmark: function (c) {
+      if (!this.el) return;
+      // localStorage 限一次（读写都防御异常环境）。
+      try {
+        if (localStorage.getItem('lore.coach.story') === '1') return;
+      } catch (e) {}
+      if (this.coachShown) return;
+      this.coachShown = true;
+      try { localStorage.setItem('lore.coach.story', '1'); } catch (e) {}
+
+      // 文案：优先 i18n，缺省英文。
+      var text = 'This commit was written with an AI agent — click to see the conversation behind it.';
+      try {
+        if (typeof window.LORE_T === 'function') {
+          var t = window.LORE_T('coachmark.text');
+          if (t) text = t;
+        }
+      } catch (e) {}
+
+      // 计算节点屏幕坐标（el 相对定位）。
+      var px = this.x(new Date(c.authorDate));
+      var py = this.commitY;
+      // 气泡贴在节点右侧偏上一点；若太靠右（接近抽屉），收回左侧。
+      var bubbleLeft = px + 16;
+      if (bubbleLeft > this.W - 260) bubbleLeft = px - 236;
+      var bubbleTop = py - 14;
+      if (bubbleTop < this.laneTop) bubbleTop = this.laneTop;
+
+      // 移除旧的（防重复）。
+      this.hideCoachmark();
+
+      var cm = document.createElement('div');
+      cm.className = 'story-coachmark glass';
+      cm.style.left = bubbleLeft + 'px';
+      cm.style.top = bubbleTop + 'px';
+      cm.innerHTML = '<div class="cm-arrow"></div>' + this.ctx.fmt.esc(text);
+      this.el.appendChild(cm);
+      this.coachmarkEl = cm;
+      // 淡入。
+      var self = this;
+      requestAnimationFrame(function () { cm.classList.add('show'); });
+
+      // 关闭逻辑：点击任意处或 8s 后。
+      var dismiss = function () {
+        document.removeEventListener('click', dismiss, true);
+        if (self._coachTimer) { clearTimeout(self._coachTimer); self._coachTimer = null; }
+        self.hideCoachmark();
+      };
+      // 延一拍再挂全局点击监听，避免触发 demo 的那次点击立刻关掉。
+      setTimeout(function () {
+        document.addEventListener('click', dismiss, true);
+      }, 50);
+      this._coachTimer = setTimeout(dismiss, 8000);
+    },
+
+    hideCoachmark: function () {
+      if (this.coachmarkEl) {
+        var el = this.coachmarkEl;
+        this.coachmarkEl = null;
+        el.classList.remove('show');
+        setTimeout(function () { if (el && el.parentNode) el.parentNode.removeChild(el); }, 300);
+      }
+    },
 
     applyCutoff: function (cutoffMs) {
       if (!this.svg) return;
       var self = this, x = this.x;
       var future = function (t) { return cutoffMs != null && +new Date(t) > cutoffMs; };
+      // 回放态下 commit/丝带的透明度由 pulseCrossed 逐帧增量驱动（脉冲 + 显形），
+      // 这里不整片改写 opacity，否则会瞬时盖掉 enterPlayback 的压制与 300ms 显形过渡。
+      var pb = this.playbackActive;
 
-      this.gCommits.selectAll('g.story-commit').style('opacity', function (c) {
-        if (future(c.authorDate)) return 0.07;
-        return self.ctx.attributionIndex.has(c.hash) ? 1 : 0.35;
-      }).style('pointer-events', function (c) { return future(c.authorDate) ? 'none' : null; });
+      var commitsSel = this.gCommits.selectAll('g.story-commit');
+      if (!pb) {
+        commitsSel.style('opacity', function (c) {
+          if (future(c.authorDate)) return 0.07;
+          return self.ctx.attributionIndex.has(c.hash) ? 1 : 0.35;
+        });
+      }
+      // pointer-events 始终按 cutoff 维护（回放态也禁用未来 commit 的命中）。
+      commitsSel.style('pointer-events', function (c) { return future(c.authorDate) ? 'none' : null; });
 
-      this.gRibbons.selectAll('path.story-ribbon').style('opacity', function (r) {
-        return future(r.commit.authorDate) ? 0.05 : 0.45;
-      });
+      if (!pb) {
+        this.gRibbons.selectAll('path.story-ribbon').style('opacity', function (r) {
+          return future(r.commit.authorDate) ? 0.05 : 0.45;
+        });
+      }
 
       this.gDecisions.selectAll('g.story-decision').style('opacity', function (n) {
         if (future(n.validAt)) return 0.07;

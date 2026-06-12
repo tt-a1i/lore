@@ -13,6 +13,15 @@
  */
 
 export const CSS = `
+/* graph view entry animation */
+@keyframes vg-fadein {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.vg-enter {
+  animation: vg-fadein 300ms var(--ease) both;
+}
+
 #view-graph {
   position: relative;
   overflow: hidden;
@@ -806,16 +815,16 @@ export const JS = `
     });
     controls.appendChild(isolatedBtn);
 
-    // 图例
+    // 图例（plain-English labels）
     var legendEl = document.createElement('div');
     legendEl.id = 'vg-legend';
     legendEl.className = 'glass';
     legendEl.innerHTML =
-      '<div class="vg-legend-item"><span class="vg-legend-dot" style="background:var(--blue)"></span>Session</div>' +
-      '<div class="vg-legend-item"><span class="vg-legend-rect"></span>Commit (color = age)</div>' +
-      '<div class="vg-legend-item"><span class="vg-legend-dot" style="background:var(--gray-node)"></span>File</div>' +
-      '<div class="vg-legend-item"><span class="vg-legend-diamond"></span>Decision</div>' +
-      '<div class="vg-legend-item"><span class="vg-legend-line"></span>PRODUCED (width = confidence)</div>';
+      '<div class="vg-legend-item"><span class="vg-legend-dot" style="background:var(--blue)"></span>AI session</div>' +
+      '<div class="vg-legend-item"><span class="vg-legend-rect"></span>Git commit (darker = older)</div>' +
+      '<div class="vg-legend-item"><span class="vg-legend-dot" style="background:var(--gray-node)"></span>Source file</div>' +
+      '<div class="vg-legend-item"><span class="vg-legend-diamond"></span>Design decision</div>' +
+      '<div class="vg-legend-item"><span class="vg-legend-line"></span>Authored (line width = confidence)</div>';
     el.appendChild(legendEl);
 
     // 空态
@@ -854,6 +863,9 @@ export const JS = `
 
     _currentCutoff = ctx.cutoffMs;
     rebuildGraph();
+
+    // entry animation: whole view fades in once on first mount
+    el.classList.add('vg-enter');
   }
 
   function onTimeline(cutoffMs) {
@@ -878,6 +890,7 @@ export const JS = `
   window.LORE_VIEWS.push({
     id: 'graph',
     label: 'Graph',
+    subtitleKey: 'graph.subtitle',
     mount: mount,
     onTimeline: onTimeline,
     onResize: onResize,

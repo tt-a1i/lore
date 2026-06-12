@@ -88,6 +88,15 @@ export const CSS = `
   text-decoration-color: var(--text-faint);
 }
 
+/* card stagger entry animation */
+@keyframes decCardIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.dec-card-enter {
+  animation: decCardIn 280ms var(--ease) both;
+}
+
 /* flash highlight */
 @keyframes decFlash {
   0%   { box-shadow: 0 0 0 3px var(--green); }
@@ -245,6 +254,7 @@ export const JS = `
   window.LORE_VIEWS.push({
     id: 'decisions',
     label: 'Decisions',
+    subtitleKey: 'decisions.subtitle',
 
     _ctx: null,
     _query: '',
@@ -332,6 +342,14 @@ export const JS = `
         html += self._cardHtml(visible[i]);
       }
       cols.innerHTML = html;
+
+      // stagger entry animation: each card fades up, delay 40ms each, capped at 400ms
+      var allCards = cols.querySelectorAll('.dec-card');
+      for (var si = 0; si < allCards.length; si++) {
+        var delay = Math.min(si * 40, 400);
+        allCards[si].classList.add('dec-card-enter');
+        allCards[si].style.animationDelay = delay + 'ms';
+      }
 
       // attach click handlers
       var cards = cols.querySelectorAll('.dec-card');

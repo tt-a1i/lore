@@ -8,6 +8,52 @@
 
 export const CSS = `
 /* ── Map view ───────────────────────────────────────────── */
+
+/* cell entry animation — applied once per render pass */
+@keyframes map-cell-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.map-cell-enter {
+  animation: map-cell-in 300ms var(--ease) both;
+}
+
+/* glass legend bar bottom-left */
+#map-legend {
+  position: absolute;
+  bottom: 80px;
+  left: 20px;
+  z-index: 10;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+}
+.map-legend-label {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.map-legend-ramp {
+  width: 80px;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, rgba(110,122,135,0.3), rgba(86,211,100,0.65));
+  flex-shrink: 0;
+}
+.map-legend-ticks {
+  display: flex;
+  justify-content: space-between;
+  width: 80px;
+  flex-shrink: 0;
+  position: relative;
+}
+.map-legend-tick {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
 #view-map {
   overflow: hidden;
   position: relative;
@@ -179,6 +225,7 @@ export const JS = `
   window.LORE_VIEWS.push({
     id: 'map',
     label: 'Map',
+    subtitleKey: 'map.subtitle',
 
     _metric: 'commits',
     _ctx: null,
@@ -248,6 +295,22 @@ export const JS = `
       svgEl.id = 'map-svg';
       el.appendChild(svgEl);
       self._svg = d3.select(svgEl);
+
+      // ── legend bar (bottom-left glass strip) ─────────────────
+      var legendEl = document.createElement('div');
+      legendEl.id = 'map-legend';
+      legendEl.className = 'glass';
+      var legendLabel = (typeof window.LORE_T === 'function')
+        ? window.LORE_T('map.legend')
+        : 'AI memory coverage';
+      legendEl.innerHTML =
+        '<span class="map-legend-tick">0%</span>' +
+        '<div>' +
+          '<div class="map-legend-ramp"></div>' +
+        '</div>' +
+        '<span class="map-legend-tick">100%</span>' +
+        '<span class="map-legend-label">' + legendLabel + '</span>';
+      el.appendChild(legendEl);
 
       self._render();
     },
@@ -370,6 +433,9 @@ export const JS = `
           event.stopPropagation();
           self._openDrawer(d);
         });
+
+      // apply entry animation to newly-created cells (one-shot)
+      cellEnter.classed('map-cell-enter', true);
 
       cellEnter.append('rect');
       cellEnter.append('text').attr('class', 'cell-label');
