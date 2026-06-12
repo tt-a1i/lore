@@ -1,9 +1,35 @@
 {
   "name": "lore",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "The intent layer for Git — link AI agent conversations to the commits they produced",
   "type": "module",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tt-a1i/lore.git"
+  },
+  "homepage": "https://github.com/tt-a1i/lore#readme",
+  "bugs": {
+    "url": "https://github.com/tt-a1i/lore/issues"
+  },
+  "keywords": [
+    "ai",
+    "git",
+    "agent",
+    "transcript",
+    "attribution",
+    "knowledge-graph",
+    "claude",
+    "codex",
+    "mcp",
+    "intent",
+    "codebase-memory"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "lore": "./dist/cli.js"
   },
@@ -12,7 +38,8 @@
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "test:kuzu": "tsx scripts/test-kuzu-store.mts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "engines": {
     "node": ">=18"

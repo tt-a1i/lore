@@ -242,7 +242,37 @@ export const JS = `
       row('subject', esc(c.subject)) +
       row('date', esc(dateStr)) +
       row('merge', c.isMerge ? 'yes' : 'no') +
-      (prods.length ? '<div class="sep"></div><h3>Attributions (' + prods.length + ')</h3>' + attrRows : '');
+      (prods.length ? '<div class="sep"></div><h3>Attributions (' + prods.length + ')</h3>' + attrRows : '') +
+      excerptHtml(ctx, c.hash);
+  }
+
+  // 抽屉内嵌对话摘录：payload.excerpts[commitHash] → HTML（无摘录返回空串）。
+  // 复用 view-story 注入的 .excerpt* CSS 类（全部视图 CSS 串接为一份）。
+  function excerptDateTime(ts) {
+    if (!ts) return '';
+    var dt = new Date(ts);
+    return isNaN(dt) ? '' : dt.toISOString().slice(0, 16).replace('T', ' ');
+  }
+  function excerptHtml(ctx, commitHash) {
+    var ex = ctx.payload && ctx.payload.excerpts;
+    var list = ex && ex[commitHash];
+    if (!list || !list.length) return '';
+    var html = '<div class="excerpt-head">conversation at this commit</div>';
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      var isUser = m.role === 'user';
+      var pill = isUser ? '<span class="role-pill user">USER</span>' : '<span class="role-pill agent">AGENT</span>';
+      var anchor = String(m.sessionId || '').slice(0, 8) + '#' + m.seq;
+      var ts = excerptDateTime(m.ts);
+      html += '<div class="excerpt role-' + (isUser ? 'user' : 'assistant') + '">' +
+        '<div class="excerpt-meta">' + pill +
+        '<span class="excerpt-anchor">' + esc(anchor) + '</span>' +
+        (ts ? '<span class="excerpt-ts">' + esc(ts) + '</span>' : '') +
+        '</div>' +
+        '<div class="excerpt-text">' + esc(m.text || '') + '</div>' +
+        '</div>';
+    }
+    return html;
   }
 
   function fileHtml(d, ctx) {

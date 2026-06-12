@@ -64,6 +64,93 @@ describe('ViewerServer', () => {
       'utf8',
     );
 
+    // A parseable fake transcript (claude-code jsonl) for the excerpts pipeline.
+    // Shape mirrors fixtures/claude-code/edit-tool.jsonl: a user intent, an
+    // assistant Edit tool_use, then a toolUseResult that produces a file-edit event.
+    // The file-edit gets seq 2 (user-message=0, assistant-message=1, file-edit=2).
+    const transcriptPath = path.join(tmpDir, 'ses-excerpt.jsonl');
+    const transcriptLines = [
+      {
+        type: 'user', uuid: 'u1', parentUuid: null, sessionId: 'ses-excerpt',
+        cwd: '/x/proj', gitBranch: 'main', version: '2.1.170',
+        timestamp: '2026-06-01T10:00:00.000Z', isMeta: false,
+        message: { role: 'user', content: 'Add a foo helper to src/foo.ts please.' },
+      },
+      {
+        type: 'assistant', uuid: 'a1', parentUuid: 'u1', sessionId: 'ses-excerpt',
+        timestamp: '2026-06-01T10:00:01.000Z',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Sure — adding the foo helper now.' },
+            { type: 'tool_use', id: 'toolu_1', name: 'Edit', input: {
+              file_path: '/x/proj/src/foo.ts',
+              old_string: 'export const x = 1;',
+              new_string: 'export const x = 1;\nexport function foo() { return 42; }',
+            } },
+          ],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'user', uuid: 'u2', parentUuid: 'a1', sessionId: 'ses-excerpt',
+        timestamp: '2026-06-01T10:00:05.000Z',
+        toolUseResult: {
+          type: 'update', filePath: '/x/proj/src/foo.ts',
+          content: 'export const x = 1;\nexport function foo() { return 42; }\n',
+          structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 2,
+            lines: ['+export function foo() { return 42; }'] }],
+          originalFile: 'export const x = 1;\n', userModified: false,
+        },
+        message: { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: 'toolu_1', content: 'File updated.', is_error: false },
+        ] },
+      },
+    ];
+    await fs.writeFile(
+      transcriptPath,
+      transcriptLines.map((l) => JSON.stringify(l)).join('\n') + '\n',
+      'utf8',
+    );
+
+    // report.json: one MatchCandidate for commit abc111 / src/foo.ts pointing at
+    // the transcript above, editSeqs = [2] (the file-edit event's seq).
+    const reportFile = {
+      repo: tmpDir,
+      generatedAt: '2026-06-01T12:00:00.000Z',
+      schemaVersion: 1,
+      commitsTotal: 3,
+      commitsMatchedStrong: 1,
+      commitsMatchedWeak: 0,
+      sessionsSeen: 1,
+      sessionsContributing: 1,
+      window: { start: '2026-06-01T09:00:00.000Z', end: '2026-06-01T11:00:00.000Z' },
+      commitsInWindow: 1,
+      strongInWindow: 1,
+      weakInWindow: 0,
+      matches: [
+        {
+          commitHash: 'abc111',
+          filePath: 'src/foo.ts',
+          sessionId: 'ses-excerpt',
+          editSeqs: [2],
+          sourcePath: transcriptPath,
+          matchedVia: 'content',
+          matchedLines: 3,
+          contentScore: 0.9,
+          timeScore: 1,
+          confidence: 0.92,
+          evidence: ['content: 3 lines'],
+        },
+      ],
+      unmatchedCommits: [],
+    };
+    await fs.writeFile(
+      path.join(loreDir, 'report.json'),
+      JSON.stringify(reportFile, null, 2),
+      'utf8',
+    );
+
     const notesFile: NotesFile = {
       schemaVersion: 1,
       distilledSessions: { 'ses-alpha': 'abc123' },
@@ -196,6 +283,59 @@ describe('ViewerServer', () => {
     // Fixture commits: 2026-06-01 and 2026-06-02
     expect(payload.timeRange!.start).toContain('2026-06-01');
     expect(payload.timeRange!.end).toContain('2026-06-02');
+  });
+
+  // ── Conversation excerpts (drawer-embedded) ──────────────────────────────────
+
+  it('payload.excerpts is keyed by commitHash with shaped excerpts', async () => {
+    const res = await fetch(serverUrl + '/api/payload');
+    const payload = await res.json() as ViewerPayload;
+
+    expect(payload.excerpts).toBeDefined();
+    const ex = payload.excerpts!;
+    // The report has a top candidate for abc111 → excerpts present for it.
+    expect(Array.isArray(ex['abc111'])).toBe(true);
+    const quotes = ex['abc111']!;
+    expect(quotes.length).toBeGreaterThan(0);
+    expect(quotes.length).toBeLessThanOrEqual(2);
+
+    // Shape of each excerpt.
+    for (const q of quotes) {
+      expect(typeof q.sessionId).toBe('string');
+      expect(typeof q.seq).toBe('number');
+      expect(q.role === 'user' || q.role === 'assistant').toBe(true);
+      expect(typeof q.text).toBe('string');
+      expect(q.text.length).toBeLessThanOrEqual(320);
+      expect(typeof q.ts).toBe('string');
+    }
+
+    // user 优先：若两条都在，第一条应为 user。
+    expect(quotes[0]!.role).toBe('user');
+    expect(quotes.some((q) => q.text.includes('foo helper'))).toBe(true);
+    // anchor 指向正确 session。
+    expect(quotes[0]!.sessionId).toBe('ses-excerpt');
+  });
+
+  it('payload.excerpts is an empty object when report.json is absent', async () => {
+    // tmpDir2 has no report.json — excerpts should be present but empty.
+    const tmpDirNR = await fs.mkdtemp(path.join(os.tmpdir(), 'lore-viewer-norep-'));
+    const graphDirNR = path.join(tmpDirNR, '.lore', 'graph');
+    await fs.mkdir(graphDirNR, { recursive: true });
+    await fs.writeFile(
+      path.join(graphDirNR, 'graph.json'),
+      JSON.stringify(makeData(), null, 2),
+      'utf8',
+    );
+    const srvNR = createViewerServer(tmpDirNR);
+    const pNR = await srvNR.start(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${pNR}/api/payload`);
+      const payload = await res.json() as ViewerPayload;
+      expect(payload.excerpts).toEqual({});
+    } finally {
+      await srvNR.stop();
+      await fs.rm(tmpDirNR, { recursive: true, force: true });
+    }
   });
 
   // ── Notes absent ─────────────────────────────────────────────────────────────

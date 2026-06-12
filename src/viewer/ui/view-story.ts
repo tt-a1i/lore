@@ -101,6 +101,30 @@ export const CSS = `
   display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10.5px;
   border: 1px solid var(--amber); color: var(--amber); background: rgba(227,179,65,0.1);
 }
+
+/* ── 抽屉内嵌对话摘录 ───────────────────────────────────────────────── */
+.excerpt-head {
+  display: flex; align-items: center; gap: 7px; margin: 14px 0 8px;
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint);
+}
+.excerpt-head::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+.excerpt {
+  margin: 0 0 8px; padding: 9px 11px;
+  border-left: 2px solid var(--border-strong); border-radius: 0 6px 6px 0;
+  background: rgba(240,246,252,0.03);
+}
+.excerpt.role-user { border-left-color: var(--blue); }
+.excerpt.role-assistant { border-left-color: var(--green); }
+.excerpt-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.role-pill {
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  font-size: 9px; font-weight: 600; letter-spacing: 0.07em;
+}
+.role-pill.user { color: var(--blue); border: 1px solid var(--blue); background: rgba(88,166,255,0.1); }
+.role-pill.agent { color: var(--green); border: 1px solid var(--green); background: rgba(86,211,100,0.1); }
+.excerpt-anchor { font-family: var(--mono); font-size: 10px; color: var(--text-faint); }
+.excerpt-ts { margin-left: auto; font-size: 10px; color: var(--text-faint); }
+.excerpt-text { font-size: 12.5px; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
 `;
 
 export const JS = `
@@ -661,6 +685,7 @@ export const JS = `
           html += '</div>';
         }
       }
+      html += excerptHtml(ctx, c.hash, esc, fmt);
       ctx.drawer.show(html);
       this.wireSessionLinks();
     },
@@ -746,5 +771,28 @@ export const JS = `
 
   // 把任意 id 变成合法 CSS/选择器片段
   function cssId(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
+  // 抽屉内嵌对话摘录：payload.excerpts[commitHash] → HTML 块（无摘录返回空串）
+  function excerptHtml(ctx, commitHash, esc, fmt) {
+    var ex = ctx.payload && ctx.payload.excerpts;
+    var list = ex && ex[commitHash];
+    if (!list || !list.length) return '';
+    var html = '<div class="excerpt-head">conversation at this commit</div>';
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      var isUser = m.role === 'user';
+      var pill = isUser ? '<span class="role-pill user">USER</span>' : '<span class="role-pill agent">AGENT</span>';
+      var anchor = String(m.sessionId || '').slice(0, 8) + '#' + m.seq;
+      var ts = m.ts ? fmt.datetime(m.ts) : '';
+      html += '<div class="excerpt role-' + (isUser ? 'user' : 'assistant') + '">' +
+        '<div class="excerpt-meta">' + pill +
+        '<span class="excerpt-anchor">' + esc(anchor) + '</span>' +
+        (ts ? '<span class="excerpt-ts">' + esc(ts) + '</span>' : '') +
+        '</div>' +
+        '<div class="excerpt-text">' + esc(m.text || '') + '</div>' +
+        '</div>';
+    }
+    return html;
+  }
 })();
 `;

@@ -10,6 +10,19 @@ $ lore why src/server/upload-store.ts:42
    Agent: 开始编辑 workspace-upload-store.ts（异步 IO、两阶段删除、启动清扫…）
 ```
 
+## Quick start
+
+```bash
+# From source (current state — pre-npm-publish):
+git clone https://github.com/tt-a1i/lore.git
+cd lore
+npm install
+npx tsx src/cli.ts scan --repo /path/to/your/git/repo
+
+# After npm publish (coming soon):
+# npx lore scan --repo /path/to/your/git/repo
+```
+
 ## Why
 
 Code is cheap now; understanding is not. When agents write most of the code, the *intent* — requirements as actually stated, constraints discovered mid-flight, approaches tried and rejected — lives in conversations that evaporate when the session ends. Git records what changed; lore records why.
@@ -32,22 +45,56 @@ lore sits **on top of Git** — no new VCS, no migration, works with your existi
 
 ## Commands
 
-```bash
-npx tsx src/cli.ts scan    --repo <path> --broad     # index transcripts → match → build graph
-npx tsx src/cli.ts why     <file>:<line> --repo <path>  # any line → the conversation behind it
-npx tsx src/cli.ts history <file> --repo <path>      # file evolution timeline with attributions
-npx tsx src/cli.ts distill --repo <path> [--max-sessions N]  # LLM-distill sessions into notes
-npx tsx src/cli.ts ask     "<question>" --repo <path>   # search decisions + conversations
-npx tsx src/cli.ts sample  --repo <path> -n 10       # spot-check attribution accuracy
-npx tsx src/cli.ts mcp     --repo <path>             # MCP server: lore_why / lore_ask / lore_history
-npx tsx src/cli.ts serve   --repo <path> --port 4017 # D3 graph viewer with timeline playback
+| Command | Description |
+|---------|-------------|
+| `lore scan --repo <path> [--max-commits N] [--broad] [--no-graph]` | Index transcripts, run the match engine, write `.lore/report.json`, build the graph |
+| `lore why <file>:<line> --repo <path> [--json]` | Trace any line of code back to the conversation that produced it |
+| `lore history <file> --repo <path> [--json]` | Show the full evolution timeline of a file with conversation attributions per commit |
+| `lore distill --repo <path> [--max-sessions N]` | LLM-distill sessions into Decision / Constraint / RejectedApproach notes via `claude -p` |
+| `lore ask "<question>" --repo <path> [--include-superseded] [--json]` | Full-text search across distilled decisions and conversation messages |
+| `lore sample --repo <path> -n <N> [--tier strong\|weak]` | Sample matches from the report for spot-checking attribution accuracy |
+| `lore mcp --repo <path>` | Start the stdio MCP server exposing `lore_why`, `lore_ask`, `lore_history` tools |
+| `lore serve --repo <path> [--port 4017]` | Start the local graph viewer at `http://localhost:4017` |
+
+### MCP server (for agents)
+
+Add to your `claude_desktop_config.json` (or any MCP host):
+
+```json
+{
+  "mcpServers": {
+    "lore": {
+      "command": "lore",
+      "args": ["mcp", "--repo", "/path/to/your/repo"]
+    }
+  }
+}
 ```
 
-Point your agent at the MCP server and it gains your project's episodic memory — past decisions, rejected approaches, and the evolution of every file.
+The agent gains three tools: `lore_why` (line-level attribution), `lore_ask` (decision search), `lore_history` (file evolution). New sessions stop being cold starts.
+
+## Viewer — four views
+
+Launch with `lore serve --repo <path>` and open `http://localhost:4017`.
+
+| View | Description |
+|------|-------------|
+| **Story** (key `1`) | Horizontal timeline: session swimlanes, commits scaled by file-touch count, attribution ribbons (Bézier, width proportional to confidence), decision diamonds with supersede chains |
+| **Graph** (key `2`) | Force-directed knowledge graph: sessions, commits, files, and decisions as nodes; PRODUCED / TOUCHES / EDITED edges; hover to highlight first-degree neighbours |
+| **Map** (key `3`) | Treemap of the repository — cells coloured by AI attribution coverage (grey = dark zone, green = fully traced); toggle by commit count or lines changed |
+| **Decisions** (key `4`) | Waterfall card stream of all distilled notes; full-text search; bi-temporal supersede chains; timeline slider dims invalidated decisions |
+
+All four views share a timeline scrubber — drag it to replay the repo's history from day one.
+
+Screenshots (to be added — see `docs/assets/*.png` once captured):
+- `docs/assets/view-story.png` — story timeline view
+- `docs/assets/view-graph.png` — force-directed graph view
+- `docs/assets/view-map.png` — repository treemap
+- `docs/assets/view-decisions.png` — decisions card stream
 
 ## Status & validation
 
-All four milestones implemented (not yet published to npm). Validated on a 726-commit production repo:
+All four milestones implemented (version 0.1.0, not yet published to npm). Validated on a 726-commit production repo:
 
 - **Attribution precision**: adversarial verification (30 samples, independent verifier agents instructed to *refute* each attribution) measured **100% on strong-tier matches** (20/20), 80% on weak tier.
 - **Coverage**: 71% of commits inside the transcript-retention window matched; every blind spot is accounted for (sessions whose transcripts were never written locally, merge commits, cloud sessions).
@@ -58,7 +105,7 @@ All four milestones implemented (not yet published to npm). Validated on a 726-c
 - **M1** ✅ Claude Code parser + 3-tier match engine + adversarial validation harness
 - **M2** ✅ Graph layer (JSON/Kuzu adapter) + `lore why` + `lore history`
 - **M3** ✅ Semantic distillation (bi-temporal notes) + `lore ask` + MCP server
-- **M4** ✅ Codex CLI & OpenCode parsers; D3 graph viewer with timeline playback
+- **M4** ✅ Codex CLI & OpenCode parsers; four-view local viewer with timeline playback
 - Next: git-notes interop (git-ai compatible), redaction + team sharing via refs, embedding retrieval backend, code-survival weighting
 
 ## Design notes
@@ -67,4 +114,4 @@ See [DESIGN.md](DESIGN.md) and [docs/research/transcript-format.md](docs/researc
 
 ## License
 
-Apache-2.0
+Apache-2.0 — copyright 2026 lore contributors

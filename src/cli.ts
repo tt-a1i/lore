@@ -2,17 +2,25 @@
 /**
  * lore CLI — commands:
  *
- *   lore scan     --repo <path> [--max-commits N] [--broad] [--no-graph]
- *   lore sample   --repo <path> -n <num> [--tier strong|weak]
- *   lore why      <target> --repo <path> [--json]
- *   lore history  <path>   --repo <path> [--json]
- *   lore distill  --repo <path> [--max-sessions N]
- *   lore ask      <question> --repo <path> [--include-superseded] [--json]
- *   lore mcp      --repo <path>
- *   lore serve    --repo <path> [--port 4017]
+ *   lore           [--repo <path>]  (default: scan → serve → open browser)
+ *   lore go        [--repo <path>]  (alias for default)
+ *   lore scan      --repo <path> [--max-commits N] [--broad] [--no-graph]
+ *   lore init      [--repo <path>]
+ *   lore sample    --repo <path> -n <num> [--tier strong|weak]
+ *   lore why       <target> --repo <path> [--json]
+ *   lore history   <path>   --repo <path> [--json]
+ *   lore distill   --repo <path> [--max-sessions N]
+ *   lore ask       <question> --repo <path> [--include-superseded] [--json]
+ *   lore mcp       --repo <path>
+ *   lore serve     --repo <path> [--port 4017]
  */
 
-import { program } from 'commander';
+import { Command } from 'commander';
+
+// Create a fresh Command instance rather than using the shared commander
+// singleton. This ensures the module is safe to import multiple times in
+// the same process (e.g. vitest singleFork test runs).
+const program = new Command();
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -118,6 +126,28 @@ async function loadMcpServer(): Promise<{
   return await import('./mcp/server.js');
 }
 
+// ── ANSI color helpers (raw escape codes; gated on process.stdout.isTTY) ─────
+
+const USE_COLOR = process.stdout.isTTY && process.env['NO_COLOR'] === undefined;
+
+function c(code: string, text: string): string {
+  if (!USE_COLOR) return text;
+  return `\x1b[${code}m${text}\x1b[0m`;
+}
+
+/** Bold green: success / checkmarks */
+export function green(text: string): string { return c('1;32', text); }
+/** Bold blue: info / steps */
+export function blue(text: string): string { return c('1;34', text); }
+/** Bold yellow: warnings */
+export function yellow(text: string): string { return c('1;33', text); }
+/** Bold red: errors */
+export function red(text: string): string { return c('1;31', text); }
+/** Dim/gray: secondary info */
+export function dim(text: string): string { return c('2', text); }
+/** Bold: emphasis */
+export function bold(text: string): string { return c('1', text); }
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function now(): number {
@@ -142,6 +172,164 @@ function randomSample<T>(arr: T[], n: number): T[] {
 function truncate(s: string, maxLen: number): string {
   if (s.length <= maxLen) return s;
   return s.slice(0, maxLen - 1) + '…';
+}
+
+/**
+ * Render a summary box after lore go completes.
+ * Pure function — exported for testing.
+ *
+ * @param matchRate     e.g. "74.2%"
+ * @param nodeCount     total graph nodes
+ * @param edgeCount     total graph edges
+ * @param url           viewer URL
+ */
+export function renderSummaryBox(opts: {
+  matchRate: string;
+  nodeCount: number;
+  edgeCount: number;
+  url: string;
+}): string {
+  const { matchRate, nodeCount, edgeCount, url } = opts;
+
+  const lines = [
+    '┌─────────────────────────────────────────────────────────────┐',
+    `│  ${bold('lore')} — graph ready                                          │`,
+    '│                                                             │',
+    `│  match rate   ${matchRate.padEnd(10)}                                 │`,
+    `│  graph        ${String(nodeCount).padEnd(6)} nodes  ${String(edgeCount).padEnd(6)} edges           │`,
+    `│  viewer       ${url.padEnd(44)} │`,
+    '└─────────────────────────────────────────────────────────────┘',
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * Idempotently inject (or refresh) a "## lore" section into a markdown file.
+ * Pure function — exported for testing.
+ *
+ * Returns { content, injected } where:
+ *   - content  is the final file text (with section present)
+ *   - injected is true if the section was newly added (false if already present / updated)
+ */
+export function injectLoreSection(existing: string): { content: string; injected: boolean } {
+  const MARKER_START = '<!-- lore:start -->';
+  const MARKER_END = '<!-- lore:end -->';
+
+  const section = [
+    '',
+    '## lore — AI-conversation ↔ commit traceability',
+    '',
+    MARKER_START,
+    '<!-- This block is managed by `lore init` — do not edit manually. -->',
+    '',
+    'Before editing an unfamiliar file, run:',
+    '```',
+    'npx lore why <file>:<line> --repo .',
+    '```',
+    '',
+    'Before making a design decision, run:',
+    '```',
+    "npx lore ask \"<your question>\" --repo .",
+    '```',
+    '',
+    'Distilled constraints in `.lore/notes.json` encode prior decisions — respect them.',
+    'Run `npx lore go --repo .` to rebuild the graph and open the viewer.',
+    '',
+    MARKER_END,
+  ].join('\n');
+
+  const startIdx = existing.indexOf(MARKER_START);
+  const endIdx = existing.indexOf(MARKER_END);
+
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    // Section already present — replace its content (idempotent update)
+    const before = existing.slice(0, startIdx);
+    const after = existing.slice(endIdx + MARKER_END.length);
+    // Check if already identical to avoid spurious "updated" messages
+    const newContent = before + MARKER_START + section.slice(
+      section.indexOf(MARKER_START) + MARKER_START.length,
+      section.indexOf(MARKER_END) + MARKER_END.length,
+    ) + after;
+    return { content: newContent, injected: false };
+  }
+
+  // Not present — append
+  const newContent = existing.trimEnd() + '\n' + section + '\n';
+  return { content: newContent, injected: true };
+}
+
+/**
+ * Guard: ensure .lore/report.json exists; exit(1) with a helpful message if not.
+ * Called by commands (why, history, ask, serve) that need a prior `lore scan`.
+ */
+async function requireReport(repoPath: string): Promise<void> {
+  const reportPath = path.join(repoPath, '.lore', 'report.json');
+  try {
+    await fs.access(reportPath);
+  } catch {
+    console.error(
+      '\n' + red('Error:') + ' .lore/report.json not found.\n\n' +
+      `  Run ${bold('`lore scan --repo <path>`')} first, or\n` +
+      `  use ${bold('`lore go --repo <path>`')} for a one-step scan + viewer.\n`,
+    );
+    process.exit(1);
+  }
+}
+
+/**
+ * Ensure .lore/.gitignore exists with content "*".
+ * Idempotent: does NOT overwrite if already present.
+ * Called automatically during scan to prevent accidental commits.
+ */
+async function writeLoreGitignore(loreDir: string): Promise<void> {
+  const giPath = path.join(loreDir, '.gitignore');
+  try {
+    await fs.access(giPath);
+    // Already exists — leave it alone.
+  } catch {
+    // Does not exist — create it.
+    await fs.writeFile(giPath, '*\n', 'utf8');
+  }
+}
+
+/**
+ * Find a free port starting from `start`, probing up to `start + range`.
+ * Falls back to 0 (OS picks) if none found in range.
+ */
+async function findFreePort(start: number, range = 20): Promise<number> {
+  const net = await import('node:net');
+  for (let port = start; port < start + range; port++) {
+    const available = await new Promise<boolean>((resolve) => {
+      const s = net.createServer();
+      s.once('error', () => resolve(false));
+      s.listen(port, '127.0.0.1', () => {
+        s.close(() => resolve(true));
+      });
+    });
+    if (available) return port;
+  }
+  return 0; // Let OS pick
+}
+
+/** Open a URL in the default browser (best-effort; errors are non-fatal). */
+async function openBrowser(url: string): Promise<void> {
+  const { spawn } = await import('node:child_process');
+  const cmds: Record<string, string[]> = {
+    darwin: ['open'],
+    linux: ['xdg-open'],
+    win32: ['cmd', '/c', 'start'],
+  };
+  const platform = process.platform as string;
+  const parts = cmds[platform];
+  if (!parts) return; // unknown platform — skip silently
+  try {
+    spawn(parts[0]!, [...parts.slice(1), url], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
+  } catch {
+    // Browser open is non-fatal
+  }
 }
 
 // ── Render helpers (pure functions — tested independently) ───────────────────
@@ -259,16 +447,24 @@ export function renderFileHistory(
 
 // ── lore scan ────────────────────────────────────────────────────────────────
 
+interface ScanResult {
+  report: RepoMatchReport;
+  nodeCount: number;
+  edgeCount: number;
+  graphBuilt: boolean;
+}
+
 async function cmdScan(opts: {
   repo: string;
   maxCommits?: number;
   broad?: boolean;
   graph?: boolean;
-}): Promise<void> {
+  quiet?: boolean;
+}): Promise<ScanResult> {
   const repoPath = path.resolve(opts.repo);
   const t0 = now();
 
-  console.log(`\nlore scan: ${repoPath}\n`);
+  if (!opts.quiet) console.log(`\n${blue('▶')} lore scan: ${repoPath}\n`);
 
   // 1. Discover transcripts — run all registered parsers
   const t1 = now();
@@ -287,7 +483,7 @@ async function cmdScan(opts: {
     parserCountParts.push(`${p.agent}=${paths.length}`);
   }
   const totalPaths = perParserPaths.reduce((s, ps) => s + ps.length, 0);
-  console.log(`[discover] found ${totalPaths} transcripts  ${parserCountParts.join(' ')}  ${elapsed(t1)}`);
+  if (!opts.quiet) console.log(`${green('✓')} [discover] found ${totalPaths} transcripts  ${dim(parserCountParts.join(' '))}  ${dim(elapsed(t1))}`);
 
   // 2. Parse concurrently across all parsers — warn and skip failures
   const t2 = now();
@@ -314,7 +510,7 @@ async function cmdScan(opts: {
       console.warn(`[parse] WARN: skipped ${parseJobs[i]!.path}: ${String(s.reason)}`);
     }
   }
-  console.log(`[parse]    parsed ${parseResults.length}/${totalPaths} sessions  ${elapsed(t2)}`);
+  if (!opts.quiet) console.log(`${green('✓')} [parse]    parsed ${parseResults.length}/${totalPaths} sessions  ${dim(elapsed(t2))}`);
 
   // 3. Read git history
   const t3 = now();
@@ -325,14 +521,14 @@ async function cmdScan(opts: {
   };
   if (opts.maxCommits !== undefined) historyOpts.maxCommits = opts.maxCommits;
   const commits = await gitReader.readHistory(repoPath, historyOpts);
-  console.log(`[git]      read ${commits.length} commits  ${elapsed(t3)}`);
+  if (!opts.quiet) console.log(`${green('✓')} [git]      read ${commits.length} commits  ${dim(elapsed(t3))}`);
 
   // 4. Run match engine
   const t4 = now();
   const engine = await loadMatchEngine();
   const sessions = parseResults.map((r) => r.session);
   const report: RepoMatchReport = engine.match(repoPath, commits, sessions);
-  console.log(`[match]    produced ${report.matches.length} candidates  ${elapsed(t4)}`);
+  if (!opts.quiet) console.log(`${green('✓')} [match]    produced ${report.matches.length} candidates  ${dim(elapsed(t4))}`);
 
   // 5. Build extended report file
   const sessionSourceMap: Record<string, string> = {};
@@ -349,17 +545,24 @@ async function cmdScan(opts: {
     skippedBySession,
   };
 
-  // 6. Write .lore/report.json
+  // 6. Write .lore/report.json + production-safety .gitignore
   const loreDir = path.join(repoPath, '.lore');
   await fs.mkdir(loreDir, { recursive: true });
+  // Safety: auto-create .lore/.gitignore="*" so transcripts/notes can't be
+  // accidentally committed (they contain full conversation content).
+  await writeLoreGitignore(loreDir);
   const reportPath = path.join(loreDir, 'report.json');
   await fs.writeFile(reportPath, JSON.stringify(loreReport, null, 2), 'utf8');
-  console.log(`\n[write]    ${reportPath}  ${elapsed(t0)} total\n`);
+  if (!opts.quiet) console.log(`\n${green('✓')} [write]    ${reportPath}  ${dim(elapsed(t0) + ' total')}\n`);
 
   // 7. Print human summary
-  console.log(renderReport(report));
+  if (!opts.quiet) console.log(renderReport(report));
 
   // 8. Build graph (skipped with --no-graph)
+  let nodeCount = 0;
+  let edgeCount = 0;
+  let graphBuilt = false;
+
   if (opts.graph !== false) {
     const tg = now();
     try {
@@ -374,22 +577,25 @@ async function cmdScan(opts: {
       await store.rebuild(graphData);
       await store.close();
 
-      const nodeCount =
+      nodeCount =
         graphData.sessions.length +
         graphData.commits.length +
         graphData.files.length;
-      const edgeCount =
+      edgeCount =
         graphData.produced.length +
         graphData.touches.length +
         graphData.edited.length;
+      graphBuilt = true;
 
-      console.log(
-        `[graph]    nodes=${nodeCount} edges=${edgeCount} backend=${store.backend}  ${elapsed(tg)}`,
+      if (!opts.quiet) console.log(
+        `${green('✓')} [graph]    nodes=${nodeCount} edges=${edgeCount} backend=${store.backend}  ${dim(elapsed(tg))}`,
       );
     } catch (e) {
-      console.error(`[graph]    WARN: graph build failed (${String(e)})`);
+      console.error(`${yellow('⚠')} [graph]    graph build failed (${String(e)})`);
     }
   }
+
+  return { report, nodeCount, edgeCount, graphBuilt };
 }
 
 // ── lore sample ──────────────────────────────────────────────────────────────
@@ -627,6 +833,9 @@ async function cmdWhy(
     file = rawFile;
   }
 
+  // Guard: require .lore/report.json
+  await requireReport(repoPath);
+
   const whyEngine = await loadWhyEngine();
   const result = await whyEngine.why(repoPath, file, line);
 
@@ -658,6 +867,9 @@ async function cmdHistory(
   } else {
     relPath = filePath;
   }
+
+  // Guard: require .lore/report.json
+  await requireReport(repoPath);
 
   const createStore = await loadGraphFactory();
   const store: GraphStore = await createStore(repoPath);
@@ -771,6 +983,10 @@ async function cmdAsk(
   opts: { repo: string; includeSuperseded?: boolean; json?: boolean },
 ): Promise<void> {
   const repoPath = path.resolve(opts.repo);
+
+  // Guard: require .lore/report.json
+  await requireReport(repoPath);
+
   const askEngine = await loadAskEngine();
 
   const result = await askEngine.ask(repoPath, question, {
@@ -812,29 +1028,187 @@ async function cmdMcp(opts: { repo: string }): Promise<void> {
 
 // ── lore serve ────────────────────────────────────────────────────────────────
 
-async function cmdServe(opts: { repo: string; port?: number }): Promise<void> {
+async function cmdServe(opts: { repo: string; port?: number }): Promise<number> {
   const repoPath = path.resolve(opts.repo);
-  const port = opts.port ?? 4017;
+  const startPort = opts.port ?? 4017;
+
+  // Guard: require .lore/report.json
+  await requireReport(repoPath);
 
   const mod = await import('./viewer/server.js');
   const server = mod.createViewerServer(repoPath);
-  const actualPort = await server.start(port);
+  const freePort = await findFreePort(startPort);
+  const actualPort = await server.start(freePort);
   const url = `http://localhost:${actualPort}`;
-  console.log(`\nlore serve: ${repoPath}`);
-  console.log(`  → ${url}\n`);
+  console.log(`\n${green('✓')} lore serve: ${repoPath}`);
+  console.log(`  ${blue('→')} ${bold(url)}\n`);
   // Long-lived: stay alive until SIGINT/SIGTERM.
+  return actualPort;
+}
+
+// ── lore go (default one-liner: scan → serve → open browser) ─────────────────
+
+async function cmdGo(opts: { repo: string; port?: number }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const startPort = opts.port ?? 4017;
+
+  console.log(`\n${blue('▶')} lore go — ${repoPath}\n`);
+
+  // Step 1: scan (broad by default — catches all worktree sessions)
+  console.log(`${blue('1/3')} scanning…\n`);
+  const scanResult = await cmdScan({ repo: repoPath, broad: true, graph: true });
+
+  if (!scanResult.graphBuilt) {
+    console.log(`\n${yellow('⚠')}  graph not built — viewer may be empty.`);
+    console.log(`    Run \`lore scan --repo ${repoPath}\` manually for details.\n`);
+  }
+
+  // Step 2: start viewer server
+  console.log(`\n${blue('2/3')} starting viewer…`);
+  const mod = await import('./viewer/server.js');
+  const server = mod.createViewerServer(repoPath);
+  const freePort = await findFreePort(startPort);
+  const actualPort = await server.start(freePort);
+  const url = `http://localhost:${actualPort}`;
+  console.log(`${green('✓')} viewer ready at ${bold(url)}\n`);
+
+  // Step 3: open browser (best-effort; failure is non-fatal)
+  console.log(`${blue('3/3')} opening browser…`);
+  try {
+    await openBrowser(url);
+    console.log(`${green('✓')} browser launched\n`);
+  } catch {
+    console.log(`${yellow('⚠')}  could not open browser automatically.\n    Visit: ${url}\n`);
+  }
+
+  // Summary box
+  const report = scanResult.report;
+  const strongPct = report.commitsTotal > 0
+    ? ((report.commitsMatchedStrong / report.commitsTotal) * 100).toFixed(1) + '%'
+    : '0.0%';
+  const inWinRate = report.window && report.commitsInWindow > 0
+    ? (((report.strongInWindow + report.weakInWindow) / report.commitsInWindow) * 100).toFixed(1) + '% in-window'
+    : null;
+  const matchRate = inWinRate ?? strongPct;
+
+  console.log(renderSummaryBox({
+    matchRate,
+    nodeCount: scanResult.nodeCount,
+    edgeCount: scanResult.edgeCount,
+    url,
+  }));
+  console.log('');
+  console.log(`${dim('Press Ctrl+C to stop the viewer server.')}`);
+  // Long-lived: keep process alive until SIGINT/SIGTERM.
+}
+
+// ── lore init ─────────────────────────────────────────────────────────────────
+
+async function cmdInit(opts: { repo: string }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  console.log(`\n${blue('▶')} lore init: ${repoPath}\n`);
+
+  const targets: { file: string; label: string }[] = [
+    { file: path.join(repoPath, 'CLAUDE.md'), label: 'CLAUDE.md' },
+    { file: path.join(repoPath, 'AGENTS.md'), label: 'AGENTS.md' },
+  ];
+
+  let anyChanged = false;
+  for (const { file, label } of targets) {
+    let existing = '';
+    let exists = true;
+    try {
+      existing = await fs.readFile(file, 'utf8');
+    } catch {
+      exists = false;
+    }
+
+    const { content, injected } = injectLoreSection(existing);
+
+    if (!exists) {
+      // File does not exist — only create CLAUDE.md, not AGENTS.md
+      if (label === 'CLAUDE.md') {
+        await fs.writeFile(file, content, 'utf8');
+        console.log(`${green('✓')} created ${label} with lore section`);
+        anyChanged = true;
+      } else {
+        console.log(`${dim('–')} ${label} — not found, skipping`);
+      }
+    } else if (injected) {
+      await fs.writeFile(file, content, 'utf8');
+      console.log(`${green('✓')} injected lore section into ${label}`);
+      anyChanged = true;
+    } else {
+      // Section already present — refresh content (idempotent)
+      if (existing !== content) {
+        await fs.writeFile(file, content, 'utf8');
+        console.log(`${dim('↻')} ${label} — lore section refreshed`);
+        anyChanged = true;
+      } else {
+        console.log(`${dim('–')} ${label} — lore section already up to date`);
+      }
+    }
+  }
+
+  if (!anyChanged) {
+    console.log(`\n${dim('All files already up to date — no changes made.')}`);
+  }
+  console.log('');
 }
 
 // ── Commander wiring ─────────────────────────────────────────────────────────
 
 program
   .name('lore')
-  .description('Link AI agent conversations to the git commits they produced')
-  .version('0.0.1');
+  .description(
+    'lore — the intent layer for Git.\n' +
+    'Link AI agent conversations to the commits they produced,\n' +
+    'then query why any line of code was written.\n\n' +
+    'Run `lore` (no subcommand) to scan + open the viewer — equivalent to `lore go`.',
+  )
+  .version('0.1.0')
+  // NOTE: root-level options intentionally omitted to avoid shadowing subcommand --repo.
+  // The default action below handles `lore` (no args) ≡ `lore go --repo .`.
+  .action(() => {
+    // lore go is long-lived: no process.exit(0).
+    cmdGo({ repo: '.' }).catch((e) => {
+      console.error(red('Error:'), e);
+      process.exit(1);
+    });
+  });
+
+program
+  .command('go')
+  .description('Scan repo, build graph, open viewer in browser — all in one step (default command)')
+  .option('--repo <path>', 'path to the git repository (default: cwd)', '.')
+  .option('--port <n>', 'viewer port (default: 4017, auto-increments if busy)', (v) => parseInt(v, 10))
+  .action((opts: { repo: string; port?: number }) => {
+    // lore go is long-lived: no process.exit(0).
+    cmdGo(opts).catch((e) => {
+      console.error(red('Error:'), e);
+      process.exit(1);
+    });
+  });
+
+program
+  .command('init')
+  .description('Inject lore guidance into CLAUDE.md / AGENTS.md (idempotent — safe to run multiple times)')
+  .option('--repo <path>', 'path to the git repository (default: cwd)', '.')
+  .action((opts: { repo: string }) => {
+    cmdInit(opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error(red('init failed:'), e);
+        process.exit(1);
+      },
+    );
+  });
 
 program
   .command('scan')
-  .description('Scan a repository: discover transcripts → parse → match → write .lore/report.json')
+  .description('Scan a repo: discover transcripts → parse → match → build graph → write .lore/report.json')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--max-commits <n>', 'limit git history to N commits', (v) => parseInt(v, 10))
   .option('--broad', 'scan ALL local transcripts, not just this repo\'s project dir (catches worktree sessions)')
@@ -845,7 +1219,7 @@ program
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
-        console.error('scan failed:', e);
+        console.error(red('scan failed:'), e);
         process.exit(1);
       },
     );
@@ -853,7 +1227,7 @@ program
 
 program
   .command('sample')
-  .description('Sample matches from .lore/report.json and display context for review')
+  .description('Sample matches from .lore/report.json and display conversation context for review')
   .requiredOption('--repo <path>', 'path to the git repository')
   .requiredOption('-n <num>', 'number of matches to sample')
   .option('--tier <tier>', 'filter by tier: strong | weak')
@@ -863,7 +1237,7 @@ program
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
-        console.error('sample failed:', e);
+        console.error(red('sample failed:'), e);
         process.exit(1);
       },
     );
@@ -871,7 +1245,7 @@ program
 
 program
   .command('why')
-  .description('Explain why a line of code was written — trace it back to the conversation')
+  .description('Explain why a line of code was written — trace it back to the AI conversation')
   .argument('<target>', 'file and line, e.g. src/a.ts:42 or /abs/path/to/file.ts:42')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--json', 'output raw WhyResult as JSON instead of human-readable text')
@@ -881,7 +1255,7 @@ program
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
-        console.error('why failed:', e);
+        console.error(red('why failed:'), e);
         process.exit(1);
       },
     );
@@ -889,7 +1263,7 @@ program
 
 program
   .command('history')
-  .description('Show the evolution timeline of a file (commits + conversation attributions)')
+  .description('Show the full evolution timeline of a file: commits + conversation attributions')
   .argument('<path>', 'repo-relative or absolute path to the file')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--json', 'output raw history array as JSON')
@@ -899,7 +1273,7 @@ program
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
-        console.error('history failed:', e);
+        console.error(red('history failed:'), e);
         process.exit(1);
       },
     );
@@ -907,7 +1281,7 @@ program
 
 program
   .command('distill')
-  .description('Distil sessions into semantic notes (Decision/Constraint/RejectedApproach) using claude CLI')
+  .description('Distil conversations into semantic notes (Decision/Constraint/RejectedApproach) using the claude CLI')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--max-sessions <n>', 'limit distillation to N sessions', (v) => parseInt(v, 10))
   .action((opts: { repo: string; maxSessions?: number }) => {
@@ -916,7 +1290,7 @@ program
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
-        console.error('distill failed:', e);
+        console.error(red('distill failed:'), e);
         process.exit(1);
       },
     );
@@ -924,7 +1298,7 @@ program
 
 program
   .command('ask')
-  .description('Search the project\'s distilled knowledge for a question')
+  .description('Search the project\'s distilled knowledge for a natural-language question')
   .argument('<question>', 'natural-language question about the codebase')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--include-superseded', 'include invalidated/superseded notes in results')
@@ -935,7 +1309,7 @@ program
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
-        console.error('ask failed:', e);
+        console.error(red('ask failed:'), e);
         process.exit(1);
       },
     );
@@ -945,7 +1319,7 @@ program
   .command('mcp')
   .description(
     'Start the lore MCP server (stdio transport). ' +
-    'Long-lived process — connect via MCP client. ' +
+    'Long-lived process — connect via any MCP client. ' +
     'All log output goes to stderr; stdout is reserved for JSON-RPC.',
   )
   .requiredOption('--repo <path>', 'path to the git repository')
@@ -960,13 +1334,13 @@ program
 
 program
   .command('serve')
-  .description('Start the local graph visualisation server (D3 force-directed graph + timeline playback)')
+  .description('Start the local graph viewer server (force-directed graph + timeline playback)')
   .requiredOption('--repo <path>', 'path to the git repository')
-  .option('--port <n>', 'port to listen on (default: 4017)', (v) => parseInt(v, 10))
+  .option('--port <n>', 'port to listen on (default: 4017, auto-increments if busy)', (v) => parseInt(v, 10))
   .action((opts: { repo: string; port?: number }) => {
     // lore serve is a long-lived process: no process.exit(0).
     cmdServe(opts).catch((e) => {
-      console.error('serve failed:', e);
+      console.error(red('serve failed:'), e);
       process.exit(1);
     });
   });

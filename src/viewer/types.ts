@@ -15,6 +15,15 @@
 import type { GraphData } from '../graph/types.js';
 import type { DistilledNote } from '../distill/types.js';
 
+/** 抽屉内嵌的一条对话摘录（锚点 = sessionId + seq）。 */
+export interface ViewerExcerpt {
+  sessionId: string;
+  seq: number;
+  role: 'user' | 'assistant';
+  text: string;
+  ts: string;
+}
+
 export interface ViewerPayload {
   repo: string;
   generatedAt: string;
@@ -23,6 +32,12 @@ export interface ViewerPayload {
   notes: DistilledNote[];
   /** 时间轴范围（commit 时间的 min/max，ISO）。 */
   timeRange: { start: string; end: string } | null;
+  /**
+   * commitHash → 该 commit top-1 归因 session 的 ≤2 条对话摘录（user 优先，
+   * 每条 ≤320 字符）。无可解析摘录的 commit 不出现在此 map。可选——
+   * 计算失败不应让 payload 挂掉。
+   */
+  excerpts?: Record<string, ViewerExcerpt[]>;
 }
 
 export interface ViewerServer {
