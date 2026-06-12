@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-lang="zh" data-motion="on">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>lore — Git 的意图层 / The intent layer for Git</title>
+<link rel="stylesheet" href="lore-site.css">
+</head>
+<body>
+
+<!-- ───────────────────────── 顶栏 ───────────────────────── -->
+<header class="nav" data-screen-label="nav">
+  <div class="container nav-inner">
+    <a class="brand" href="#top">lore<span class="cursor"></span><span class="ver">v0.1.0</span></a>
+    <nav class="nav-links">
+      <a href="#why"><span class="zh">为什么</span><span class="en">Why</span></a>
+      <a href="#how"><span class="zh">工作原理</span><span class="en">How it works</span></a>
+      <a href="#commands"><span class="zh">命令</span><span class="en">Commands</span></a>
+      <a href="#viewer">Viewer</a>
+      <a href="#mcp">MCP</a>
+      <a href="#proof"><span class="zh">验证</span><span class="en">Validation</span></a>
+    </nav>
+    <div class="nav-right">
+      <div class="lang-toggle" role="group" aria-label="Language">
+        <button id="lang-zh" class="active" type="button">中</button>
+        <button id="lang-en" type="button">EN</button>
+      </div>
+      <a class="btn" href="https://github.com/tt-a1i/lore" target="_blank" rel="noopener">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</header>
+
+<!-- ───────────────────────── Hero ───────────────────────── -->
+<section class="hero" id="top" data-screen-label="hero">
+  <div class="container">
+    <div class="hero-copy">
+      <span class="eyebrow"><span class="dot"></span><span class="zh">Git 的意图层 · Apache-2.0 开源</span><span class="en">The intent layer for Git · Apache-2.0</span></span>
+      <h1>
+        <span class="zh">Git 记录改了什么。<br>lore 记录<em>为什么</em>。</span>
+        <span class="en">Git records what changed.<br>lore records <em>why</em>.</span>
+      </h1>
+      <p class="sub">
+        <span class="zh">把 AI agent 的对话关联到它产出的 commit——任何一行代码，都能问出它存在的原因，并得到当时真实的那段对话。</span>
+        <span class="en">lore links AI agent conversations to the commits they produced — ask any line of code why it exists, and get the actual conversation that shaped it.</span>
+      </p>
+      <div class="hero-actions">
+        <div class="install">
+          <span class="prompt">$</span>
+          <span id="install-cmd">npx lore scan --repo .</span>
+          <button id="copy-btn" type="button"><span class="zh">复制</span><span class="en">Copy</span></button>
+        </div>
+        <a class="btn primary" href="https://github.com/tt-a1i/lore" target="_blank" rel="noopener">
+          <span class="zh">GitHub 上查看</span><span class="en">View on GitHub</span>
+        </a>
+      </div>
+      <p class="hero-note">
+        <span class="zh">npm 发布在即 — 现可从源码运行 · 无新 VCS，无迁移，直接作用于现有仓库</span>
+        <span class="en">npm publish coming soon — runs from source today · no new VCS, no migration</span>
+      </p>
+    </div>
+    <div class="hero-visual">
+      <div class="story-mini" aria-hidden="true">
+        <div class="story-bar">
+          <span>story · attribution timeline</span>
+          <span class="spacer"></span>
+          <span>726 commits · 71% traced</span>
+        </div>
+        <svg id="story-svg" viewBox="0 0 640 320" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="terminal" id="terminal">
+        <div class="terminal-bar">
+          <span class="light"></span><span class="light"></span><span class="light"></span>
+          <span class="title">~/your-repo</span>
+          <button class="replay" id="replay-btn" type="button">↻ replay</button>
+        </div>
+        <div class="terminal-body" id="terminal-body"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Why ───────────────────────── -->
+<section class="block" id="why" data-screen-label="why">
+  <div class="container">
+    <p class="kicker">01 — Why</p>
+    <p class="why-quote reveal">
+      <span class="zh">代码已经廉价，<em>理解</em>没有。当 agent 写下大部分代码，真实的需求、半途发现的约束、被否掉的方案——都活在会话结束即蒸发的对话里。</span>
+      <span class="en">Code is cheap now; <em>understanding</em> is not. When agents write most of the code, the real requirements, mid-flight constraints, and rejected approaches live in conversations that evaporate when the session ends.</span>
+    </p>
+    <div class="why-grid">
+      <div class="why-card reveal">
+        <p class="who"><span class="zh">给人</span><span class="en">For humans</span></p>
+        <h3><code>lore why &lt;file&gt;:&lt;line&gt;</code></h3>
+        <p>
+          <span class="zh">从任何一行代码，回溯到产生它的那段对话。审代码不再靠猜测意图。</span>
+          <span class="en">From any line of code back to the conversation behind it. Review code without guessing intent.</span>
+        </p>
+      </div>
+      <div class="why-card reveal">
+        <p class="who"><span class="zh">给 agent</span><span class="en">For agents</span></p>
+        <h3><span class="zh">项目的情景记忆</span><span class="en">Episodic memory for your repo</span></h3>
+        <p>
+          <span class="zh">MCP server 让任何 agent 继承项目历史——过去的决策、被否的方案、每个文件的演化。新会话不再冷启动。</span>
+          <span class="en">An MCP server gives any agent your project's past decisions, rejected approaches, and file evolution. New sessions stop being cold starts.</span>
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── How it works ───────────────────────── -->
+<section class="block tinted" id="how" data-screen-label="how-it-works">
+  <div class="container">
+    <p class="kicker">02 — How it works</p>
+    <h2><span class="zh">四步，从散落的 transcript 到可追问的图谱</span><span class="en">Four steps from loose transcripts to a queryable graph</span></h2>
+    <p class="lede">
+      <span class="zh">lore 架在 Git 之上——解析磁盘上已有的对话记录，安装当下即可回溯索引全部历史。</span>
+      <span class="en">lore sits on top of Git — it parses the transcripts already on your disk, retroactively indexing your entire history the minute you install.</span>
+    </p>
+    <div class="steps">
+      <div class="step reveal">
+        <p class="num">01</p>
+        <h3><span class="zh">捕获</span><span class="en">Capture</span></h3>
+        <p class="h3-en mono">Capture</p>
+        <p>
+          <span class="zh">把 Claude Code、Codex CLI、OpenCode 的本地 transcript 解析为统一事件流。</span>
+          <span class="en">Parses local transcripts from Claude Code, Codex CLI, and OpenCode into one unified event stream.</span>
+        </p>
+      </div>
+      <div class="step reveal">
+        <p class="num">02</p>
+        <h3><span class="zh">匹配</span><span class="en">Match</span></h3>
+        <p class="h3-en mono">Match</p>
+        <p>
+          <span class="zh">三层引擎把 commit 归因到会话，处理 squash、worktree 与 rebase。</span>
+          <span class="en">A 3-tier engine attributes commits to sessions — squashes, worktrees, and rebases included.</span>
+        </p>
+        <div class="tiers">
+          <span class="tier"><b>T0</b><span class="zh">transcript 内 SHA 精确锚定</span><span class="en">exact SHA anchoring</span></span>
+          <span class="tier"><b>T1</b><span class="zh">编辑与 hunk 内容重叠 ·0.8</span><span class="en">content overlap ·0.8</span></span>
+          <span class="tier"><b>T2</b><span class="zh">按文件时间窗相关 ·0.2</span><span class="en">time-window correlation ·0.2</span></span>
+        </div>
+      </div>
+      <div class="step reveal">
+        <p class="num">03</p>
+        <h3><span class="zh">图谱</span><span class="en">Graph</span></h3>
+        <p class="h3-en mono">Graph</p>
+        <p>
+          <span class="zh">会话、commit、文件与决策进入嵌入式图存储；双时间有效性——被取代的决策标记失效，从不删除。</span>
+          <span class="en">Sessions, commits, files and decisions in an embedded graph with bi-temporal validity — superseded decisions are invalidated, never deleted.</span>
+        </p>
+      </div>
+      <div class="step reveal">
+        <p class="num">04</p>
+        <h3><span class="zh">蒸馏</span><span class="en">Distill</span></h3>
+        <p class="h3-en mono">Distill</p>
+        <p>
+          <span class="zh">每会话一次 <code class="mono">claude -p</code> 调用，提取决策、约束与被否方案，逐条锚回原始对话消息。</span>
+          <span class="en">One <code class="mono">claude -p</code> call per session extracts decisions, constraints and rejected approaches — each anchored back to the exact messages.</span>
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── 命令 ───────────────────────── -->
+<section class="block" id="commands" data-screen-label="commands">
+  <div class="container">
+    <p class="kicker">03 — Commands</p>
+    <h2><span class="zh">八个命令，一条认知链路</span><span class="en">Eight commands, one chain of understanding</span></h2>
+    <div class="cmd-table reveal">
+      <div class="cmd-row"><code>lore scan <span class="arg">--repo &lt;path&gt;</span></code><span class="desc"><span class="zh">索引 transcript，跑匹配引擎，构建图谱</span><span class="en">Index transcripts, run the match engine, build the graph</span></span></div>
+      <div class="cmd-row"><code>lore why <span class="arg">&lt;file&gt;:&lt;line&gt;</span></code><span class="desc"><span class="zh">从任意一行代码回溯到产生它的对话</span><span class="en">Trace any line back to the conversation that produced it</span></span></div>
+      <div class="cmd-row"><code>lore history <span class="arg">&lt;file&gt;</span></code><span class="desc"><span class="zh">文件的完整演化时间线，逐 commit 附对话归因</span><span class="en">Full evolution timeline of a file, with attribution per commit</span></span></div>
+      <div class="cmd-row"><code>lore distill</code><span class="desc"><span class="zh">LLM 蒸馏会话为决策 / 约束 / 被否方案笔记</span><span class="en">Distill sessions into Decision / Constraint / RejectedApproach notes</span></span></div>
+      <div class="cmd-row"><code>lore ask <span class="arg">"&lt;question&gt;"</span></code><span class="desc"><span class="zh">跨决策与对话消息的全文检索</span><span class="en">Full-text search across decisions and conversation messages</span></span></div>
+      <div class="cmd-row"><code>lore sample <span class="arg">-n &lt;N&gt;</span></code><span class="desc"><span class="zh">抽样匹配结果，人工或 agent 抽查归因准确率</span><span class="en">Sample matches for spot-checking attribution accuracy</span></span></div>
+      <div class="cmd-row"><code>lore mcp</code><span class="desc"><span class="zh">启动 stdio MCP server，给 agent 三个记忆工具</span><span class="en">Start the stdio MCP server exposing three memory tools</span></span></div>
+      <div class="cmd-row"><code>lore serve <span class="arg">--port 4017</span></code><span class="desc"><span class="zh">本地图谱 viewer，四视图 + 时间轴回放</span><span class="en">Local graph viewer — four views plus timeline playback</span></span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Viewer ───────────────────────── -->
+<section class="block tinted" id="viewer" data-screen-label="viewer">
+  <div class="container">
+    <p class="kicker">04 — Viewer</p>
+    <h2><span class="zh">四个视图，看见仓库的记忆</span><span class="en">Four views into your repo's memory</span></h2>
+    <p class="lede">
+      <span class="zh"><code class="mono">lore serve</code> 在本地启动 viewer——四个视图共享同一条时间轴 scrubber，拖动即可从第一天回放整个仓库的历史。</span>
+      <span class="en"><code class="mono">lore serve</code> launches the local viewer — all four views share one timeline scrubber; drag it to replay your repo's history from day one.</span>
+    </p>
+    <div class="views">
+      <div class="view-card reveal">
+        <div class="view-shot"><span class="ph">screenshot: view-story.png</span></div>
+        <div class="view-meta">
+          <div class="head"><h3>Story</h3><span class="key">1</span></div>
+          <p><span class="zh">叙事账本：会话分组下的归因 commit 流，绿轨标记出处，内联当时的 USER/AGENT 对话摘录；无对话的日子折叠为一行。</span><span class="en">A narrative ledger: attributed commits grouped by session with green provenance rails, inline USER/AGENT excerpts, and no-conversation days collapsed to a single bar.</span></p>
+        </div>
+      </div>
+      <div class="view-card reveal">
+        <div class="view-shot"><span class="ph">screenshot: view-graph.png</span></div>
+        <div class="view-meta">
+          <div class="head"><h3>Graph</h3><span class="key">2</span></div>
+          <p><span class="zh">力导向知识图谱：会话、commit、文件、决策为节点；悬停高亮一度邻居。</span><span class="en">Force-directed knowledge graph: sessions, commits, files and decisions as nodes; hover to highlight first-degree neighbours.</span></p>
+        </div>
+      </div>
+      <div class="view-card reveal">
+        <div class="view-shot"><span class="ph">screenshot: view-map.png</span></div>
+        <div class="view-meta">
+          <div class="head"><h3>Map</h3><span class="key">3</span></div>
+          <p><span class="zh">仓库 treemap——按 AI 归因覆盖度着色：灰为盲区，绿为完全可追溯。</span><span class="en">Repository treemap coloured by AI attribution coverage — grey is a dark zone, green is fully traced.</span></p>
+        </div>
+      </div>
+      <div class="view-card reveal">
+        <div class="view-shot"><span class="ph">screenshot: view-decisions.png</span></div>
+        <div class="view-meta">
+          <div class="head"><h3>Decisions</h3><span class="key">4</span></div>
+          <p><span class="zh">全部蒸馏笔记的瀑布卡片流；全文检索；时间轴滑块让被取代的决策渐暗。</span><span class="en">Waterfall card stream of every distilled note; full-text search; the timeline slider dims invalidated decisions.</span></p>
+        </div>
+      </div>
+    </div>
+    <p class="views-note"><span class="line"></span><span class="zh">截图待捕获 — docs/assets/*.png</span><span class="en">screenshots pending — docs/assets/*.png</span><span class="line"></span></p>
+  </div>
+</section>
+
+<!-- ───────────────────────── MCP ───────────────────────── -->
+<section class="block" id="mcp" data-screen-label="mcp">
+  <div class="container mcp-grid">
+    <div>
+      <p class="kicker">05 — MCP</p>
+      <h2><span class="zh">给每个 agent 接上项目记忆</span><span class="en">Plug project memory into any agent</span></h2>
+      <p class="lede">
+        <span class="zh">在任何 MCP host 里加一段配置，agent 即获得三个工具：行级归因、决策检索、文件演化。它写代码前，先知道这个仓库经历过什么。</span>
+        <span class="en">One config block in any MCP host and the agent gains three tools: line-level attribution, decision search, file evolution. Before it writes code, it knows what this repo has been through.</span>
+      </p>
+      <div class="tool-chips">
+        <span class="tool-chip">lore_why</span>
+        <span class="tool-chip">lore_ask</span>
+        <span class="tool-chip">lore_history</span>
+      </div>
+    </div>
+    <div class="code-card reveal">
+      <div class="code-bar">claude_desktop_config.json</div>
+      <pre>{
+  <span class="tok-k">"mcpServers"</span><span class="tok-p">:</span> {
+    <span class="tok-k">"lore"</span><span class="tok-p">:</span> {
+      <span class="tok-k">"command"</span><span class="tok-p">:</span> <span class="tok-s">"lore"</span><span class="tok-p">,</span>
+      <span class="tok-k">"args"</span><span class="tok-p">:</span> [<span class="tok-s">"mcp"</span><span class="tok-p">,</span> <span class="tok-s">"--repo"</span><span class="tok-p">,</span> <span class="tok-s">"/path/to/your/repo"</span>]
+    }
+  }
+}</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── 验证 ───────────────────────── -->
+<section class="block tinted" id="proof" data-screen-label="validation">
+  <div class="container">
+    <p class="kicker">06 — Validation</p>
+    <h2><span class="zh">归因不靠感觉——靠对抗验证</span><span class="en">Attribution proven adversarially, not assumed</span></h2>
+    <p class="lede">
+      <span class="zh">在一个 726 commit 的生产仓库上，独立验证 agent 被明确指示去「推翻」每一条归因。</span>
+      <span class="en">On a 726-commit production repo, independent verifier agents were explicitly instructed to refute each attribution.</span>
+    </p>
+    <div class="stats">
+      <div class="stat reveal">
+        <p class="big"><em>100</em>%</p>
+        <p class="label"><span class="zh">strong 层归因精度</span><span class="en">Strong-tier precision</span></p>
+        <p><span class="zh">对抗验证 20/20 全部成立；weak 层 80%。</span><span class="en">20/20 upheld under adversarial review; 80% on the weak tier.</span></p>
+      </div>
+      <div class="stat reveal">
+        <p class="big">71%</p>
+        <p class="label"><span class="zh">commit 覆盖率</span><span class="en">Commit coverage</span></p>
+        <p><span class="zh">transcript 保留窗口内；每个盲区都有解释——云端会话、merge commit、未落盘的记录。</span><span class="en">Within the retention window; every blind spot accounted for — cloud sessions, merges, transcripts never written locally.</span></p>
+      </div>
+      <div class="stat reveal">
+        <p class="big">&lt;30<span class="t-dim">s</span></p>
+        <p class="label"><span class="zh">全量扫描</span><span class="en">Full scan</span></p>
+        <p><span class="zh">55MB transcript、709 commit 的仓库一次跑完；安装即回溯索引全部既有历史。</span><span class="en">55MB of transcripts, 709 commits, one pass; existing history indexed the minute you install.</span></p>
+      </div>
+    </div>
+    <p class="stats-foot">
+      <span class="zh">方法与失败模式分析见 DESIGN.md——包括第一轮 50% 精度的两个失败模式，以及修复它们的证据下限机制。</span>
+      <span class="en">Method and failure-mode analysis in DESIGN.md — including the first round's 50% precision, and the evidence-floor mechanism that fixed it.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ───────────────────────── CTA ───────────────────────── -->
+<section class="cta" data-screen-label="cta">
+  <div class="container">
+    <p class="kicker">$ lore why</p>
+    <h2><span class="zh">你的仓库已经有答案了，<br>只是还没人去问。</span><span class="en">Your repo already has the answers.<br>No one has asked it yet.</span></h2>
+    <div class="hero-actions">
+      <div class="install">
+        <span class="prompt">$</span>
+        <span>npx lore scan --repo .</span>
+        <button class="copy-btn-2" id="copy-btn-2" type="button"><span class="zh">复制</span><span class="en">Copy</span></button>
+      </div>
+      <a class="btn primary" href="https://github.com/tt-a1i/lore" target="_blank" rel="noopener">
+        <span class="zh">去 GitHub 点亮 ★</span><span class="en">Star on GitHub ★</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Footer ───────────────────────── -->
+<footer data-screen-label="footer">
+  <div class="container">
+    <div class="foot-inner">
+      <p class="foot-brand">lore<span class="tag"><span class="zh">Git 的意图层</span><span class="en">The intent layer for Git</span></span></p>
+      <div class="foot-road">
+        <p class="t"><span class="zh">路线图 · 下一步</span><span class="en">Roadmap · next</span></p>
+        <div class="road-chips">
+          <span class="road-chip">git-notes interop</span>
+          <span class="road-chip"><span class="zh">脱敏 + 团队共享</span><span class="en">redaction + team sharing</span></span>
+          <span class="road-chip">embedding retrieval</span>
+          <span class="road-chip"><span class="zh">代码存活率加权</span><span class="en">code-survival weighting</span></span>
+        </div>
+      </div>
+    </div>
+    <div class="foot-meta">
+      <span>Apache-2.0 © 2026 lore contributors</span>
+      <span class="spacer"></span>
+      <a href="https://github.com/tt-a1i/lore" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/tt-a1i/lore#readme" target="_blank" rel="noopener">README</a>
+      <a href="https://github.com/tt-a1i/lore/issues" target="_blank" rel="noopener">Issues</a>
+    </div>
+  </div>
+</footer>
+
+<script src="lore-site.js"></script>
+
+</body>
+</html>
