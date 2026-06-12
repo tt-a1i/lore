@@ -31,7 +31,7 @@ lore sits **on top of Git** — no new VCS, no migration, works with your existi
 
 ## Status
 
-Early development — M1 (matching engine) is implemented and validated against real repos. Not yet published to npm.
+Early development — M1 (matching engine) is implemented and validated against real repos: on a 726-commit production repo, adversarial verification (30 samples, independent verifier agents instructed to refute each attribution) measured **100% precision on strong-tier matches** (20/20) and 80% on weak tier. Not yet published to npm.
 
 ```bash
 git clone … && npm install

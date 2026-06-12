@@ -51,3 +51,21 @@ src/
 3. 盲区分析：unmatchedCommits 里是什么（手写 commit？squash？格式漂移？）。
 
 验收线：strong 层准确率 ≥ 90%，否则回炉匹配算法。
+
+### M1 验收结果（2026-06-12）
+
+两轮对抗验证（每轮 30 样本 × 独立 Sonnet 验证官，任务为推翻归因）：
+
+- **第一轮：strong 50%（10/20）**。两个失败模式：
+  ① 父 session 与 workflow 子 agent 共享 sessionId，桶合并导致证据指向错误文件（7例）；
+  ② 单行 generic 内容碰巧重叠冲进 strong（3例）。
+- 修复：归因粒度降到解析单元（MatchCandidate.sourcePath/matchedLines）；
+  证据下限（<2 行丢弃，<3 行封顶 weak）。
+- **第二轮：strong 100%（20/20）✅，weak 80%（8/10）**。weak 的 2 个错误均为
+  预期残余（后续 session 编辑既有文件时与文件创建 commit 的重叠；2 行 CSS 碰巧）。
+
+覆盖率（hive-private，transcript 窗口内 31 个 commit）：71% 匹配。
+盲区全部可解释：Codex 写的 commit（M4 parser 范围）、merge commit（设计上不展开）、
+云端 session（本地无 transcript）。
+
+**M1 验收：通过。**
