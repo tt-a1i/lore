@@ -97,7 +97,7 @@ export function usageHint(hasMcp: boolean): string {
   if (hasMcp) {
     return 'Before editing, you can consult lore via the lore_ask / lore_why MCP tools; record new decisions with lore_note.';
   }
-  return 'Before editing, consult prior decisions with `npx lore ask "<q>" --repo . --file <path>`; record new ones with `npx lore note --repo . --kind constraint --title "…" --body "…" --source agent`.';
+  return 'Before editing, consult prior decisions with `lore ask "<q>" --repo . --file <path>`; record new ones with `lore note --repo . --kind constraint --title "…" --body "…" --source agent`.';
 }
 
 /**

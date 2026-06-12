@@ -185,22 +185,22 @@ const MARKER_END = '<!-- lore:end -->';
 describe('injectLoreSection v2', () => {
   it('contains lore note trigger (step 3)', () => {
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore note');
+    expect(content).toContain('lore note');
   });
 
   it('contains lore status trigger (step 4)', () => {
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore status');
+    expect(content).toContain('lore status');
   });
 
   it('contains lore why trigger (step 1)', () => {
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore why');
+    expect(content).toContain('lore why');
   });
 
   it('contains lore ask trigger (step 2)', () => {
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore ask');
+    expect(content).toContain('lore ask');
   });
 
   it('mentions --source agent flag', () => {
@@ -238,7 +238,7 @@ describe('injectLoreSection v2', () => {
     const stale = `# CLAUDE.md\n\n${MARKER_START}\nBefore making a design decision, run:\nOLD v1 content\n${MARKER_END}\n`;
     const { content } = injectLoreSection(stale);
     expect(content).not.toContain('OLD v1 content');
-    expect(content).toContain('npx lore note');
+    expect(content).toContain('lore note');
   });
 
   it('## lore heading appears exactly once after double injection', () => {

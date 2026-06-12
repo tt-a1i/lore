@@ -121,8 +121,8 @@ describe('usageHint', () => {
 
   it('mentions npx commands when no MCP', () => {
     const h = usageHint(false);
-    expect(h).toContain('npx lore ask');
-    expect(h).toContain('npx lore note');
+    expect(h).toContain('lore ask');
+    expect(h).toContain('lore note');
     expect(h).toContain('--source agent');
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "@tt-a1i/lore",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The intent layer for Git — link AI agent conversations to the commits they produced",
   "type": "module",
   "license": "Apache-2.0",

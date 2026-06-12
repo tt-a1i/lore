@@ -118,21 +118,21 @@ describe('injectLoreSection', () => {
     expect(first).toBe(second);
   });
 
-  it('section contains npx lore why usage hint', () => {
+  it('section contains lore why usage hint', () => {
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore why');
+    expect(content).toContain('lore why');
   });
 
-  it('section contains npx lore ask usage hint', () => {
+  it('section contains lore ask usage hint', () => {
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore ask');
+    expect(content).toContain('lore ask');
   });
 
   it('section contains session-start status trigger (v2 replaces bare lore go hint)', () => {
     // v2 guidance rewrites the section with specific trigger moments;
     // lore status --repo . is the session-start hint (step 4).
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore status');
+    expect(content).toContain('lore status');
   });
 
   it('section contains the ## lore heading', () => {
@@ -168,6 +168,6 @@ describe('injectLoreSection', () => {
     // Old content should be replaced
     expect(content).not.toContain('OLD CONTENT');
     // New content should have the standard hints
-    expect(content).toContain('npx lore why');
+    expect(content).toContain('lore why');
   });
 });
