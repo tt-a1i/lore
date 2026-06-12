@@ -67,7 +67,7 @@ export const SHELL_CSS = `
 
 #view-subtitle {
   position: absolute; top: 74px; left: 30px; right: 30px; z-index: 28;
-  font-family: var(--serif); font-style: italic; font-size: 13px; color: var(--text-dim);
+  font-family: var(--font); font-size: 12px; color: var(--text-dim);
   letter-spacing: 0.01em; pointer-events: none;
   opacity: 0; transform: translateY(-3px);
   transition: opacity var(--t-med), transform var(--t-med);
@@ -214,6 +214,9 @@ window.LORE_VIEWS = window.LORE_VIEWS || [];
     'decisions.subtitle': 'Decisions, constraints and rejected paths — with their full history',
     'stats.template': '{s} conversations · {c} commits · {n} decisions',
     'coachmark': 'This is the conversation that wrote this commit.',
+    'coachmark.text': 'This commit was written with an AI agent — click any row to read the conversation behind it.',
+    'story.coverage': '{a} of {c} commits have conversation provenance',
+    'story.noconvo': 'no conversation recorded',
     'map.legend': 'AI memory coverage',
   };
   var ZH = {
@@ -228,6 +231,9 @@ window.LORE_VIEWS = window.LORE_VIEWS || [];
     'decisions.subtitle': '决策、约束与被否决的路——以及它们的完整历史',
     'stats.template': '{s} 段对话 · {c} 个 commit · {n} 条决策',
     'coachmark': '这就是写出这个 commit 的对话。',
+    'coachmark.text': '这个 commit 由 AI agent 写就——点任意一行，读它背后的对话。',
+    'story.coverage': '{a} / {c} 个 commit 带对话出处',
+    'story.noconvo': '无对话记录',
     'map.legend': 'AI 记忆覆盖度',
   };
   var lang = 'en';

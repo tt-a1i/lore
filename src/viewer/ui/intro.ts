@@ -20,10 +20,7 @@ export const INTRO_CSS = `
 #intro-overlay {
   position: absolute; inset: 0; z-index: 100;
   display: flex; align-items: center; justify-content: center;
-  /* --bg 不透明打底 + 微弱径向光晕（绿，极淡；纸面上几乎不可见，深色下有呼吸感）*/
-  background:
-    radial-gradient(900px 600px at 50% 38%, color-mix(in srgb, var(--green) 7%, transparent) 0%, color-mix(in srgb, var(--bg) 0%, transparent) 60%),
-    var(--bg);
+  background: var(--bg);
   opacity: 0;
   transition: opacity 400ms var(--ease);
   pointer-events: none;
@@ -43,16 +40,16 @@ export const INTRO_CSS = `
   font-family: var(--mono);
   font-size: 12px; font-weight: 600;
   letter-spacing: 0.42em; text-indent: 0.42em;
-  color: var(--green); text-transform: uppercase;
+  color: var(--text-faint); text-transform: uppercase;
   margin-bottom: 20px;
   opacity: 0.92;
 }
 
 .intro-headline {
-  font-family: var(--serif);
-  font-size: 34px; line-height: 1.2; font-weight: 600;
+  font-family: var(--font);
+  font-size: 30px; line-height: 1.2; font-weight: 700;
   color: var(--text);
-  letter-spacing: 0.005em;
+  letter-spacing: -0.01em;
   font-feature-settings: "liga", "kern";
   margin-bottom: 18px;
   text-wrap: balance;
@@ -78,19 +75,15 @@ export const INTRO_CSS = `
 .intro-watch {
   appearance: none; cursor: pointer;
   font: inherit; font-size: 13.5px; font-weight: 600;
-  color: var(--green);
+  color: white;
   padding: 11px 26px; border-radius: 999px;
-  background: color-mix(in srgb, var(--green) 6%, transparent);
+  background: var(--green);
   border: 1px solid var(--green);
-  /* 纸面 --glow-opacity=0 → 辉光自动消失，只留深绿描边；深色态维持微辉光 */
-  box-shadow: 0 0 22px color-mix(in srgb, var(--green) calc(20% * var(--glow-opacity)), transparent);
   transition: all var(--t-fast);
 }
 .intro-watch:hover {
-  background: color-mix(in srgb, var(--green) 12%, transparent);
-  box-shadow:
-    0 0 0 4px color-mix(in srgb, var(--green) calc(14% * var(--glow-opacity)), transparent),
-    0 0 30px color-mix(in srgb, var(--green) calc(32% * var(--glow-opacity)), transparent);
+  background: color-mix(in srgb, var(--green) 88%, #000000 12%);
+  border-color: color-mix(in srgb, var(--green) 88%, #000000 12%);
   transform: translateY(-1px);
 }
 .intro-watch:active { transform: translateY(0); }
