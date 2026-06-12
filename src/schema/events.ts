@@ -110,8 +110,13 @@ export interface ParsedSession {
 /** 每种 agent 一个实现。parser 必须容错：跳过无法识别的行并计数，绝不抛弃整个文件。 */
 export interface TranscriptParser {
   agent: AgentKind;
-  /** 找出与某个仓库工作目录相关的所有 transcript 文件。 */
-  discover(repoPath: string): Promise<string[]>;
+  /**
+   * 找出与某个仓库工作目录相关的所有 transcript 文件。
+   * broad=true 时扫描该 agent 的全部本地 transcript（不限于该仓库的项目目录）——
+   * 用于捕获在 worktree（cwd ≠ repo）里跑的 session；错误归属由匹配引擎的
+   * 内容信号过滤（时间信号单独达不到 weak 阈值）。
+   */
+  discover(repoPath: string, opts?: { broad?: boolean }): Promise<string[]>;
   parse(transcriptPath: string): Promise<ParseResult>;
 }
 

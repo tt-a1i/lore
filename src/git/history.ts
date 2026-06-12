@@ -321,7 +321,8 @@ export const gitHistoryReader: GitHistoryReader = {
     const args: string[] = [
       '-C', repoPath,
       'log',
-      '--first-parent',
+      // allRefs: agent 的真实 commit 常在 PR 分支/远端引用上（squash 合并后 main 只有改写版）。
+      ...(opts.allRefs ? ['--all'] : ['--first-parent']),
       '--reverse',
       '-p',
       '-U0',

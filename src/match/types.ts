@@ -71,6 +71,16 @@ export interface RepoMatchReport {
   commitsMatchedWeak: number;
   sessionsSeen: number;
   sessionsContributing: number;
+  /**
+   * transcript 覆盖窗口：[全部 session 最早 startedAt − 2min, 最晚 endedAt + 2min]。
+   * Claude Code 会清理旧 session，窗口外的 commit 结构性不可匹配——
+   * 匹配率必须以窗口内 commit 为分母评估。无 session 时为 null。
+   */
+  window: { start: string; end: string } | null;
+  /** authorDate 或 committerDate 落在窗口内的 commit 数。 */
+  commitsInWindow: number;
+  strongInWindow: number;
+  weakInWindow: number;
   matches: MatchCandidate[];
   /** 无任何匹配的 commit（hash + 首行 message），用于分析盲区。 */
   unmatchedCommits: { hash: string; subject: string }[];

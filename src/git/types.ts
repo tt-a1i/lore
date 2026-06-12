@@ -33,8 +33,15 @@ export interface Hunk {
 }
 
 export interface GitHistoryReader {
-  /** 按时间升序返回 first-parent 链上的 commit（含 hunks）。merge commit 标记但不展开。 */
-  readHistory(repoPath: string, opts?: { since?: string; maxCommits?: number }): Promise<CommitInfo[]>;
+  /**
+   * 按时间升序返回 commit（含 hunks）。merge commit 标记但不展开。
+   * 默认 first-parent 链；allRefs=true 时扫 --all（全部分支/远端引用）——
+   * agent 的真实 commit 常在 PR 分支上，squash 合入后 main 上只有改写版。
+   */
+  readHistory(
+    repoPath: string,
+    opts?: { since?: string; maxCommits?: number; allRefs?: boolean }
+  ): Promise<CommitInfo[]>;
   /** path 归一化：把事件里的绝对路径转成 repo 相对路径；不在 repo 内返回 null。 */
   toRepoRelative(repoPath: string, absPath: string): string | null;
 }

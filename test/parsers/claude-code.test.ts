@@ -372,3 +372,37 @@ describe('schema version and agent kind', () => {
     expect(session.meta.sourcePath).toBe(filePath);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 11. Input-fallback: subagent transcripts without toolUseResult side-channel
+// ---------------------------------------------------------------------------
+
+describe('input fallback for subagent transcripts (no toolUseResult)', () => {
+  it('emits file-edit from tool_use input when tool_result has no toolUseResult', async () => {
+    const { session } = await claudeCodeParser.parse(fixture('input-fallback.jsonl'));
+    const edits = session.events.filter(
+      (e): e is FileEditEvent => e.kind === 'file-edit',
+    );
+    expect(edits).toHaveLength(2);
+
+    const edit = edits[0]!;
+    expect(edit.op).toBe('edit');
+    expect(edit.toolUseId).toBe('toolu_f1');
+    expect(edit.filePath).toBe('/repo/.claude/worktrees/wf-1/src/a.ts');
+    expect(edit.oldText).toBe('const a = 1;');
+    expect(edit.newText).toBe('const a = 2;');
+    expect(edit.patch).toBeNull();
+    expect(edit.succeeded).toBe(true);
+  });
+
+  it('marks failed edits with succeeded=false (is_error tool_result)', async () => {
+    const { session } = await claudeCodeParser.parse(fixture('input-fallback.jsonl'));
+    const edits = session.events.filter(
+      (e): e is FileEditEvent => e.kind === 'file-edit',
+    );
+    const write = edits[1]!;
+    expect(write.op).toBe('write');
+    expect(write.newText).toBe('export const b = 42;\n');
+    expect(write.succeeded).toBe(false);
+  });
+});

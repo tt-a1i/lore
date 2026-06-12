@@ -135,9 +135,46 @@ function parseTs(iso: string): number {
   return Number.isNaN(t) ? 0 : t;
 }
 
+/**
+ * worktree/别名根兜底：前缀剥离失败的绝对路径，用后缀对 commit 文件清单做唯一匹配。
+ * 现实动机：agent 常在 git worktree（如 /tmp/hive-pr15/src/a.ts）里编辑，
+ * 而 repoPath 是主工作区路径，前缀永远对不上。
+ * 规则：从长到短取路径的后 k 段（k 从全长到 2），若恰好唯一命中一个 commit 路径
+ * 的等长后缀则采用；始终要求 ≥2 段，避免 README.md 这类 basename 误归。
+ */
+function buildSuffixResolver(commits: CommitInfo[]): (absPath: string) => string | null {
+  const byBasename = new Map<string, string[]>();
+  for (const c of commits) {
+    for (const cf of c.files) {
+      const base = cf.path.slice(cf.path.lastIndexOf('/') + 1);
+      const arr = byBasename.get(base);
+      if (arr) {
+        if (!arr.includes(cf.path)) arr.push(cf.path);
+      } else byBasename.set(base, [cf.path]);
+    }
+  }
+  return (absPath: string) => {
+    const parts = absPath.split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    const base = parts[parts.length - 1]!;
+    const candidates = byBasename.get(base);
+    if (!candidates || candidates.length === 0) return null;
+    for (let k = parts.length; k >= 2; k--) {
+      const suffix = parts.slice(parts.length - k).join('/');
+      const hits = candidates.filter((p) => p === suffix || p.endsWith('/' + suffix));
+      if (hits.length === 1) return hits[0]!;
+      if (hits.length === 0) continue; // 后缀太长（含 worktree 根目录段），缩短再试
+    }
+    return null;
+  };
+}
+
 export class ContentTimeMatchEngine implements MatchEngine {
   match(repoPath: string, commits: CommitInfo[], sessions: ParsedSession[]): RepoMatchReport {
-    const index = this.buildIndex(repoPath, sessions);
+    const suffixResolve = buildSuffixResolver(commits);
+    const commitPaths = new Set<string>();
+    for (const c of commits) for (const cf of c.files) commitPaths.add(cf.path);
+    const index = this.buildIndex(repoPath, sessions, suffixResolve, commitPaths);
 
     // Tier-0: 预先建立 commit hash 前缀映射，用于把 GitCommitEvent.sha 锚定到 commit。
     // 一个 session 内的 git-commit 事件：sha 前缀匹配 commits.hash。
@@ -257,6 +294,34 @@ export class ContentTimeMatchEngine implements MatchEngine {
       .filter((c) => !matchedAnyCommit.has(c.hash))
       .map((c) => ({ hash: c.hash, subject: firstLine(c.message) }));
 
+    // transcript 覆盖窗口与窗口内口径。
+    let window: { start: string; end: string } | null = null;
+    let winStart = Infinity;
+    let winEnd = -Infinity;
+    for (const s of sessions) {
+      const st = parseTs(s.meta.startedAt);
+      const en = s.meta.endedAt ? parseTs(s.meta.endedAt) : st;
+      if (st > 0 && st < winStart) winStart = st;
+      if (en > winEnd) winEnd = en;
+    }
+    let commitsInWindow = 0;
+    let strongInWindow = 0;
+    let weakInWindow = 0;
+    if (winStart !== Infinity && winEnd !== -Infinity) {
+      const lo = winStart - CLOCK_TOLERANCE_MS;
+      const hi = winEnd + CLOCK_TOLERANCE_MS;
+      window = { start: new Date(lo).toISOString(), end: new Date(hi).toISOString() };
+      for (const c of commits) {
+        const a = parseTs(c.authorDate);
+        const ct = parseTs(c.committerDate);
+        const inWin = (a >= lo && a <= hi) || (ct >= lo && ct <= hi);
+        if (!inWin) continue;
+        commitsInWindow++;
+        if (strongCommits.has(c.hash)) strongInWindow++;
+        else if (weakCommits.has(c.hash)) weakInWindow++;
+      }
+    }
+
     return {
       repo: repoPath,
       generatedAt: new Date().toISOString(),
@@ -266,6 +331,10 @@ export class ContentTimeMatchEngine implements MatchEngine {
       commitsMatchedWeak: weakCommits.size,
       sessionsSeen: sessions.length,
       sessionsContributing: contributingSessions.size,
+      window,
+      commitsInWindow,
+      strongInWindow,
+      weakInWindow,
       matches,
       unmatchedCommits,
     };
@@ -273,7 +342,12 @@ export class ContentTimeMatchEngine implements MatchEngine {
 
   // ---------------------------------------------------------------------------
 
-  private buildIndex(repoPath: string, sessions: ParsedSession[]): Index {
+  private buildIndex(
+    repoPath: string,
+    sessions: ParsedSession[],
+    suffixResolve?: (absPath: string) => string | null,
+    commitPaths?: Set<string>
+  ): Index {
     const byPath = new Map<string, Map<string, SessionFileBucket>>();
     const sessionMap = new Map<string, ParsedSession>();
 
@@ -287,7 +361,14 @@ export class ContentTimeMatchEngine implements MatchEngine {
         // failed (succeeded === false) 的 edit 排除。succeeded === null/true 保留。
         if (edit.succeeded === false) continue;
 
-        const rel = normalizePath(edit.filePath, repoPath, cwd);
+        let rel = normalizePath(edit.filePath, repoPath, cwd);
+        // 前缀剥离可能"成功"地剥出错误路径——典型：worktree 在 repo 内部
+        // （<repo>/.claude/worktrees/wf_x-6/src/a.ts → ".claude/worktrees/…"）。
+        // 只要剥出的路径不在 commit 文件集里，就交给后缀解析兜底。
+        if (suffixResolve && (rel === null || rel === '' || (commitPaths && !commitPaths.has(rel)))) {
+          const resolved = suffixResolve(edit.filePath);
+          if (resolved) rel = resolved;
+        }
         if (rel === null || rel === '') continue;
 
         const lines = editAddedLines(edit);

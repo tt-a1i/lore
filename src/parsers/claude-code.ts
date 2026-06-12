@@ -100,6 +100,11 @@ interface RawToolUseResult {
   structuredPatch?: RawPatchHunk[];
   originalFile?: string | null;
   userModified?: boolean;
+  // 无 type 字段的 Edit 变体（v2.1.x 实测主力形态）：
+  // { filePath, oldString, newString, originalFile, structuredPatch, userModified, replaceAll }
+  oldString?: string;
+  newString?: string;
+  replaceAll?: boolean;
   gitOperation?: {
     commit?: { sha?: string; kind?: string };
     push?: { branch?: string };
@@ -113,6 +118,22 @@ interface RawPatchHunk {
   newStart?: number;
   newLines?: number;
   lines?: string[];
+}
+
+/**
+ * 无 pendingTu 时从 toolUseResult 自身推断 op：
+ * - type: "create" → write；type: "update" → edit
+ * - 无 type 变体：有 oldString（Edit 形态）→ edit；originalFile 为 null（新建）→ write；其余 → edit
+ */
+function inferOp(
+  turType: string | undefined,
+  tur: RawToolUseResult
+): 'edit' | 'write' {
+  if (turType === 'create') return 'write';
+  if (turType === 'update') return 'edit';
+  if (tur.oldString !== undefined) return 'edit';
+  if (tur.originalFile === null) return 'write';
+  return 'edit';
 }
 
 // ---------------------------------------------------------------------------
@@ -302,12 +323,20 @@ async function parseFile(
         events.push(ev);
       }
 
-      // File edit
+      // File edit —— 两种实测形态：
+      // a) 带 type 的：{ type: "create"|"update", filePath, content, structuredPatch, … }
+      // b) 无 type 的（v2.1.x Edit 主力形态）：
+      //    { filePath, oldString, newString, originalFile, structuredPatch, userModified, replaceAll }
       const turType = tur.type;
-      if (
-        (turType === 'create' || turType === 'update') &&
-        typeof tur.filePath === 'string'
-      ) {
+      const isTypedEdit =
+        (turType === 'create' || turType === 'update') && typeof tur.filePath === 'string';
+      const isTypelessEdit =
+        turType === undefined &&
+        typeof tur.filePath === 'string' &&
+        (tur.structuredPatch !== undefined ||
+          tur.newString !== undefined ||
+          tur.originalFile !== undefined);
+      if ((isTypedEdit || isTypelessEdit) && typeof tur.filePath === 'string') {
         // Find the corresponding tool_use in message.content[] to get toolUseId
         // The message.content[] may have tool_result blocks referencing toolu_X
         let toolUseId: string | null = null;
@@ -360,16 +389,16 @@ async function parseFile(
           else if (pendingTu.name === 'Write') op = 'write';
           else if (pendingTu.name === 'MultiEdit') op = 'multi-edit';
           else if (pendingTu.name === 'NotebookEdit') op = 'notebook-edit';
-          else op = turType === 'create' ? 'write' : 'edit';
+          else op = inferOp(turType, tur);
         } else {
-          op = turType === 'create' ? 'write' : 'edit';
+          op = inferOp(turType, tur);
           toolUseId = null;
         }
 
         const patch = tur.structuredPatch ? normalizePatch(tur.structuredPatch) : null;
-        const oldText = pendingTu?.oldString ?? null;
+        const oldText = pendingTu?.oldString ?? tur.oldString ?? null;
         const newText =
-          pendingTu?.newString ?? tur.content ?? '';
+          pendingTu?.newString ?? tur.newString ?? tur.content ?? '';
         const userModified = typeof tur.userModified === 'boolean' ? tur.userModified : null;
 
         const ev: FileEditEvent = {
@@ -387,6 +416,55 @@ async function parseFile(
           succeeded: true, // toolUseResult present means success unless is_error
         };
         events.push(ev);
+      }
+    }
+
+    // --- Fallback：subagent/workflow transcript 没有 toolUseResult 侧通道 ---
+    // 它们的编辑只有 assistant tool_use 的 input。看到对应 tool_result（任意形态）
+    // 即用暂存的 input 发 file-edit（patch=null，匹配引擎退 newText 行集）。
+    // 主链场景中上面的 toolUseResult 分支已消费掉 pending，不会重复发。
+    {
+      const msgContent = raw.message?.content;
+      if (Array.isArray(msgContent)) {
+        for (const block of msgContent) {
+          if (!block || typeof block !== 'object') continue;
+          const b = block as RawContentBlock;
+          if (b.type !== 'tool_result' || !b.tool_use_id) continue;
+          const pending = pendingToolUses.get(b.tool_use_id);
+          if (!pending) continue;
+          if (
+            pending.name !== 'Edit' &&
+            pending.name !== 'Write' &&
+            pending.name !== 'MultiEdit' &&
+            pending.name !== 'NotebookEdit'
+          ) {
+            continue;
+          }
+          pendingToolUses.delete(b.tool_use_id);
+          const op: FileEditEvent['op'] =
+            pending.name === 'Write'
+              ? 'write'
+              : pending.name === 'MultiEdit'
+                ? 'multi-edit'
+                : pending.name === 'NotebookEdit'
+                  ? 'notebook-edit'
+                  : 'edit';
+          const ev: FileEditEvent = {
+            kind: 'file-edit',
+            sessionId,
+            ts,
+            seq: nextSeq(),
+            toolUseId: b.tool_use_id,
+            op,
+            filePath: pending.filePath,
+            oldText: pending.oldString,
+            newText: pending.newString,
+            patch: null,
+            userModified: null,
+            succeeded: b.is_error === true ? false : true,
+          };
+          events.push(ev);
+        }
       }
     }
 
@@ -570,10 +648,32 @@ async function parseFile(
 // discover()
 // ---------------------------------------------------------------------------
 
-async function discoverTranscripts(repoPath: string): Promise<string[]> {
-  const encoded = encodeProjectPath(repoPath);
-  const projectDir = path.join(os.homedir(), '.claude', 'projects', encoded);
+async function discoverTranscripts(repoPath: string, broad = false): Promise<string[]> {
+  if (!broad) {
+    const encoded = encodeProjectPath(repoPath);
+    const projectDir = path.join(os.homedir(), '.claude', 'projects', encoded);
+    return discoverInProjectDir(projectDir);
+  }
 
+  // broad 模式：扫全部项目目录。session 常跑在 worktree（如 /tmp/hive-pr15）里，
+  // transcript 落在按 cwd 命名的其他项目目录下，只扫本仓库目录会漏掉它们。
+  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  let dirs: fs.Dirent[];
+  try {
+    dirs = await fs.promises.readdir(projectsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const results: string[] = [];
+  for (const d of dirs) {
+    if (!d.isDirectory()) continue;
+    const found = await discoverInProjectDir(path.join(projectsRoot, d.name));
+    results.push(...found);
+  }
+  return results;
+}
+
+async function discoverInProjectDir(projectDir: string): Promise<string[]> {
   let entries: fs.Dirent[];
   try {
     entries = await fs.promises.readdir(projectDir, { withFileTypes: true });
@@ -648,8 +748,8 @@ async function collectSubagentFilesRecursive(dir: string, results: string[]): Pr
 export const claudeCodeParser: TranscriptParser = {
   agent: 'claude-code',
 
-  async discover(repoPath: string): Promise<string[]> {
-    return discoverTranscripts(repoPath);
+  async discover(repoPath: string, opts?: { broad?: boolean }): Promise<string[]> {
+    return discoverTranscripts(repoPath, opts?.broad === true);
   },
 
   async parse(transcriptPath: string): Promise<ParseResult> {

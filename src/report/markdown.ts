@@ -87,6 +87,24 @@ export function renderReport(report: RepoMatchReport): string {
       ' '.repeat(Math.max(1, 26 - String(unmatchedCount).length - unmatchedPct.length)) +
       '|',
   );
+  // 窗口内口径——真正有意义的匹配率（窗口外的 commit 结构性不可匹配）。
+  if (report.window) {
+    const inWinPct =
+      report.commitsInWindow > 0
+        ? (((report.strongInWindow + report.weakInWindow) / report.commitsInWindow) * 100).toFixed(1)
+        : '0.0';
+    lines.push(
+      `| Transcript window          | ${report.window.start.slice(0, 16)} → ${report.window.end.slice(0, 16)} |`,
+    );
+    lines.push(
+      `| Commits in window          | ${report.commitsInWindow}` +
+        ' '.repeat(Math.max(1, 33 - String(report.commitsInWindow).length)) +
+        '|',
+    );
+    lines.push(
+      `| In-window matched          | strong ${report.strongInWindow} + weak ${report.weakInWindow} (${inWinPct}%) |`,
+    );
+  }
   lines.push(
     `| Sessions seen              | ${report.sessionsSeen}` +
       ' '.repeat(Math.max(1, 33 - String(report.sessionsSeen).length)) +

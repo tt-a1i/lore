@@ -81,7 +81,7 @@ function truncate(s: string, maxLen: number): string {
 
 // ── lore scan ────────────────────────────────────────────────────────────────
 
-async function cmdScan(opts: { repo: string; maxCommits?: number }): Promise<void> {
+async function cmdScan(opts: { repo: string; maxCommits?: number; broad?: boolean }): Promise<void> {
   const repoPath = path.resolve(opts.repo);
   const t0 = now();
 
@@ -90,7 +90,7 @@ async function cmdScan(opts: { repo: string; maxCommits?: number }): Promise<voi
   // 1. Discover transcripts
   const t1 = now();
   const parser = await loadParser();
-  const transcriptPaths = await parser.discover(repoPath);
+  const transcriptPaths = await parser.discover(repoPath, { broad: opts.broad === true });
   console.log(`[discover] found ${transcriptPaths.length} transcripts  ${elapsed(t1)}`);
 
   // 2. Parse concurrently — warn and skip failures
@@ -114,7 +114,10 @@ async function cmdScan(opts: { repo: string; maxCommits?: number }): Promise<voi
   // 3. Read git history
   const t3 = now();
   const gitReader = await loadGitReader();
-  const historyOpts: { since?: string; maxCommits?: number } = {};
+  // 默认 --all：agent 的真实 commit 常在 PR 分支上（squash 合并后 main 上只有改写版）。
+  const historyOpts: { since?: string; maxCommits?: number; allRefs?: boolean } = {
+    allRefs: true,
+  };
   if (opts.maxCommits !== undefined) historyOpts.maxCommits = opts.maxCommits;
   const commits = await gitReader.readHistory(repoPath, historyOpts);
   console.log(`[git]      read ${commits.length} commits  ${elapsed(t3)}`);
@@ -351,7 +354,8 @@ program
   .description('Scan a repository: discover transcripts → parse → match → write .lore/report.json')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--max-commits <n>', 'limit git history to N commits', (v) => parseInt(v, 10))
-  .action((opts: { repo: string; maxCommits?: number }) => {
+  .option('--broad', 'scan ALL local transcripts, not just this repo\'s project dir (catches worktree sessions)')
+  .action((opts: { repo: string; maxCommits?: number; broad?: boolean }) => {
     cmdScan(opts).catch((e) => {
       console.error('scan failed:', e);
       process.exit(1);
