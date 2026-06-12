@@ -9,7 +9,11 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { claudeCodeParser } from '../../src/parsers/claude-code.js';
+import {
+  claudeCodeParser,
+  encodeProjectPath,
+  isTmpdirProjectDir,
+} from '../../src/parsers/claude-code.js';
 import type {
   UserMessageEvent,
   AssistantMessageEvent,
@@ -352,6 +356,83 @@ describe('discover()', () => {
   it('returns [] for a repo with no claude project directory', async () => {
     const files = await claudeCodeParser.discover('/nonexistent/repo/path');
     expect(files).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9b. isTmpdirProjectDir — broad-discover guard for lore's own distill output
+// ---------------------------------------------------------------------------
+
+describe('isTmpdirProjectDir', () => {
+  it('flags an encoded dir whose cwd is under os.tmpdir()', () => {
+    const tmp = '/var/folders/ab/T';
+    const distillCwd = `${tmp}/lore-distill-xyz`;
+    expect(isTmpdirProjectDir(encodeProjectPath(distillCwd), tmp)).toBe(true);
+  });
+
+  it('flags the tmpdir root itself', () => {
+    const tmp = '/var/folders/ab/T';
+    expect(isTmpdirProjectDir(encodeProjectPath(tmp), tmp)).toBe(true);
+  });
+
+  it('does not flag a real project dir', () => {
+    const tmp = '/var/folders/ab/T';
+    expect(isTmpdirProjectDir(encodeProjectPath('/Users/x/code/myproject'), tmp)).toBe(false);
+  });
+
+  it('does not flag a sibling dir that merely shares a string prefix', () => {
+    const tmp = '/tmp';
+    // "/tmpfoo" shares the "/tmp" string prefix but is NOT under "/tmp".
+    expect(isTmpdirProjectDir(encodeProjectPath('/tmpfoo/proj'), tmp)).toBe(false);
+  });
+
+  it('uses the real os.tmpdir() by default', () => {
+    const realChild = path.join(os.tmpdir(), 'lore-distill-abc');
+    expect(isTmpdirProjectDir(encodeProjectPath(realChild))).toBe(true);
+    expect(isTmpdirProjectDir(encodeProjectPath('/Users/x/code/proj'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9c. broad discover() skips tmpdir (distill) project dirs
+// ---------------------------------------------------------------------------
+
+describe('broad discover() skips tmpdir project dirs', () => {
+  let fakeHome: string;
+  let savedHome: string | undefined;
+
+  beforeAll(async () => {
+    fakeHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'lore-broad-'));
+    const projectsRoot = path.join(fakeHome, '.claude', 'projects');
+
+    // A real project dir — should be discovered in broad mode.
+    const realDir = path.join(projectsRoot, encodeProjectPath('/Users/x/code/realproj'));
+    await fs.promises.mkdir(realDir, { recursive: true });
+    await fs.promises.writeFile(path.join(realDir, 'real-session.jsonl'), '');
+
+    // A distill-cwd project dir under os.tmpdir() — must be skipped in broad mode.
+    const distillCwd = path.join(os.tmpdir(), 'lore-distill-fake123');
+    const distillDir = path.join(projectsRoot, encodeProjectPath(distillCwd));
+    await fs.promises.mkdir(distillDir, { recursive: true });
+    await fs.promises.writeFile(path.join(distillDir, 'distill-session.jsonl'), '');
+
+    savedHome = process.env['HOME'];
+    process.env['HOME'] = fakeHome;
+  });
+
+  afterAll(async () => {
+    process.env['HOME'] = savedHome;
+    await fs.promises.rm(fakeHome, { recursive: true, force: true });
+  });
+
+  it('includes the real project session', async () => {
+    const files = await claudeCodeParser.discover('/Users/x/code/realproj', { broad: true });
+    expect(files.some((f) => f.endsWith('real-session.jsonl'))).toBe(true);
+  });
+
+  it('excludes the tmpdir distill session', async () => {
+    const files = await claudeCodeParser.discover('/Users/x/code/realproj', { broad: true });
+    expect(files.some((f) => f.endsWith('distill-session.jsonl'))).toBe(false);
   });
 });
 

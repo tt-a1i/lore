@@ -415,7 +415,9 @@ describe('WhyEngine.why — full pipeline', () => {
     await expect(engine.why(repo, 'committed.ts', 2)).rejects.toThrow(/not committed yet/i);
   });
 
-  it('ranks candidates by confidence and keeps at most top 3', async () => {
+  // Shared fixture for the confidence-floor tests below: four candidates on the
+  // same (commit, file) — two strong (≥0.8), two weak (<0.8).
+  function makeFloorRepo(): string {
     const repo = makeRepo();
     const newLine = 'export const shared = true;';
     writeRepoFile(repo, 'shared.ts', `${newLine}\n`);
@@ -453,12 +455,34 @@ describe('WhyEngine.why — full pipeline', () => {
       evidence: [] as string[],
     }));
     writeReport(repo, { matches });
+    return repo;
+  }
 
+  it('filters weak (<0.8) attributions by default — only strong survive', async () => {
+    const repo = makeFloorRepo();
     const engine = createWhyEngine(fakeStore({}), claudeCodeParser);
     const result = await engine.why(repo, 'shared.ts', 1);
+    // Default floor 0.8: only 0.95 and 0.8 pass; 0.6 and 0.55 are filtered out.
+    const confs = result.attributions.map((a) => a.produced.confidence);
+    expect(confs).toEqual([0.95, 0.8]);
+  });
+
+  it('includeWeak admits weak candidates, ranked by confidence, capped at top 3', async () => {
+    const repo = makeFloorRepo();
+    const engine = createWhyEngine(fakeStore({}), claudeCodeParser);
+    const result = await engine.why(repo, 'shared.ts', 1, { includeWeak: true });
     expect(result.attributions).toHaveLength(3);
     const confs = result.attributions.map((a) => a.produced.confidence);
-    expect(confs).toEqual([0.95, 0.8, 0.6]); // descending, top 3
+    expect(confs).toEqual([0.95, 0.8, 0.6]); // descending, top 3 (0.55 drops off)
+  });
+
+  it('honours an explicit minConfidence floor', async () => {
+    const repo = makeFloorRepo();
+    const engine = createWhyEngine(fakeStore({}), claudeCodeParser);
+    // floor 0.9 keeps only the single 0.95 candidate
+    const result = await engine.why(repo, 'shared.ts', 1, { minConfidence: 0.9 });
+    const confs = result.attributions.map((a) => a.produced.confidence);
+    expect(confs).toEqual([0.95]);
   });
 
   it('matches short report hashes against the full blame hash (prefix)', async () => {

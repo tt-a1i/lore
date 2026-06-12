@@ -22,6 +22,7 @@ import { Command } from 'commander';
 // the same process (e.g. vitest singleFork test runs).
 const program = new Command();
 import fs from 'node:fs/promises';
+import fssync from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,7 +33,7 @@ import type { MatchEngine, RepoMatchReport, MatchCandidate } from './match/types
 import { tierOf } from './match/types.js';
 import { renderReport } from './report/markdown.js';
 import type { GraphStore } from './graph/types.js';
-import type { WhyEngine, WhyResult, WhyAttribution } from './why/types.js';
+import type { WhyEngine, WhyOptions, WhyResult, WhyAttribution } from './why/types.js';
 import type { AskEngine, AskResult } from './ask/types.js';
 import type { Distiller } from './distill/types.js';
 
@@ -259,7 +260,53 @@ export function injectLoreSection(existing: string): { content: string; injected
 }
 
 /**
+ * Determine whether a report is stale relative to now / a HEAD commit time.
+ * Pure-ish logic (injectable nowMs + headTime for testability).
+ * Returns a warning string to emit, or null if fresh.
+ *
+ * Staleness conditions:
+ *   - HEAD commit is newer than generatedAt, OR
+ *   - generatedAt is more than 4 hours before nowMs.
+ */
+export function staleness(opts: {
+  generatedAt: string;
+  nowMs: number;
+  headTime: string | null;
+  repoPath: string;
+  useColor: boolean;
+}): string | null {
+  const { generatedAt, nowMs, headTime, repoPath, useColor } = opts;
+  const generatedMs = Date.parse(generatedAt);
+  if (isNaN(generatedMs)) return null;
+
+  const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+  const ageStale = nowMs - generatedMs > FOUR_HOURS_MS;
+
+  let headNewer = false;
+  if (headTime) {
+    const headMs = Date.parse(headTime);
+    if (!isNaN(headMs) && headMs > generatedMs) {
+      headNewer = true;
+    }
+  }
+
+  if (!headNewer && !ageStale) return null;
+
+  const genStr = generatedAt.slice(0, 19).replace('T', ' ');
+  const headStr = headTime ? headTime.slice(0, 19).replace('T', ' ') : 'unknown';
+  const warnLabel = useColor ? `\x1b[1;33mWARNING\x1b[0m` : 'WARNING';
+  return (
+    `${warnLabel}: lore data is stale (generated ${genStr}, HEAD ${headStr})` +
+    ` — run \`lore scan --repo ${repoPath}\`\n`
+  );
+}
+
+/**
  * Guard: ensure .lore/report.json exists; exit(1) with a helpful message if not.
+ * Also emits a non-blocking staleness warning to stderr when:
+ *   - HEAD commit is newer than report's generatedAt, OR
+ *   - generatedAt is more than 4 hours before now.
+ * Git failure silently skips the staleness check.
  * Called by commands (why, history, ask, serve) that need a prior `lore scan`.
  */
 async function requireReport(repoPath: string): Promise<void> {
@@ -273,6 +320,44 @@ async function requireReport(repoPath: string): Promise<void> {
       `  use ${bold('`lore go --repo <path>`')} for a one-step scan + viewer.\n`,
     );
     process.exit(1);
+  }
+
+  // Staleness warning — non-blocking; all failures are silently skipped.
+  try {
+    const raw = await fs.readFile(reportPath, 'utf8');
+    const report = JSON.parse(raw) as { generatedAt?: string };
+    const generatedAt = report.generatedAt;
+    if (!generatedAt) return; // old report without timestamp — skip
+
+    // Attempt to read HEAD commit time via git.
+    let headTime: string | null = null;
+    try {
+      const { execFile: execFileCb } = await import('node:child_process');
+      const { promisify: prom } = await import('node:util');
+      const execFileAsync2 = prom(execFileCb);
+      const { stdout } = await execFileAsync2(
+        'git',
+        ['-C', repoPath, 'log', '-1', '--format=%cI'],
+        { encoding: 'utf8' },
+      );
+      headTime = stdout.trim() || null;
+    } catch {
+      // git not available or repo has no commits — skip git check.
+    }
+
+    const useColor = process.stderr.isTTY === true && process.env['NO_COLOR'] === undefined;
+    const warning = staleness({
+      generatedAt,
+      nowMs: Date.now(),
+      headTime,
+      repoPath,
+      useColor,
+    });
+    if (warning) {
+      process.stderr.write(warning);
+    }
+  } catch {
+    // Any unexpected error in staleness check must not block the command.
   }
 }
 
@@ -798,7 +883,7 @@ async function renderSampleBlock(
 
 async function cmdWhy(
   target: string,
-  opts: { repo: string; json?: boolean },
+  opts: { repo: string; json?: boolean; includeWeak?: boolean },
 ): Promise<void> {
   const repoPath = path.resolve(opts.repo);
 
@@ -837,7 +922,10 @@ async function cmdWhy(
   await requireReport(repoPath);
 
   const whyEngine = await loadWhyEngine();
-  const result = await whyEngine.why(repoPath, file, line);
+  const whyOpts: WhyOptions = {
+    includeWeak: opts.includeWeak === true,
+  };
+  const result = await whyEngine.why(repoPath, file, line, whyOpts);
 
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -1249,7 +1337,11 @@ program
   .argument('<target>', 'file and line, e.g. src/a.ts:42 or /abs/path/to/file.ts:42')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--json', 'output raw WhyResult as JSON instead of human-readable text')
-  .action((target: string, opts: { repo: string; json?: boolean }) => {
+  .option(
+    '--include-weak',
+    'include weak attributions (confidence < 0.8) in results; by default only strong-tier matches are shown',
+  )
+  .action((target: string, opts: { repo: string; json?: boolean; includeWeak?: boolean }) => {
     cmdWhy(target, opts).then(
       // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
@@ -1347,7 +1439,18 @@ program
 
 // Only parse argv when this module is run directly (not when imported for testing).
 // ESM equivalent of `require.main === module`.
-const _thisFile = fileURLToPath(import.meta.url);
-if (process.argv[1] !== undefined && _thisFile === process.argv[1]) {
+// Both sides are resolved through fs.realpathSync so that npm bin symlinks
+// (e.g. node_modules/.bin/lore → ../../dist/cli.js) compare equal to the
+// physical file path returned by import.meta.url.
+function _resolveReal(p: string): string {
+  try {
+    return fssync.realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+const _thisFile = _resolveReal(fileURLToPath(import.meta.url));
+const _argv1 = process.argv[1] !== undefined ? _resolveReal(process.argv[1]) : undefined;
+if (_argv1 !== undefined && _thisFile === _argv1) {
   program.parse();
 }

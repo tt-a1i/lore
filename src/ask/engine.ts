@@ -15,7 +15,9 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import * as os from 'node:os';
 
+import { encodeProjectPath } from '../parsers/claude-code.js';
 import type { AskEngine, AskResult, AskHit } from './types.js';
 import type { DistilledNote, NotesFile } from '../distill/types.js';
 
@@ -190,10 +192,62 @@ function scoreNote(note: DistilledNote, queryTerms: Map<string, number>): number
 const WEIGHT_MSG = 1;
 const MSG_TRUNCATE = 600;
 
+/**
+ * Relevance floor: hits scoring below this are dropped as noise rather than
+ * returned. Without it an unrelated query (e.g. random tokens that happen to
+ * brush a single common token) surfaces near-zero-score garbage. Notes and
+ * messages are both subject to it.
+ */
+export const MIN_SCORE = 0.3;
+
+/**
+ * Validity weight applied to a note's score when ranking. Currently-valid notes
+ * (invalidAt === null) get a 1.5× boost so a superseded note can never out-rank
+ * the note that replaced it on equal raw relevance (the "superseded reversal"
+ * bug). Applied only to ranking — the raw `score` returned is unweighted.
+ */
+const VALID_NOTE_WEIGHT = 1.5;
+
 export interface MessageIndexEntry {
   sessionId: string;
   seq: number;
   text: string;
+}
+
+/**
+ * Content blacklist — messages that are lore's own pipeline artifacts, not real
+ * project conversation. Indexing them pollutes `ask` results with meta-noise:
+ *   - task-notification harness lines (start with "<task-notification>")
+ *   - the distiller prompt itself ("software-archaeology distiller")
+ *   - tool-plumbing envelopes ("tool-use-id" / "output-file")
+ */
+function isLorePipelineArtifact(text: string): boolean {
+  const t = text.trimStart();
+  if (t.startsWith('<task-notification>')) return true;
+  const lower = text.toLowerCase();
+  return (
+    lower.includes('software-archaeology distiller') ||
+    lower.includes('tool-use-id') ||
+    lower.includes('output-file')
+  );
+}
+
+/**
+ * Decide whether a transcript sourcePath belongs to the target repo, so we only
+ * index messages from THIS project's sessions (sessions for other repos share the
+ * global ~/.claude/projects/ tree). Accepts a path when it is either:
+ *   - under ~/.claude/projects/<encodeProjectPath(repoPath)>/ (the canonical home), or
+ *   - inside the repo directory itself (in-repo / fixture transcripts).
+ * encodeProjectPath is reused from parsers/claude-code.ts (single source of truth).
+ */
+function sourcePathBelongsToRepo(sourcePath: string, repoPath: string): boolean {
+  const norm = sourcePath.replace(/\\/g, '/');
+  const encoded = encodeProjectPath(repoPath);
+  const projectDir = path.join(os.homedir(), '.claude', 'projects', encoded).replace(/\\/g, '/');
+  if (norm === projectDir || norm.startsWith(projectDir + '/')) return true;
+  const repo = repoPath.replace(/\\/g, '/').replace(/\/$/, '');
+  if (norm === repo || norm.startsWith(repo + '/')) return true;
+  return false;
 }
 
 /** Score a message entry against query terms. */
@@ -286,6 +340,10 @@ async function extractUserMessages(
 
     if (!text.trim()) continue;
 
+    // Content blacklist: skip lore's own pipeline artifacts (task-notifications,
+    // the distiller prompt, tool-plumbing envelopes) so they never enter the index.
+    if (isLorePipelineArtifact(text)) continue;
+
     entries.push({
       sessionId,
       seq: lineSeq,
@@ -335,16 +393,19 @@ class DeterministicAskEngine implements AskEngine {
       ? notes
       : notes.filter((n) => n.invalidAt === null);
 
-    // 4. Score notes.
-    const noteHits: AskHit[] = [];
+    // 4. Score notes. Drop sub-threshold (MIN_SCORE) noise. Rank by a
+    //    validity-weighted score (valid notes get a 1.5× boost) so a superseded
+    //    note can never out-rank the note that replaced it on equal relevance;
+    //    the `score` we return stays the raw, unweighted value.
+    const noteHits: { hit: AskHit; rankScore: number }[] = [];
     for (const note of filteredNotes) {
       const score = scoreNote(note, queryTerms);
-      if (score > 0) {
-        noteHits.push({ score, note });
-      }
+      if (score < MIN_SCORE) continue;
+      const rankScore = note.invalidAt === null ? score * VALID_NOTE_WEIGHT : score;
+      noteHits.push({ hit: { score, note }, rankScore });
     }
-    noteHits.sort((a, b) => b.score - a.score);
-    const topNoteHits = noteHits.slice(0, topK);
+    noteHits.sort((a, b) => b.rankScore - a.rankScore);
+    const topNoteHits = noteHits.slice(0, topK).map((x) => x.hit);
 
     // 5. Load report.json for sessionSourceMap.
     const reportPath = path.join(repo, '.lore', 'report.json');
@@ -360,18 +421,23 @@ class DeterministicAskEngine implements AskEngine {
     }
 
     // 6. Build message index from transcripts (concurrent reads).
+    //    Session-source filter: only index sessions whose transcript belongs to
+    //    THIS repo's project dir (or the repo itself) — other repos' sessions in
+    //    the shared ~/.claude/projects tree must not leak into results.
+    const ownSessions = Object.entries(sessionSourceMap).filter(([, srcPath]) =>
+      sourcePathBelongsToRepo(srcPath, repo),
+    );
     const perSession = await Promise.all(
-      Object.entries(sessionSourceMap).map(([sid, srcPath]) =>
-        extractUserMessages(srcPath, sid),
-      ),
+      ownSessions.map(([sid, srcPath]) => extractUserMessages(srcPath, sid)),
     );
     const allMessages: MessageIndexEntry[] = perSession.flat();
 
-    // 7. Score messages.
+    // 7. Score messages. Drop sub-threshold (MIN_SCORE) noise so an unrelated
+    //    query returns nothing rather than near-zero-score garbage.
     const msgScored: { entry: MessageIndexEntry; score: number }[] = [];
     for (const entry of allMessages) {
       const score = scoreMessage(entry, queryTerms);
-      if (score > 0) {
+      if (score >= MIN_SCORE) {
         msgScored.push({ entry, score });
       }
     }

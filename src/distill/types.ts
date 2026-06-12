@@ -50,6 +50,12 @@ export interface DistillInput {
   digest: SessionDigest;
   /** 同文件域现存有效 notes（供判断 supersede）。 */
   existingNotes: DistilledNote[];
+  /**
+   * 目标仓库根（可选）。提供时，claude-cli 后端会把蒸馏调用返回 envelope 里的
+   * session_id 追加记录到 <repoPath>/.lore/distill-sessions.json，便于审计/清理
+   * 蒸馏自身产生的 session。缺省则不记录（不影响蒸馏结果）。
+   */
+  repoPath?: string;
 }
 
 /** 蒸馏后端适配器。 */

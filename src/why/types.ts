@@ -44,6 +44,13 @@ export interface WhyResult {
   editedBy: { sessionId: string; agent: string; lastTs: string }[];
 }
 
+export interface WhyOptions {
+  /** Minimum confidence threshold; attributions below this are excluded. Default: 0.8. */
+  minConfidence?: number;
+  /** If true, include attributions below the 0.8 strong-tier floor ("weak" matches). Default: false. */
+  includeWeak?: boolean;
+}
+
 export interface WhyEngine {
-  why(repoPath: string, file: string, line: number): Promise<WhyResult>;
+  why(repoPath: string, file: string, line: number, opts?: WhyOptions): Promise<WhyResult>;
 }

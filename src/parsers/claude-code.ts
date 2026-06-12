@@ -161,9 +161,32 @@ interface AssistantDelta {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function encodeProjectPath(repoPath: string): string {
+/**
+ * Encode an absolute repo path into the directory name Claude Code uses under
+ * `~/.claude/projects/`: every '/' becomes '-'.  Exported so other layers (e.g.
+ * the ask engine's session-source filter) can recognise which project dir a
+ * transcript belongs to without re-deriving the rule.
+ */
+export function encodeProjectPath(repoPath: string): string {
   // Replace every '/' with '-'
   return repoPath.replace(/\//g, '-');
+}
+
+/**
+ * True when a ~/.claude/projects/<encoded> directory name corresponds to a cwd
+ * under os.tmpdir(). Because encodeProjectPath('/a/b') is a '-'-joined path, the
+ * encoded name of any tmpdir child starts with encodeProjectPath(os.tmpdir()).
+ *
+ * Why we skip these in broad discover (task: distill self-isolation): the
+ * `lore distill` step shells out to `claude -p` with cwd pinned to a tmpdir
+ * subdir, so its own distillation transcripts land in a tmpdir project dir.
+ * A broad scan would otherwise re-ingest lore's own pipeline output as if it
+ * were real project work, polluting the graph and `ask` index. Repo-targeted
+ * discover never sees these (different encoded dir); only broad mode needs the guard.
+ */
+export function isTmpdirProjectDir(encodedDirName: string, tmpdir: string = os.tmpdir()): boolean {
+  const tmpEncoded = encodeProjectPath(tmpdir.replace(/\/$/, ''));
+  return encodedDirName === tmpEncoded || encodedDirName.startsWith(tmpEncoded + '-');
 }
 
 function normalizePatch(raw: RawPatchHunk[]): PatchHunk[] {
@@ -667,6 +690,10 @@ async function discoverTranscripts(repoPath: string, broad = false): Promise<str
   const results: string[] = [];
   for (const d of dirs) {
     if (!d.isDirectory()) continue;
+    // Skip project dirs whose cwd is under os.tmpdir() — these hold lore's own
+    // distillation transcripts (claude -p runs with cwd in tmpdir), not real
+    // project work. Ingesting them would feed lore's output back into itself.
+    if (isTmpdirProjectDir(d.name)) continue;
     const found = await discoverInProjectDir(path.join(projectsRoot, d.name));
     results.push(...found);
   }

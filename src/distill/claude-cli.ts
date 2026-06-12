@@ -15,6 +15,9 @@
  */
 
 import { execFile } from 'node:child_process';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import type { Distiller, DistillInput, DistilledNote } from './types.js';
 
@@ -22,7 +25,7 @@ import type { Distiller, DistillInput, DistilledNote } from './types.js';
 export type ExecFn = (
   cmd: string,
   args: string[],
-  opts: { maxBuffer?: number; timeout?: number },
+  opts: { maxBuffer?: number; timeout?: number; cwd?: string },
 ) => Promise<{ stdout: string; stderr: string }>;
 
 /** 默认 exec：promisify(execFile)，不引第三方。 */
@@ -151,6 +154,26 @@ export function extractResultText(stdout: string): string {
     // 不是合法 envelope JSON——当作模型直接吐了文本。
   }
   return trimmed;
+}
+
+/**
+ * 从 `claude -p --output-format json` 的 envelope 提取 session_id（存在则）。
+ * envelope 形如 {"type":"result","session_id":"...","result":"..."}。
+ * 不是合法 JSON、无 session_id 字段或非字符串时返回 null。导出供测试。
+ */
+export function extractSessionId(stdout: string): string | null {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  try {
+    const env = JSON.parse(trimmed) as unknown;
+    if (env && typeof env === 'object' && 'session_id' in env) {
+      const sid = (env as { session_id: unknown }).session_id;
+      if (typeof sid === 'string' && sid.length > 0) return sid;
+    }
+  } catch {
+    // 不是 envelope JSON——无 session_id 可记录。
+  }
+  return null;
 }
 
 /**
@@ -315,10 +338,50 @@ function extractSeq(a: unknown): number | null {
   return null;
 }
 
+/** 注入用的 mkdtemp 形态（测试可 mock，避免真实建临时目录）。 */
+export type MkdtempFn = (prefix: string) => Promise<string>;
+
+const defaultMkdtemp: MkdtempFn = (prefix) => fs.mkdtemp(prefix);
+
+export interface ClaudeCliOptions {
+  /** exec 注入（测试用）。 */
+  exec?: ExecFn;
+  /** mkdtemp 注入（测试用）。 */
+  mkdtemp?: MkdtempFn;
+  /**
+   * 目标仓库根（可选）。提供时，蒸馏会把 envelope 的 session_id 追加记录到
+   * <repoPath>/.lore/distill-sessions.json。也可由 DistillInput.repoPath 覆盖
+   * （per-call 优先）。
+   */
+  repoPath?: string;
+}
+
 export class ClaudeCliDistiller implements Distiller {
   readonly name = 'claude-cli';
 
-  constructor(private readonly exec: ExecFn = defaultExec) {}
+  private readonly exec: ExecFn;
+  private readonly mkdtemp: MkdtempFn;
+  private readonly repoPath: string | undefined;
+
+  /** 蒸馏专用临时工作目录（os.tmpdir() 下，mkdtemp 一次后复用）。懒初始化。 */
+  private tmpCwd: string | null = null;
+  private tmpCwdPromise: Promise<string | null> | null = null;
+
+  /**
+   * 兼容旧签名：第一个参数可直接传 ExecFn（历史单测都这么用），也可传
+   * ClaudeCliOptions。两者均可。
+   */
+  constructor(opts: ExecFn | ClaudeCliOptions = {}) {
+    if (typeof opts === 'function') {
+      this.exec = opts;
+      this.mkdtemp = defaultMkdtemp;
+      this.repoPath = undefined;
+    } else {
+      this.exec = opts.exec ?? defaultExec;
+      this.mkdtemp = opts.mkdtemp ?? defaultMkdtemp;
+      this.repoPath = opts.repoPath;
+    }
+  }
 
   async available(): Promise<boolean> {
     try {
@@ -329,6 +392,26 @@ export class ClaudeCliDistiller implements Distiller {
     }
   }
 
+  /**
+   * 懒建一个 os.tmpdir() 下的专用子目录作蒸馏 cwd（复用）。
+   * 蒸馏调用 `claude -p` 会在 cwd 对应的 ~/.claude/projects 项目目录里落 transcript——
+   * 把 cwd 钉在 tmpdir 下，蒸馏产物就不会污染任何真实项目目录（repo 定向 discover
+   * 天然扫不到；broad discover 也会跳过 tmpdir 下的项目目录，见 parsers/claude-code.ts）。
+   * 建目录失败（极罕见）时返回 null，distill 退回不带 cwd（不阻断蒸馏）。
+   */
+  private async ensureTmpCwd(): Promise<string | null> {
+    if (this.tmpCwd !== null) return this.tmpCwd;
+    if (!this.tmpCwdPromise) {
+      this.tmpCwdPromise = this.mkdtemp(path.join(os.tmpdir(), 'lore-distill-'))
+        .then((dir) => {
+          this.tmpCwd = dir;
+          return dir;
+        })
+        .catch(() => null);
+    }
+    return this.tmpCwdPromise;
+  }
+
   async distill(input: DistillInput): Promise<{
     notes: RawNote[];
     supersededIds: string[];
@@ -337,18 +420,29 @@ export class ClaudeCliDistiller implements Distiller {
     const validSeqs = new Set(input.digest.messages.map((m) => m.seq));
     const prompt = buildPrompt(input);
 
+    // 蒸馏隔离：在 os.tmpdir() 下的专用 cwd 跑 claude -p，蒸馏 transcript 不落真实项目目录。
+    const cwd = await this.ensureTmpCwd();
+    const execOpts: { maxBuffer: number; timeout: number; cwd?: string } = {
+      maxBuffer: MAX_BUFFER,
+      timeout: DISTILL_TIMEOUT,
+    };
+    if (cwd) execOpts.cwd = cwd;
+
     let stdout: string;
     try {
       const res = await this.exec(
         'claude',
         ['-p', prompt, '--output-format', 'json', '--model', DISTILL_MODEL],
-        { maxBuffer: MAX_BUFFER, timeout: DISTILL_TIMEOUT },
+        execOpts,
       );
       stdout = res.stdout;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return { notes: [], supersededIds: [], error: `claude CLI failed: ${msg}` };
     }
+
+    // 记录蒸馏 session_id（best-effort，绝不影响蒸馏结果/抛异常）。
+    await this.recordDistillSession(input, stdout);
 
     const resultText = extractResultText(stdout);
     const parsed = lenientJsonParse(resultText);
@@ -361,6 +455,42 @@ export class ClaudeCliDistiller implements Distiller {
     }
 
     return coerceDistillOutput(parsed, validSeqs);
+  }
+
+  /**
+   * 把本次蒸馏调用的 session_id 追加进 <repo>/.lore/distill-sessions.json。
+   * repoPath 优先取 per-call（DistillInput.repoPath），否则构造期 repoPath；都没有则跳过。
+   * 容错铁律：任何 IO/解析错误都吞掉——session 记录只是审计便利，绝不能炸蒸馏。
+   */
+  private async recordDistillSession(input: DistillInput, stdout: string): Promise<void> {
+    const repoPath = input.repoPath ?? this.repoPath;
+    if (!repoPath) return;
+    const sessionId = extractSessionId(stdout);
+    if (!sessionId) return;
+    try {
+      const filePath = path.join(repoPath, '.lore', 'distill-sessions.json');
+      let sessions: string[] = [];
+      try {
+        const raw = await fs.readFile(filePath, 'utf8');
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          sessions = parsed.filter((s): s is string => typeof s === 'string');
+        } else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { sessions?: unknown }).sessions)) {
+          sessions = ((parsed as { sessions: unknown[] }).sessions).filter(
+            (s): s is string => typeof s === 'string',
+          );
+        }
+      } catch {
+        // 文件不存在/损坏：从空开始。
+      }
+      if (!sessions.includes(sessionId)) {
+        sessions.push(sessionId);
+        await fs.mkdir(path.join(repoPath, '.lore'), { recursive: true });
+        await fs.writeFile(filePath, JSON.stringify({ sessions }, null, 2), 'utf8');
+      }
+    } catch {
+      // 吞掉——审计记录失败不影响蒸馏。
+    }
   }
 }
 

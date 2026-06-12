@@ -507,4 +507,149 @@ describe('AskEngine.ask', () => {
     expect(result.hits).toEqual([]);
     expect(result.messageHits).toEqual([]);
   });
+
+  // ── Denoising: MIN_SCORE floor ─────────────────────────────────────────────
+
+  it('returns empty results for a totally unrelated query (MIN_SCORE floor)', async () => {
+    const repo = makeRepo();
+    const notes: DistilledNote[] = [
+      makeNote({
+        id: 'note-real',
+        title: 'Scrolling constraint in the terminal pane',
+        body: 'The terminal must not scroll past the last line; we clamp the offset.',
+        files: ['src/server/terminal.ts'],
+      }),
+    ];
+    writeNotesJson(repo, notes);
+    const transcriptPath = writeTranscript(repo, 'sess-real', [
+      'We need to fix the scrolling constraint so the pane stays anchored.',
+    ]);
+    writeReportJson(repo, { 'sess-real': transcriptPath });
+
+    const engine = createAskEngine();
+    const result = await engine.ask(
+      repo,
+      'a totally unrelated query about quantum chromodynamics zzz',
+    );
+
+    expect(result.hits).toEqual([]);
+    expect(result.messageHits).toEqual([]);
+  });
+
+  it('still finds the relevant note for a real query after denoising', async () => {
+    const repo = makeRepo();
+    const notes: DistilledNote[] = [
+      makeNote({
+        id: 'note-scroll',
+        title: 'Scrolling constraint in the terminal pane',
+        body: 'The terminal pane must not scroll past the last line; the scroll offset is clamped to the content height.',
+        files: ['src/server/terminal.ts'],
+      }),
+    ];
+    writeNotesJson(repo, notes);
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'scrolling constraint');
+
+    expect(result.hits.length).toBeGreaterThanOrEqual(1);
+    expect(result.hits[0]!.note.id).toBe('note-scroll');
+  });
+
+  // ── Denoising: content blacklist ───────────────────────────────────────────
+
+  it('skips lore pipeline artifact messages (task-notification / distiller / tool plumbing)', async () => {
+    const repo = makeRepo();
+    // All three messages mention "kuzu graph" but each is a lore artifact and must be skipped.
+    const transcriptPath = writeTranscript(repo, 'sess-artifact', [
+      '<task-notification> kuzu graph storage distill complete',
+      'You are a software-archaeology distiller. Extract notes about kuzu graph.',
+      'envelope with tool-use-id pointing at kuzu graph output-file path',
+    ]);
+    writeReportJson(repo, { 'sess-artifact': transcriptPath });
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'kuzu graph storage');
+
+    expect(result.messageHits).toEqual([]);
+  });
+
+  it('keeps a genuine message even when a sibling artifact message is present', async () => {
+    const repo = makeRepo();
+    const transcriptPath = writeTranscript(repo, 'sess-mixed', [
+      '<task-notification> kuzu graph distill complete', // artifact — skipped
+      'Please wire up the kuzu graph store adapter for persistence.', // genuine — kept
+    ]);
+    writeReportJson(repo, { 'sess-mixed': transcriptPath });
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'kuzu graph store adapter');
+
+    expect(result.messageHits.length).toBe(1);
+    expect(result.messageHits[0]!.text).toContain('wire up the kuzu graph store adapter');
+  });
+
+  // ── Denoising: session-source filter ───────────────────────────────────────
+
+  it('excludes messages from a session whose transcript belongs to another repo', async () => {
+    const repo = makeRepo();
+    // A foreign transcript that lives outside the repo and outside its project dir.
+    const foreignDir = mkdtempSync(join(tmpdir(), 'lore-other-repo-'));
+    tmpDirs.push(foreignDir);
+    const foreignTranscript = join(foreignDir, 'sess-foreign.jsonl');
+    writeFileSync(
+      foreignTranscript,
+      JSON.stringify({
+        type: 'user',
+        sessionId: 'sess-foreign',
+        cwd: foreignDir,
+        isMeta: false,
+        timestamp: '2026-06-01T10:00:00.000Z',
+        message: { role: 'user', content: 'Implement the kuzu graph store adapter please.' },
+      }) + '\n',
+      'utf8',
+    );
+    writeReportJson(repo, { 'sess-foreign': foreignTranscript });
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'kuzu graph store adapter');
+
+    // The matching content exists, but its source is a foreign repo → excluded.
+    expect(result.messageHits).toEqual([]);
+  });
+
+  // ── Bi-temporal: valid note out-ranks superseded on equal relevance ────────
+
+  it('ranks a valid note above an equally-relevant superseded note (--include-superseded)', async () => {
+    const repo = makeRepo();
+    // Identical title/body → identical raw score; only validity differs.
+    const sharedTitle = 'Storage backend decision';
+    const sharedBody = 'We use a graph store for the storage backend of the project.';
+    const notes: DistilledNote[] = [
+      makeNote({
+        id: 'note-superseded',
+        title: sharedTitle,
+        body: sharedBody,
+        invalidAt: '2026-06-05T00:00:00.000Z',
+        supersededBy: 'note-valid',
+      }),
+      makeNote({
+        id: 'note-valid',
+        title: sharedTitle,
+        body: sharedBody,
+        invalidAt: null,
+      }),
+    ];
+    writeNotesJson(repo, notes);
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'storage backend', {
+      includeSuperseded: true,
+    });
+
+    const ids = result.hits.map((h) => h.note.id);
+    expect(ids).toContain('note-valid');
+    expect(ids).toContain('note-superseded');
+    // The valid note must rank first despite identical raw relevance.
+    expect(result.hits[0]!.note.id).toBe('note-valid');
+  });
 });

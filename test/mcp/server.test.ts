@@ -10,10 +10,14 @@
  *   2. Error path: engine throws → isError=true, message surfaced in content.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { createLoreMcpServer } from '../../src/mcp/server.js';
+import { createLoreMcpServer, __test__ } from '../../src/mcp/server.js';
 import type { WhyEngine, WhyResult } from '../../src/why/types.js';
 import type { AskEngine, AskResult } from '../../src/ask/types.js';
 import type {
@@ -177,12 +181,15 @@ function mockGraphStore(
 
 // ── Test harness: wire McpServer ↔ Client via InMemoryTransport ───────────────
 
-async function makeClientServer(engines: {
-  whyEngine?: WhyEngine;
-  askEngine?: AskEngine;
-  graphStore?: GraphStore;
-}): Promise<{ client: Client; cleanup: () => Promise<void> }> {
-  const server = createLoreMcpServer('/fake/repo', engines);
+async function makeClientServer(
+  engines: {
+    whyEngine?: WhyEngine;
+    askEngine?: AskEngine;
+    graphStore?: GraphStore;
+  },
+  repoPath = '/fake/repo',
+): Promise<{ client: Client; cleanup: () => Promise<void> }> {
+  const server = createLoreMcpServer(repoPath, engines);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
   const client = new Client({ name: 'test-client', version: '0.0.1' });
@@ -614,6 +621,262 @@ describe('server tool listing', () => {
         expect(tool.description!.length).toBeGreaterThan(0);
         expect(tool.inputSchema).toBeDefined();
       }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // ── semantic legend in descriptions (task 4) ───────────────────────────────
+  it('lore_why description documents the trust model, anchors, and when to call', async () => {
+    const { client, cleanup } = await makeClientServer({
+      whyEngine: mockWhyEngine(makeWhyResult()),
+    });
+    try {
+      const { tools } = await client.listTools();
+      const why = tools.find((t) => t.name === 'lore_why')!;
+      const d = why.description!;
+      expect(d).toContain('0.8'); // strong/weak boundary
+      expect(d.toLowerCase()).toContain('strong');
+      expect(d.toLowerCase()).toContain('weak');
+      expect(d).toContain('matchedVia'); // matchedVia meaning explained
+      expect(d.toLowerCase()).toContain('anchor'); // [sessionId+seq] is a permanent anchor
+      expect(d.toLowerCase()).toMatch(/before (editing|you)/i); // when to call
+      // include_weak is exposed in the schema
+      const props = (why.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+      expect(props).toHaveProperty('include_weak');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('lore_ask description documents kind enum and note-vs-msg trust', async () => {
+    const { client, cleanup } = await makeClientServer({
+      askEngine: mockAskEngine(makeAskResult()),
+    });
+    try {
+      const { tools } = await client.listTools();
+      const ask = tools.find((t) => t.name === 'lore_ask')!;
+      const d = ask.description!;
+      expect(d).toContain('decision');
+      expect(d).toContain('constraint');
+      expect(d).toContain('rejected-approach');
+      expect(d.toLowerCase()).toContain('distilled'); // note = distilled high-trust
+      expect(d.toLowerCase()).toMatch(/raw|unvetted/); // msg = raw low-trust
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('lore_history description documents the trust model and anchors', async () => {
+    const { client, cleanup } = await makeClientServer({
+      graphStore: mockGraphStore([]),
+    });
+    try {
+      const { tools } = await client.listTools();
+      const hist = tools.find((t) => t.name === 'lore_history')!;
+      const d = hist.description!;
+      expect(d).toContain('0.8');
+      expect(d.toLowerCase()).toContain('strong');
+      expect(d.toLowerCase()).toContain('weak');
+      expect(d.toLowerCase()).toContain('anchor');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ── weak-confidence rendering (task 1, MCP side) ───────────────────────────────
+
+function makeWeakWhyResult(): WhyResult {
+  const r = makeWhyResult();
+  // Drop to a weak (<0.8) confidence; give a multi-line excerpt to verify folding.
+  r.attributions[0]!.produced.confidence = 0.55;
+  r.attributions[0]!.excerpts = [
+    {
+      sessionId: 'session-abc123',
+      seq: 4,
+      role: 'user',
+      text: 'Line one of the excerpt.\nLine two should be folded.\nLine three too.',
+      ts: '2026-06-10T10:20:00.000Z',
+    },
+  ];
+  return r;
+}
+
+describe('weak-confidence rendering', () => {
+  it('renderWhyCompact prefixes weak attributions with ⚠ LOW-CONFIDENCE and folds the body', () => {
+    const text = __test__.renderWhyCompact(makeWeakWhyResult());
+    expect(text).toContain('confidence:0.550(weak)');
+    expect(text).toContain('⚠ LOW-CONFIDENCE');
+    // body folded to a single line — no embedded newline in the excerpt line
+    const excerptLine = text.split('\n').find((l) => l.includes('USER:'))!;
+    expect(excerptLine).toContain('Line one of the excerpt. Line two should be folded.');
+    expect(excerptLine).not.toContain('\n');
+    // anchor preserved
+    expect(text).toContain('[session-+4]');
+  });
+
+  it('renderWhyCompact leaves strong attributions unchanged (no ⚠, full excerpts)', () => {
+    const text = __test__.renderWhyCompact(makeWhyResult());
+    expect(text).toContain('confidence:0.920(strong)');
+    expect(text).not.toContain('⚠ LOW-CONFIDENCE');
+    // strong path keeps up to 2 excerpts
+    expect(text).toContain('Please implement the config parser');
+    expect(text).toContain('I will implement the YAML config parser now.');
+  });
+
+  it('renderHistoryCompact flags weak attributions with ⚠ LOW-CONFIDENCE', () => {
+    const weakProduced = { ...makeProduced(), confidence: 0.6 };
+    const text = __test__.renderHistoryCompact('src/x.ts', [
+      { commit: makeCommit(), produced: [weakProduced] },
+    ]);
+    expect(text).toContain('⚠ LOW-CONFIDENCE');
+    expect(text).toContain('conf=0.600(weak)');
+  });
+
+  it('renderHistoryCompact leaves strong attributions unflagged', () => {
+    const text = __test__.renderHistoryCompact('src/x.ts', [
+      { commit: makeCommit(), produced: [makeProduced()] },
+    ]);
+    expect(text).not.toContain('⚠ LOW-CONFIDENCE');
+    expect(text).toContain('conf=0.920(strong)');
+  });
+
+  it('lore_why passes include_weak through to the engine', async () => {
+    let capturedOpts: { includeWeak?: boolean } | undefined;
+    const spyEngine: WhyEngine = {
+      why: async (_repo, _file, _line, opts) => {
+        capturedOpts = opts;
+        return makeWhyResult();
+      },
+    };
+    const { client, cleanup } = await makeClientServer({ whyEngine: spyEngine });
+    try {
+      await client.callTool({
+        name: 'lore_why',
+        arguments: { file: 'a.ts', line: 1, include_weak: true },
+      });
+      expect(capturedOpts?.includeWeak).toBe(true);
+
+      await client.callTool({
+        name: 'lore_why',
+        arguments: { file: 'a.ts', line: 1 },
+      });
+      expect(capturedOpts?.includeWeak).toBe(false); // default
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ── freshness header (task 4) ──────────────────────────────────────────────────
+
+const headerTmpDirs: string[] = [];
+afterEach(() => {
+  for (const dir of headerTmpDirs.splice(0)) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+});
+
+function makeRepoWithReport(
+  report: Record<string, unknown>,
+  opts: { initGit?: boolean; commitDate?: string } = {},
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'lore-mcp-hdr-'));
+  headerTmpDirs.push(dir);
+  mkdirSync(join(dir, '.lore'), { recursive: true });
+  writeFileSync(join(dir, '.lore', 'report.json'), JSON.stringify(report), 'utf8');
+  if (opts.initGit) {
+    const git = (...a: string[]) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
+    git('init');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'Test User');
+    git('config', 'commit.gpgsign', 'false');
+    writeFileSync(join(dir, 'f.txt'), 'hello\n', 'utf8');
+    git('add', '-A');
+    const env = opts.commitDate
+      ? { ...process.env, GIT_AUTHOR_DATE: opts.commitDate, GIT_COMMITTER_DATE: opts.commitDate }
+      : process.env;
+    execFileSync('git', ['-C', dir, 'commit', '-m', 'init'], { encoding: 'utf8', env });
+  }
+  return dir;
+}
+
+describe('freshnessHeader', () => {
+  it('returns null when report.json is absent', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lore-mcp-noreport-'));
+    headerTmpDirs.push(dir);
+    expect(await __test__.buildFreshnessHeader(dir)).toBeNull();
+  });
+
+  it('builds coverage + generated without stale when not a git repo', async () => {
+    const dir = makeRepoWithReport({
+      generatedAt: '2026-06-12T09:00:00.000Z',
+      commitsTotal: 100,
+      commitsMatchedStrong: 40,
+      commitsMatchedWeak: 10,
+    });
+    const header = await __test__.buildFreshnessHeader(dir);
+    expect(header).toContain('coverage:50/100');
+    expect(header).toContain('generated:2026-06-12');
+    // No git repo → stale omitted.
+    expect(header).not.toContain('stale:');
+  });
+
+  it('marks stale:true when report predates HEAD commit', async () => {
+    const dir = makeRepoWithReport(
+      {
+        generatedAt: '2026-06-01T00:00:00.000Z',
+        commitsTotal: 10,
+        commitsMatchedStrong: 5,
+        commitsMatchedWeak: 0,
+      },
+      { initGit: true, commitDate: '2026-06-10T12:00:00 +0000' },
+    );
+    const header = await __test__.buildFreshnessHeader(dir);
+    expect(header).toContain('coverage:5/10');
+    expect(header).toContain('stale:true');
+  });
+
+  it('marks stale:false when report is newer than HEAD commit', async () => {
+    const dir = makeRepoWithReport(
+      {
+        generatedAt: '2026-06-20T00:00:00.000Z',
+        commitsTotal: 10,
+        commitsMatchedStrong: 5,
+        commitsMatchedWeak: 2,
+      },
+      { initGit: true, commitDate: '2026-06-10T12:00:00 +0000' },
+    );
+    const header = await __test__.buildFreshnessHeader(dir);
+    expect(header).toContain('coverage:7/10');
+    expect(header).toContain('stale:false');
+  });
+
+  it('tool output first line carries the freshness header', async () => {
+    const dir = makeRepoWithReport({
+      generatedAt: '2026-06-12T09:00:00.000Z',
+      commitsTotal: 100,
+      commitsMatchedStrong: 40,
+      commitsMatchedWeak: 10,
+    });
+    const { client, cleanup } = await makeClientServer(
+      { askEngine: mockAskEngine(makeAskResult()) },
+      dir,
+    );
+    try {
+      const result = await client.callTool({
+        name: 'lore_ask',
+        arguments: { question: 'why YAML?' },
+      });
+      const text = (result.content as { type: string; text: string }[])[0]!.text;
+      const firstLine = text.split('\n')[0]!;
+      expect(firstLine).toContain('coverage:50/100');
+      expect(firstLine).toContain('generated:2026-06-12');
     } finally {
       await cleanup();
     }

@@ -4,12 +4,16 @@
  * anchors seq 校验、available()。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import {
   ClaudeCliDistiller,
   buildPrompt,
   extractResultText,
+  extractSessionId,
   lenientJsonParse,
   coerceDistillOutput,
   DISTILL_MODEL,
@@ -297,5 +301,145 @@ describe('ClaudeCliDistiller.available', () => {
 
   it('has the expected name', () => {
     expect(new ClaudeCliDistiller().name).toBe('claude-cli');
+  });
+});
+
+// ── self-isolation: tmpdir cwd + session recording (task 3) ────────────────────
+
+describe('ClaudeCliDistiller self-isolation', () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const dir of tmpDirs.splice(0)) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  it('runs claude -p with cwd pinned to an os.tmpdir() subdir', async () => {
+    let capturedCwd: string | undefined;
+    const spyExec: ExecFn = async (_cmd, _args, opts) => {
+      capturedCwd = opts.cwd;
+      return { stdout: envelope(VALID_NOTE_JSON), stderr: '' };
+    };
+    const d = new ClaudeCliDistiller({ exec: spyExec });
+    await d.distill(digestInput());
+
+    expect(capturedCwd).toBeDefined();
+    // cwd must live under os.tmpdir() — NOT in any real project directory.
+    expect(capturedCwd!.startsWith(tmpdir())).toBe(true);
+    expect(capturedCwd).toContain('lore-distill-');
+  });
+
+  it('reuses the same tmpdir cwd across multiple distill calls (mkdtemp once)', async () => {
+    const seen: (string | undefined)[] = [];
+    let mkdtempCalls = 0;
+    const spyExec: ExecFn = async (_cmd, _args, opts) => {
+      seen.push(opts.cwd);
+      return { stdout: envelope(VALID_NOTE_JSON), stderr: '' };
+    };
+    const d = new ClaudeCliDistiller({
+      exec: spyExec,
+      mkdtemp: async (prefix) => {
+        mkdtempCalls++;
+        return prefix + 'fixed';
+      },
+    });
+    await d.distill(digestInput());
+    await d.distill(digestInput());
+
+    expect(mkdtempCalls).toBe(1); // created once
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBe(seen[1]); // reused
+  });
+
+  it('still distills (no cwd) when tmpdir creation fails', async () => {
+    let capturedCwd: string | undefined = 'sentinel';
+    const spyExec: ExecFn = async (_cmd, _args, opts) => {
+      capturedCwd = opts.cwd;
+      return { stdout: envelope(VALID_NOTE_JSON), stderr: '' };
+    };
+    const d = new ClaudeCliDistiller({
+      exec: spyExec,
+      mkdtemp: async () => {
+        throw new Error('disk full');
+      },
+    });
+    const out = await d.distill(digestInput());
+
+    expect(capturedCwd).toBeUndefined(); // exec called without cwd
+    expect(out.notes).toHaveLength(1); // distillation still succeeds
+  });
+
+  it('records the envelope session_id to <repo>/.lore/distill-sessions.json', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'lore-distill-repo-'));
+    tmpDirs.push(repo);
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      session_id: 'distill-sess-xyz',
+      result: VALID_NOTE_JSON,
+    });
+    const d = new ClaudeCliDistiller({ exec: async () => ({ stdout, stderr: '' }), repoPath: repo });
+    await d.distill(digestInput());
+
+    const filePath = join(repo, '.lore', 'distill-sessions.json');
+    expect(existsSync(filePath)).toBe(true);
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as { sessions: string[] };
+    expect(parsed.sessions).toContain('distill-sess-xyz');
+  });
+
+  it('does not duplicate a session_id across repeated calls', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'lore-distill-repo-'));
+    tmpDirs.push(repo);
+    const stdout = JSON.stringify({ session_id: 'sess-dup', result: VALID_NOTE_JSON });
+    const d = new ClaudeCliDistiller({ exec: async () => ({ stdout, stderr: '' }), repoPath: repo });
+    await d.distill(digestInput());
+    await d.distill(digestInput());
+
+    const parsed = JSON.parse(
+      readFileSync(join(repo, '.lore', 'distill-sessions.json'), 'utf8'),
+    ) as { sessions: string[] };
+    expect(parsed.sessions.filter((s) => s === 'sess-dup')).toHaveLength(1);
+  });
+
+  it('prefers per-call DistillInput.repoPath over the constructor repoPath', async () => {
+    const ctorRepo = mkdtempSync(join(tmpdir(), 'lore-distill-ctor-'));
+    const callRepo = mkdtempSync(join(tmpdir(), 'lore-distill-call-'));
+    tmpDirs.push(ctorRepo, callRepo);
+    const stdout = JSON.stringify({ session_id: 'sess-percall', result: VALID_NOTE_JSON });
+    const d = new ClaudeCliDistiller({
+      exec: async () => ({ stdout, stderr: '' }),
+      repoPath: ctorRepo,
+    });
+    await d.distill({ ...digestInput(), repoPath: callRepo });
+
+    expect(existsSync(join(callRepo, '.lore', 'distill-sessions.json'))).toBe(true);
+    expect(existsSync(join(ctorRepo, '.lore', 'distill-sessions.json'))).toBe(false);
+  });
+
+  it('skips recording when no repoPath is configured (graceful no-op)', async () => {
+    const stdout = JSON.stringify({ session_id: 'sess-none', result: VALID_NOTE_JSON });
+    const d = new ClaudeCliDistiller({ exec: async () => ({ stdout, stderr: '' }) });
+    // No repoPath anywhere — must not throw, must still return notes.
+    const out = await d.distill(digestInput());
+    expect(out.notes).toHaveLength(1);
+  });
+});
+
+describe('extractSessionId', () => {
+  it('pulls session_id out of the envelope', () => {
+    expect(extractSessionId(JSON.stringify({ session_id: 'abc', result: '{}' }))).toBe('abc');
+  });
+
+  it('returns null when session_id is absent', () => {
+    expect(extractSessionId(JSON.stringify({ result: '{}' }))).toBeNull();
+  });
+
+  it('returns null for non-JSON / empty stdout', () => {
+    expect(extractSessionId('not json')).toBeNull();
+    expect(extractSessionId('   ')).toBeNull();
   });
 });

@@ -29,6 +29,7 @@ import type { CommitNodeData } from '../graph/types.js';
 import type { GraphStore } from '../graph/types.js';
 import type {
   WhyEngine,
+  WhyOptions,
   WhyResult,
   WhyAttribution,
   ConversationExcerpt,
@@ -200,8 +201,11 @@ export class DeterministicWhyEngine implements WhyEngine {
     private readonly parser: TranscriptParser,
   ) {}
 
-  async why(repoPath: string, file: string, line: number): Promise<WhyResult> {
+  async why(repoPath: string, file: string, line: number, opts?: WhyOptions): Promise<WhyResult> {
     const repo = path.resolve(repoPath);
+
+    // Resolve confidence floor: default 0.8 unless --include-weak explicitly set.
+    const minConfidence = opts?.minConfidence ?? (opts?.includeWeak ? 0 : 0.8);
 
     // 1. blame
     const { hash, lineContent } = await blameLine(repo, file, line);
@@ -210,7 +214,7 @@ export class DeterministicWhyEngine implements WhyEngine {
     const commit = await this.resolveCommit(repo, hash);
 
     // 3. report.json 取 (commitHash, filePath) 的 candidate，confidence 降序 top 3。
-    const candidates = await this.loadCandidates(repo, commit.hash, file, hash);
+    const candidates = await this.loadCandidates(repo, commit.hash, file, hash, minConfidence);
 
     // 4. 每个 candidate 构建归因（parse sourcePath，抽摘录）。
     const attributions: WhyAttribution[] = [];
@@ -253,12 +257,14 @@ export class DeterministicWhyEngine implements WhyEngine {
    * 从 .lore/report.json 取该 (commitHash, filePath) 的 MatchCandidate，
    * confidence 降序，取前 3。blame 的 commit 是全 hash，report 里也可能是短 hash——
    * 双向前缀匹配。filePath 用归一化后缀比较（report 存 repo 相对路径）。
+   * minConfidence: 过滤低于此值的候选（默认 0.8，--include-weak 时为 0）。
    */
   private async loadCandidates(
     repoPath: string,
     fullHash: string,
     file: string,
     blameHash: string,
+    minConfidence = 0.8,
   ): Promise<MatchCandidate[]> {
     const reportPath = path.join(repoPath, '.lore', 'report.json');
     let report: LoreReportFile;
@@ -275,7 +281,8 @@ export class DeterministicWhyEngine implements WhyEngine {
     const matched = report.matches.filter((m) => {
       const hashOk = prefixMatch(m.commitHash, fullHash) || prefixMatch(m.commitHash, blameHash);
       const fileOk = filePathMatch(m.filePath, relFile);
-      return hashOk && fileOk;
+      const confOk = m.confidence >= minConfidence;
+      return hashOk && fileOk && confOk;
     });
 
     matched.sort((a, b) => b.confidence - a.confidence);
@@ -411,7 +418,7 @@ export function createWhyEngine(store: GraphStore, parser: TranscriptParser): Wh
  * 不复用连接更简单、也避免 kuzu 句柄泄漏。
  */
 class SelfWiringWhyEngine implements WhyEngine {
-  async why(repoPath: string, file: string, line: number): Promise<WhyResult> {
+  async why(repoPath: string, file: string, line: number, opts?: WhyOptions): Promise<WhyResult> {
     const repo = path.resolve(repoPath);
     // factory.js 由存储层另行落地；用计算 specifier 做运行时导入，避免
     // 在它就位前阻塞本模块的 typecheck。
@@ -426,7 +433,7 @@ class SelfWiringWhyEngine implements WhyEngine {
     await store.init();
     try {
       const inner = new DeterministicWhyEngine(store, claudeCodeParser);
-      return await inner.why(repo, file, line);
+      return await inner.why(repo, file, line, opts);
     } finally {
       await store.close();
     }
