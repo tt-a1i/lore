@@ -27,6 +27,10 @@
  * contentScore 的分母是 commit 侧归一化后的有效 addedLines 总数
  * （语义："这个 hunk 有多少出自该 session"——commit 是被归因对象）。
  *
+ * 证据下限（对抗验证实测教训）：命中行数 <2 的候选丢弃；<3 的封顶 weak。
+ * 单行/双行的重叠（import、样板、generic 属性行）碰巧率太高，撑不起 strong。
+ * 代价：真实的 1-2 行小 commit 最多到 weak，可接受。
+ *
  * 已知困难（来自 hive-private 画像，验证阶段重点观察）：
  * 超大 squash commit（最大 429 文件）、单日 107 commit 的密集提交、
  * agent 多轮改写同一行（取最终态）、人工编辑混入（userModified 标志可用）、
@@ -38,10 +42,18 @@ export interface MatchCandidate {
   /** repo 相对路径。 */
   filePath: string;
   sessionId: string;
-  /** 贡献了内容的 FileEditEvent.seq 列表。 */
+  /** 贡献了内容的 FileEditEvent.seq 列表（seq 相对于 sourcePath 对应的解析单元）。 */
   editSeqs: number[];
+  /**
+   * 实际包含贡献编辑的 transcript 文件（解析单元粒度）。
+   * 同一 sessionId 下父 session 与各 workflow 子 agent 是不同解析单元——
+   * 证据必须指向真正干活的那个文件，否则归因无法复核。
+   */
+  sourcePath: string;
   /** 归因路径：sha = Tier-0 精确锚定；content = Tier-1/2 信号匹配。 */
   matchedVia: 'sha' | 'content';
+  /** 命中的归一化行数。strong 要求 ≥3；<2 的候选直接丢弃（单行重叠极易碰巧）。 */
+  matchedLines: number;
   /** 0-1，归一化行重叠率。 */
   contentScore: number;
   /** 0-1，时间窗符合度。 */

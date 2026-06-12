@@ -115,6 +115,8 @@ interface EditRecord {
  */
 interface SessionFileBucket {
   sessionId: string;
+  /** 解析单元（transcript 文件）——父 session 与各子 agent 必须分桶，证据才可复核。 */
+  sourcePath: string;
   /** 归一化行 → 出现次数（多重集）。 */
   lineCounts: Map<string, number>;
   /** 贡献了内容的 edit seq（去重、升序）。 */
@@ -202,26 +204,43 @@ export class ContentTimeMatchEngine implements MatchEngine {
         // ---- Tier-0: 该 commit 被某 session 通过 sha 锚定 ----
         const anchoredSessions = anchors.byCommit.get(commit.hash);
         if (anchoredSessions && anchoredSessions.size > 0) {
-          for (const [sid, anchorTs] of anchoredSessions) {
-            const editSeqs = this.anchorEditSeqs(index, relPath, sid, anchorTs);
-            const cand: MatchCandidate = {
-              commitHash: commit.hash,
-              filePath: relPath,
-              sessionId: sid,
-              editSeqs,
-              matchedVia: 'sha',
-              contentScore: 1.0,
-              timeScore: 1.0,
-              confidence: 1.0,
-              evidence: [
-                `anchor: GitCommitEvent.sha 前缀匹配 commit ${commit.hash}`,
-                `editSeqs: ${editSeqs.length} 个 commit 前触碰本文件的编辑`,
-              ],
-            };
-            matches.push(cand);
-            strongCommits.add(commit.hash);
-            matchedAnyCommit.add(commit.hash);
-            contributingSessions.add(sid);
+          for (const [sid, anchor] of anchoredSessions) {
+            // 找该 session 名下、触碰本文件的解析单元桶；证据指向真正干活的文件。
+            const sessMap0 = index.byPath.get(relPath);
+            const buckets = sessMap0
+              ? [...sessMap0.values()].filter((b) => b.sessionId === sid)
+              : [];
+            const targets = buckets.length > 0 ? buckets : [null];
+            for (const bucket of targets) {
+              const editSeqs =
+                bucket === null
+                  ? []
+                  : bucket.edits
+                      .filter((e) => anchor.ts === 0 || e.ts <= anchor.ts)
+                      .map((e) => e.seq)
+                      .filter((v, i, a) => a.indexOf(v) === i)
+                      .sort((a, b) => a - b);
+              const cand: MatchCandidate = {
+                commitHash: commit.hash,
+                filePath: relPath,
+                sessionId: sid,
+                editSeqs,
+                sourcePath: bucket ? bucket.sourcePath : anchor.sourcePath,
+                matchedVia: 'sha',
+                matchedLines: bucket ? bucket.lineCounts.size : 0,
+                contentScore: 1.0,
+                timeScore: 1.0,
+                confidence: 1.0,
+                evidence: [
+                  `anchor: GitCommitEvent.sha 前缀匹配 commit ${commit.hash}`,
+                  `editSeqs: ${editSeqs.length} 个 commit 前触碰本文件的编辑`,
+                ],
+              };
+              matches.push(cand);
+              strongCommits.add(commit.hash);
+              matchedAnyCommit.add(commit.hash);
+              contributingSessions.add(sid);
+            }
           }
           // Tier-0 命中后不再为同一 (commit,file) 做 Tier-1/2（已 1.0，无需降级）。
           continue;
@@ -259,7 +278,10 @@ export class ContentTimeMatchEngine implements MatchEngine {
             if (s > timeScore) timeScore = s;
           }
 
-          const confidence = 0.8 * contentScore + 0.2 * timeScore;
+          // 证据下限：<2 行命中直接丢弃；<3 行封顶 weak（单行重叠碰巧率太高）。
+          if (hits < 2) continue;
+          let confidence = 0.8 * contentScore + 0.2 * timeScore;
+          if (hits < 3) confidence = Math.min(confidence, 0.79);
           if (tierOf(confidence) === 'none') continue;
 
           const editSeqs = [...bucket.seqs].sort((a, b) => a - b);
@@ -267,14 +289,16 @@ export class ContentTimeMatchEngine implements MatchEngine {
             `content: ${hits}/${targetTotal} 归一化行重叠 (score=${contentScore.toFixed(3)})`,
             `time: score=${timeScore.toFixed(3)}`,
           ];
-          if (contentScore === 0) evidence.push('content miss: 仅时间信号，不会单独达 strong');
+          if (hits < 3) evidence.push(`evidence floor: 仅 ${hits} 行命中，封顶 weak`);
 
           const cand: MatchCandidate = {
             commitHash: commit.hash,
             filePath: relPath,
             sessionId: bucket.sessionId,
             editSeqs,
+            sourcePath: bucket.sourcePath,
             matchedVia: 'content',
+            matchedLines: hits,
             contentScore,
             timeScore,
             confidence,
@@ -354,6 +378,7 @@ export class ContentTimeMatchEngine implements MatchEngine {
     for (const session of sessions) {
       sessionMap.set(session.meta.sessionId, session);
       const cwd = session.meta.cwd;
+      const sourcePath = session.meta.sourcePath;
 
       for (const ev of session.events) {
         if (ev.kind !== 'file-edit') continue;
@@ -378,15 +403,19 @@ export class ContentTimeMatchEngine implements MatchEngine {
           sessMap = new Map();
           byPath.set(rel, sessMap);
         }
-        let bucket = sessMap.get(session.meta.sessionId);
+        // 桶按解析单元（sessionId + sourcePath）分，不按 sessionId 合并——
+        // 否则父 session 与子 agent 的编辑混在一起，证据无法指向真正的出处。
+        const bucketKey = session.meta.sessionId + ' ' + sourcePath;
+        let bucket = sessMap.get(bucketKey);
         if (!bucket) {
           bucket = {
             sessionId: session.meta.sessionId,
+            sourcePath,
             lineCounts: new Map(),
             seqs: new Set(),
             edits: [],
           };
-          sessMap.set(session.meta.sessionId, bucket);
+          sessMap.set(bucketKey, bucket);
         }
         for (const l of lines) {
           bucket.lineCounts.set(l, (bucket.lineCounts.get(l) ?? 0) + 1);
@@ -407,8 +436,8 @@ export class ContentTimeMatchEngine implements MatchEngine {
   private computeAnchors(
     commits: CommitInfo[],
     sessions: ParsedSession[]
-  ): { byCommit: Map<string, Map<string, number>> } {
-    const byCommit = new Map<string, Map<string, number>>();
+  ): { byCommit: Map<string, Map<string, { ts: number; sourcePath: string }>> } {
+    const byCommit = new Map<string, Map<string, { ts: number; sourcePath: string }>>();
 
     for (const session of sessions) {
       for (const ev of session.events) {
@@ -426,34 +455,14 @@ export class ContentTimeMatchEngine implements MatchEngine {
             const ts = parseTs(ev.ts);
             const existing = m.get(session.meta.sessionId);
             // 同 session 多个 commit 事件命中同一 commit：取最早的事件时间。
-            if (existing === undefined || ts < existing) {
-              m.set(session.meta.sessionId, ts);
+            if (existing === undefined || ts < existing.ts) {
+              m.set(session.meta.sessionId, { ts, sourcePath: session.meta.sourcePath });
             }
           }
         }
       }
     }
     return { byCommit };
-  }
-
-  /**
-   * Tier-0 editSeqs：该 session 中、在 commit 事件时间之前、触碰该 commit 文件的 file-edit seq。
-   */
-  private anchorEditSeqs(
-    index: Index,
-    relPath: string,
-    sessionId: string,
-    anchorTs: number
-  ): number[] {
-    const sessMap = index.byPath.get(relPath);
-    const bucket = sessMap?.get(sessionId);
-    if (!bucket) return [];
-    const seqs: number[] = [];
-    for (const e of bucket.edits) {
-      // commit 事件之前（含等于会有歧义，取严格之前；anchorTs===0 表示无时间，则全收）。
-      if (anchorTs === 0 || e.ts <= anchorTs) seqs.push(e.seq);
-    }
-    return [...new Set(seqs)].sort((a, b) => a - b);
   }
 
   /**

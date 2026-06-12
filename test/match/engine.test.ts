@@ -158,13 +158,14 @@ describe('Tier-0 sha anchoring', () => {
 describe('Tier-0 miss degrades to Tier-1', () => {
   it('rewritten hash (no prefix match) falls back to content matching', () => {
     // commit hash does NOT match any git-commit event sha -> Tier-1
+    // 3+ lines so evidence floor does not cap to weak
     const commits = [
-      commit('ffffffffffff', [commitFile('src/a.ts', ['const value = 42', 'return value'])], {
+      commit('ffffffffffff', [commitFile('src/a.ts', ['const value = 42', 'return value', 'export { value }'])], {
         committerDate: '2026-06-01T12:00:00.000Z',
       }),
     ];
     const s = session('S', [
-      fileEdit(REPO + '/src/a.ts', 'const value = 42\nreturn value', {
+      fileEdit(REPO + '/src/a.ts', 'const value = 42\nreturn value\nexport { value }', {
         ts: '2026-06-01T11:59:00.000Z',
         seq: 1,
       }),
@@ -263,9 +264,10 @@ describe('failed edit exclusion', () => {
   });
 
   it('keeps succeeded===null edits (unknown result)', () => {
-    const commits = [commit('c6', [commitFile('ok.ts', ['kept content here'])])];
+    // 3+ distinct lines so evidence floor does not discard the candidate
+    const commits = [commit('c6', [commitFile('ok.ts', ['kept content here', 'second kept line', 'third kept line'])])];
     const s = session('S', [
-      fileEdit(REPO + '/ok.ts', 'kept content here', {
+      fileEdit(REPO + '/ok.ts', 'kept content here\nsecond kept line\nthird kept line', {
         ts: '2026-06-01T11:59:00.000Z',
         seq: 1,
         succeeded: null,
@@ -354,15 +356,19 @@ describe('Tier-2 time window', () => {
 
 describe('cross-session competition', () => {
   it('keeps candidates from multiple sessions for the same (commit,file)', () => {
-    const commits = [commit('x1', [commitFile('shared.ts', ['common line one', 'common line two'])])];
+    // 3+ lines so both sessions survive the evidence floor
+    const commits = [commit('x1', [commitFile('shared.ts', ['common line one', 'common line two', 'common line three'])])];
     const s1 = session('S1', [
-      fileEdit(REPO + '/shared.ts', 'common line one\ncommon line two', {
+      fileEdit(REPO + '/shared.ts', 'common line one\ncommon line two\ncommon line three', {
         ts: '2026-06-01T11:59:00.000Z',
         seq: 1,
       }),
     ]);
     const s2 = session('S2', [
-      fileEdit(REPO + '/shared.ts', 'common line one', { ts: '2026-06-01T11:58:00.000Z', seq: 1 }),
+      fileEdit(REPO + '/shared.ts', 'common line one\ncommon line two\ncommon line three', {
+        ts: '2026-06-01T11:58:00.000Z',
+        seq: 1,
+      }),
     ]);
     const report = engine.match(REPO, commits, [s1, s2]);
     const forFile = report.matches.filter((m) => m.filePath === 'shared.ts');
@@ -395,9 +401,10 @@ describe('whitespace / single-char lines not scored', () => {
 
 describe('path normalization', () => {
   it('strips repo prefix from absolute paths', () => {
-    const commits = [commit('n1', [commitFile('deep/nested/file.ts', ['abc def ghi'])])];
+    // 3+ distinct lines to clear the evidence floor
+    const commits = [commit('n1', [commitFile('deep/nested/file.ts', ['abc def ghi', 'jkl mno pqr', 'stu vwx yz01'])])];
     const s = session('S', [
-      fileEdit(REPO + '/deep/nested/file.ts', 'abc def ghi', { ts: '2026-06-01T11:59:00.000Z', seq: 1 }),
+      fileEdit(REPO + '/deep/nested/file.ts', 'abc def ghi\njkl mno pqr\nstu vwx yz01', { ts: '2026-06-01T11:59:00.000Z', seq: 1 }),
     ]);
     const report = engine.match(REPO, commits, [s]);
     expect(report.matches.find((m) => m.filePath === 'deep/nested/file.ts')).toBeDefined();
@@ -405,11 +412,12 @@ describe('path normalization', () => {
 
   it('strips cwd prefix when cwd differs from repoPath', () => {
     // session cwd is a subdir alias different from repo; edit path under cwd
+    // 3+ distinct lines to clear the evidence floor
     const cwd = '/Users/dev/proj-worktree';
-    const commits = [commit('n2', [commitFile('lib/x.ts', ['unique aaa bbb'])])];
+    const commits = [commit('n2', [commitFile('lib/x.ts', ['unique aaa bbb', 'unique ccc ddd', 'unique eee fff'])])];
     const s = session(
       'S',
-      [fileEdit(cwd + '/lib/x.ts', 'unique aaa bbb', { ts: '2026-06-01T11:59:00.000Z', seq: 1 })],
+      [fileEdit(cwd + '/lib/x.ts', 'unique aaa bbb\nunique ccc ddd\nunique eee fff', { ts: '2026-06-01T11:59:00.000Z', seq: 1 })],
       cwd
     );
     const report = engine.match(REPO, commits, [s]);
@@ -419,16 +427,103 @@ describe('path normalization', () => {
 
 describe('unmatched commits reporting', () => {
   it('lists commits with no matches and their subject', () => {
+    // 3+ distinct lines so u1 is matched (not filtered by evidence floor) and only u2 is unmatched
     const commits = [
-      commit('u1', [commitFile('a.ts', ['matched content line'])]),
+      commit('u1', [commitFile('a.ts', ['matched content line', 'second matched line', 'third matched line'])]),
       commit('u2', [commitFile('manual.ts', ['hand written never seen'])], {
         message: 'manual commit\n\nbody',
       }),
     ];
     const s = session('S', [
-      fileEdit(REPO + '/a.ts', 'matched content line', { ts: '2026-06-01T11:59:00.000Z', seq: 1 }),
+      fileEdit(REPO + '/a.ts', 'matched content line\nsecond matched line\nthird matched line', { ts: '2026-06-01T11:59:00.000Z', seq: 1 }),
     ]);
     const report = engine.match(REPO, commits, [s]);
     expect(report.unmatchedCommits).toEqual([{ hash: 'u2', subject: 'manual commit' }]);
+  });
+});
+
+describe('evidence floor', () => {
+  it('(a) single-line hit → no candidate produced', () => {
+    // commit has 3 added lines but the session edit only shares 1 → hits=1 < 2, discarded
+    const commits = [
+      commit('ef1', [commitFile('ef.ts', ['shared only line', 'commit exclusive two', 'commit exclusive three'])], {
+        committerDate: '2026-06-01T12:00:00.000Z',
+      }),
+    ];
+    const s = session('S', [
+      fileEdit(REPO + '/ef.ts', 'shared only line', {
+        ts: '2026-06-01T11:59:00.000Z',
+        seq: 1,
+      }),
+    ]);
+    const report = engine.match(REPO, commits, [s]);
+    expect(report.matches.find((m) => m.filePath === 'ef.ts')).toBeUndefined();
+  });
+
+  it('(b) exactly 2 lines hit with perfect content+time scores → confidence capped at 0.79, tier weak, evidence mentions floor', () => {
+    // commit has exactly 2 effective added lines; edit matches both → hits=2, contentScore=1, timeScore=1
+    // confidence would be 1.0 but is capped at 0.79 by the evidence floor (hits < 3)
+    const commits = [
+      commit('ef2', [commitFile('ef2.ts', ['floor line alpha', 'floor line beta'])], {
+        committerDate: '2026-06-01T12:00:00.000Z',
+      }),
+    ];
+    const s = session('S', [
+      fileEdit(REPO + '/ef2.ts', 'floor line alpha\nfloor line beta', {
+        ts: '2026-06-01T11:59:00.000Z',
+        seq: 1,
+      }),
+    ]);
+    const report = engine.match(REPO, commits, [s]);
+    const m = report.matches.find((x) => x.filePath === 'ef2.ts');
+    expect(m).toBeDefined();
+    expect(m!.matchedLines).toBe(2);
+    expect(m!.confidence).toBe(0.79);
+    expect(tierOf(m!.confidence)).toBe('weak');
+    expect(m!.evidence.join(' ')).toMatch(/floor/i);
+  });
+
+  it('(c) 3 lines hit with perfect content+time scores → confidence 1.0, tier strong', () => {
+    // 3+ lines: evidence floor does not apply; full score passes through
+    const commits = [
+      commit('ef3', [commitFile('ef3.ts', ['strong line one', 'strong line two', 'strong line three'])], {
+        committerDate: '2026-06-01T12:00:00.000Z',
+      }),
+    ];
+    const s = session('S', [
+      fileEdit(REPO + '/ef3.ts', 'strong line one\nstrong line two\nstrong line three', {
+        ts: '2026-06-01T11:59:00.000Z',
+        seq: 1,
+      }),
+    ]);
+    const report = engine.match(REPO, commits, [s]);
+    const m = report.matches.find((x) => x.filePath === 'ef3.ts');
+    expect(m).toBeDefined();
+    expect(m!.matchedLines).toBe(3);
+    expect(m!.confidence).toBeCloseTo(1.0);
+    expect(tierOf(m!.confidence)).toBe('strong');
+  });
+
+  it('(d) candidate carries correct sourcePath (from session.meta.sourcePath) and matchedLines', () => {
+    // sourcePath comes from the ParsedSession.meta.sourcePath of the contributing session
+    const commits = [
+      commit('ef4', [commitFile('ef4.ts', ['source path line one', 'source path line two', 'source path line three'])], {
+        committerDate: '2026-06-01T12:00:00.000Z',
+      }),
+    ];
+    const sessionId = 'SrcPathSession';
+    const s = session(sessionId, [
+      fileEdit(REPO + '/ef4.ts', 'source path line one\nsource path line two\nsource path line three', {
+        ts: '2026-06-01T11:59:00.000Z',
+        seq: 1,
+      }),
+    ]);
+    // session() sets sourcePath to '/tmp/' + sessionId + '.jsonl'
+    const expectedSourcePath = '/tmp/' + sessionId + '.jsonl';
+    const report = engine.match(REPO, commits, [s]);
+    const m = report.matches.find((x) => x.filePath === 'ef4.ts');
+    expect(m).toBeDefined();
+    expect(m!.sourcePath).toBe(expectedSourcePath);
+    expect(m!.matchedLines).toBe(3);
   });
 });

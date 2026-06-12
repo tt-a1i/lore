@@ -202,19 +202,21 @@ async function cmdSample(opts: {
   const parser = await loadParser();
 
   // Group by sessionId to avoid re-parsing the same file multiple times
-  const bySession = new Map<string, MatchCandidate[]>();
+  // 按解析单元（candidate.sourcePath）分组——证据上下文必须取自真正包含编辑的文件，
+  // 同 sessionId 的父 session 与子 agent 是不同解析单元。
+  const bySource = new Map<string, MatchCandidate[]>();
   for (const m of sampled) {
-    const arr = bySession.get(m.sessionId) ?? [];
+    const src = m.sourcePath || loreReport.sessionSourceMap[m.sessionId] || '';
+    const arr = bySource.get(src) ?? [];
     arr.push(m);
-    bySession.set(m.sessionId, arr);
+    bySource.set(src, arr);
   }
 
   console.log(`\n# lore sample — ${sampled.length} match(es) from ${repoPath}\n`);
 
-  for (const [sessionId, matches] of bySession) {
-    const sourcePath = loreReport.sessionSourceMap[sessionId];
+  for (const [sourcePath, matches] of bySource) {
     if (!sourcePath) {
-      console.warn(`WARN: no sourcePath for session ${sessionId}, skipping`);
+      console.warn(`WARN: no sourcePath for ${matches.length} match(es), skipping`);
       continue;
     }
 
