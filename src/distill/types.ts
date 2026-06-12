@@ -1,0 +1,77 @@
+/**
+ * M3 语义蒸馏层 —— 把 session 蒸馏成 Decision / Constraint / RejectedApproach。
+ *
+ * 原则：
+ * - 每 session 一次 LLM 调用（成本可控），输入是"会话摘要包"而非原始 transcript。
+ * - 蒸馏器是适配器：默认后端 claude-cli（shell 出 `claude -p`，用户装了
+ *   Claude Code 就能用，零 API key 配置）；接口留给未来的 API 后端。
+ * - 双时间模型（借鉴 Graphiti）：决策被推翻不删除，打 invalidAt + supersededBy。
+ *   新蒸馏会拿到同文件域的现存有效 notes，可声明 supersedes。
+ * - notes.json 是事实源（.lore/notes.json），图谱从它重建语义层节点。
+ */
+
+export type NoteKind = 'decision' | 'constraint' | 'rejected-approach';
+
+export interface DistilledNote {
+  /** `${sessionId}#${n}` —— 稳定 id，supersedes 引用它。 */
+  id: string;
+  kind: NoteKind;
+  /** 一句话标题（≤80 字符）。 */
+  title: string;
+  /** 2-4 句正文：内容 + 为什么。rejected-approach 必须含否决原因。 */
+  body: string;
+  /** 涉及的 repo 相对路径（可空）。 */
+  files: string[];
+  /** 支撑锚点：回到对话原文的地址。 */
+  anchors: { sessionId: string; seq: number }[];
+  sessionId: string;
+  /** 生效时间（session 时间）。 */
+  validAt: string;
+  /** 被推翻时间；null = 仍有效。 */
+  invalidAt: string | null;
+  /** 推翻它的 note id。 */
+  supersededBy: string | null;
+}
+
+/** 喂给蒸馏器的会话摘要包（调用方负责构建，控制 token 量）。 */
+export interface SessionDigest {
+  sessionId: string;
+  agent: string;
+  startedAt: string;
+  /** 用户消息全文（截断到单条 ≤1000 字符）+ assistant 关键消息（截断）。带 seq。 */
+  messages: { seq: number; role: 'user' | 'assistant'; text: string }[];
+  /** 该 session 编辑过的 repo 相对路径。 */
+  editedFiles: string[];
+  /** 归因到的 commit（hash + subject）。 */
+  commits: { hash: string; subject: string }[];
+}
+
+export interface DistillInput {
+  digest: SessionDigest;
+  /** 同文件域现存有效 notes（供判断 supersede）。 */
+  existingNotes: DistilledNote[];
+}
+
+/** 蒸馏后端适配器。 */
+export interface Distiller {
+  readonly name: string;
+  /** 后端是否可用（如 claude CLI 是否在 PATH）。 */
+  available(): Promise<boolean>;
+  /**
+   * 返回新 notes（id 由调用方分配后写入）+ 被推翻的现存 note id。
+   * 实现必须容错：LLM 输出不合法时返回空数组并附原因，绝不抛异常中断批量蒸馏。
+   */
+  distill(input: DistillInput): Promise<{
+    notes: Omit<DistilledNote, 'id' | 'sessionId' | 'validAt' | 'invalidAt' | 'supersededBy'>[];
+    supersededIds: string[];
+    error?: string;
+  }>;
+}
+
+/** notes.json 的形态。 */
+export interface NotesFile {
+  schemaVersion: number;
+  /** sessionId → 摘要包内容 hash，用于跳过已蒸馏且未变化的 session。 */
+  distilledSessions: Record<string, string>;
+  notes: DistilledNote[];
+}
