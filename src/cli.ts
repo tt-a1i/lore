@@ -2,10 +2,13 @@
 /**
  * lore CLI — commands:
  *
- *   lore scan    --repo <path> [--max-commits N] [--broad] [--no-graph]
- *   lore sample  --repo <path> -n <num> [--tier strong|weak]
- *   lore why     <target> --repo <path> [--json]
- *   lore history <path>   --repo <path> [--json]
+ *   lore scan     --repo <path> [--max-commits N] [--broad] [--no-graph]
+ *   lore sample   --repo <path> -n <num> [--tier strong|weak]
+ *   lore why      <target> --repo <path> [--json]
+ *   lore history  <path>   --repo <path> [--json]
+ *   lore distill  --repo <path> [--max-sessions N]
+ *   lore ask      <question> --repo <path> [--include-superseded] [--json]
+ *   lore mcp      --repo <path>
  */
 
 import { program } from 'commander';
@@ -21,6 +24,8 @@ import { tierOf } from './match/types.js';
 import { renderReport } from './report/markdown.js';
 import type { GraphStore } from './graph/types.js';
 import type { WhyEngine, WhyResult, WhyAttribution } from './why/types.js';
+import type { AskEngine, AskResult } from './ask/types.js';
+import type { Distiller } from './distill/types.js';
 
 // ── Report file schema (extends RepoMatchReport with operational metadata) ───
 
@@ -78,6 +83,39 @@ async function loadWhyEngine(): Promise<WhyEngine> {
   const mod = await import('./why/engine.js');
   // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
   return mod.engine as WhyEngine;
+}
+
+async function loadAskEngine(): Promise<AskEngine> {
+  const mod = await import('./ask/engine.js');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+  return mod.engine as AskEngine;
+}
+
+async function loadDistiller(): Promise<Distiller> {
+  const mod = await import('./distill/claude-cli.js');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+  return mod.distiller as Distiller;
+}
+
+async function loadDistillOrchestrate(): Promise<{
+  runDistill(
+    repoPath: string,
+    opts: { distiller: Distiller; maxSessions?: number },
+  ): Promise<{
+    distilled: number;
+    skipped: number;
+    notesAdded: number;
+    superseded: number;
+    errors: { sessionId: string; error: string }[];
+  }>;
+}> {
+  return await import('./distill/orchestrate.js');
+}
+
+async function loadMcpServer(): Promise<{
+  createLoreMcpServer: typeof import('./mcp/server.js').createLoreMcpServer;
+}> {
+  return await import('./mcp/server.js');
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -610,6 +648,139 @@ async function cmdHistory(
   }
 }
 
+// ── lore distill ─────────────────────────────────────────────────────────────
+
+async function cmdDistill(opts: {
+  repo: string;
+  maxSessions?: number;
+}): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  console.log(`\nlore distill: ${repoPath}\n`);
+
+  const distiller = await loadDistiller();
+  const available = await distiller.available();
+  if (!available) {
+    console.error(
+      'Error: claude CLI not found in PATH.\n' +
+      'Install Claude Code (https://claude.ai/download) and ensure `claude` is on your PATH,\n' +
+      'then re-run `lore distill`.',
+    );
+    process.exit(1);
+  }
+
+  const orchestrate = await loadDistillOrchestrate();
+  const distillOpts: { distiller: Distiller; maxSessions?: number } = { distiller };
+  if (opts.maxSessions !== undefined) distillOpts.maxSessions = opts.maxSessions;
+  const stats = await orchestrate.runDistill(repoPath, distillOpts);
+
+  console.log(`\ndistill complete:`);
+  console.log(`  distilled:         ${stats.distilled}`);
+  console.log(`  skipped (cached):  ${stats.skipped}`);
+  console.log(`  notes added:       ${stats.notesAdded}`);
+  console.log(`  superseded:        ${stats.superseded}`);
+  console.log(`  errors:            ${stats.errors.length}`);
+}
+
+// ── lore ask ──────────────────────────────────────────────────────────────────
+
+/**
+ * Render AskResult for human-readable terminal output.
+ * Pure function — exported for testing.
+ */
+export function renderAskResult(result: AskResult): string {
+  const lines: string[] = [];
+
+  lines.push('');
+  lines.push(`question: ${result.question}`);
+  lines.push('');
+
+  if (result.hits.length === 0 && result.messageHits.length === 0) {
+    lines.push('  (no results found)');
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  if (result.hits.length > 0) {
+    lines.push(`notes (${result.hits.length}):`);
+    for (let i = 0; i < result.hits.length; i++) {
+      const h = result.hits[i]!;
+      const n = h.note;
+      const anchor = n.anchors.length > 0
+        ? `  [${n.anchors[0]!.sessionId.slice(0, 8)}+${n.anchors[0]!.seq}]`
+        : '';
+      lines.push('');
+      lines.push(`  [${i + 1}] ${n.kind}  score=${h.score.toFixed(3)}${anchor}`);
+      lines.push(`      ${n.title}`);
+      lines.push(`      ${n.body}`);
+      if (n.files.length > 0) {
+        lines.push(`      files: ${n.files.slice(0, 5).join(', ')}`);
+      }
+      if (n.invalidAt !== null) {
+        lines.push(`      (superseded ${n.invalidAt.slice(0, 10)})`);
+      }
+    }
+  }
+
+  if (result.messageHits.length > 0) {
+    lines.push('');
+    lines.push(`message hits (${result.messageHits.length}):`);
+    for (let i = 0; i < result.messageHits.length; i++) {
+      const m = result.messageHits[i]!;
+      const anchor = `[${m.sessionId.slice(0, 8)}+${m.seq}]`;
+      lines.push('');
+      lines.push(`  [${i + 1}] ${anchor}  score=${m.score.toFixed(3)}`);
+      lines.push(`      ${truncate(m.text, 300)}`);
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n');
+}
+
+async function cmdAsk(
+  question: string,
+  opts: { repo: string; includeSuperseded?: boolean; json?: boolean },
+): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const askEngine = await loadAskEngine();
+
+  const result = await askEngine.ask(repoPath, question, {
+    topK: 5,
+    includeSuperseded: opts.includeSuperseded === true,
+  });
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(renderAskResult(result));
+}
+
+// ── lore mcp ──────────────────────────────────────────────────────────────────
+
+async function cmdMcp(opts: { repo: string }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+
+  // Log to stderr — stdout is reserved for JSON-RPC.
+  process.stderr.write(`[lore-mcp] starting MCP server for ${repoPath}\n`);
+
+  const { createLoreMcpServer } = await loadMcpServer();
+  const server = createLoreMcpServer(repoPath);
+
+  // StdioServerTransport reads from process.stdin and writes to process.stdout.
+  const { StdioServerTransport } = await import(
+    '@modelcontextprotocol/sdk/server/stdio.js'
+  ) as { StdioServerTransport: typeof import('@modelcontextprotocol/sdk/server/stdio.js').StdioServerTransport };
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  process.stderr.write('[lore-mcp] connected, waiting for requests\n');
+  // Long-lived process — do NOT call process.exit.
+  // The process will stay alive as long as the transport connection is open.
+}
+
 // ── Commander wiring ─────────────────────────────────────────────────────────
 
 program
@@ -688,6 +859,59 @@ program
         process.exit(1);
       },
     );
+  });
+
+program
+  .command('distill')
+  .description('Distil sessions into semantic notes (Decision/Constraint/RejectedApproach) using claude CLI')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--max-sessions <n>', 'limit distillation to N sessions', (v) => parseInt(v, 10))
+  .action((opts: { repo: string; maxSessions?: number }) => {
+    cmdDistill(opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error('distill failed:', e);
+        process.exit(1);
+      },
+    );
+  });
+
+program
+  .command('ask')
+  .description('Search the project\'s distilled knowledge for a question')
+  .argument('<question>', 'natural-language question about the codebase')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--include-superseded', 'include invalidated/superseded notes in results')
+  .option('--json', 'output raw AskResult as JSON instead of human-readable text')
+  .action((question: string, opts: { repo: string; includeSuperseded?: boolean; json?: boolean }) => {
+    cmdAsk(question, opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error('ask failed:', e);
+        process.exit(1);
+      },
+    );
+  });
+
+program
+  .command('mcp')
+  .description(
+    'Start the lore MCP server (stdio transport). ' +
+    'Long-lived process — connect via MCP client. ' +
+    'All log output goes to stderr; stdout is reserved for JSON-RPC.',
+  )
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .action((opts: { repo: string }) => {
+    // lore mcp is a long-lived process: no process.exit(0).
+    // Any startup failure does exit(1) so the MCP host can detect it.
+    cmdMcp(opts).catch((e) => {
+      process.stderr.write(`[lore-mcp] fatal: ${String(e)}\n`);
+      process.exit(1);
+    });
   });
 
 // Only parse argv when this module is run directly (not when imported for testing).

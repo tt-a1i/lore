@@ -5,7 +5,8 @@
  * rebuild 策略：删除整个 kuzu/ 目录并重建（派生数据，幂等最简）。
  *
  * kuzu ESM 加载：createRequire，避免静态 import 在无原生绑定时炸掉整个进程。
- * 参数注入：全部走 conn.prepare / conn.execute，杜绝字符串注入。
+ * 参数注入：全部走 cypherLit 手工转义的内联字面量——不用 PreparedStatement，
+ * 它在所属连接关闭后任何一次 GC 都可能 use-after-free（kuzu 0.11.3，flaky SIGSEGV）。
  */
 
 import { createRequire } from 'node:module';
@@ -40,14 +41,8 @@ interface KuzuQueryResult {
   getAll(): Promise<Record<string, unknown>[]>;
 }
 
-interface KuzuPreparedStatement {
-  _preparedStatement: unknown;
-}
-
 interface KuzuConnection {
   query(cypher: string): Promise<KuzuQueryResult>;
-  prepare(cypher: string): Promise<KuzuPreparedStatement>;
-  execute(stmt: KuzuPreparedStatement, params: Record<string, unknown>): Promise<KuzuQueryResult>;
   /** 同 Database.close：异步，必须 await。 */
   close(): Promise<void>;
 }
@@ -75,6 +70,27 @@ function strOrNull(v: unknown): string | null {
 function strArr(v: unknown): string[] {
   if (Array.isArray(v)) return v.map((x) => String(x));
   return [];
+}
+
+/** Cypher 字面量编码（kuzu 单引号字符串）：转义 \ ' 换行回车；null → NULL。 */
+function cypherLit(v: unknown): string {
+  if (v === null || v === undefined) return 'NULL';
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'NULL';
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) return '[' + v.map(cypherLit).join(', ') + ']';
+  return (
+    "'" +
+    String(v)
+      .replace(/\\/g, '\\\\')
+      .replace(/'/g, "\\'")
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r') +
+    "'"
+  );
+}
+
+function structLit(row: Record<string, unknown>): string {
+  return '{' + Object.entries(row).map(([k, v]) => `${k}: ${cypherLit(v)}`).join(', ') + '}';
 }
 
 // ── DDL ───────────────────────────────────────────────────────────────────────
@@ -285,25 +301,29 @@ export class KuzuGraphStore implements GraphStore {
     );
   }
 
+  /**
+   * 不用 prepare/execute：kuzu 0.11.3 的 PreparedStatement 在其连接关闭后，
+   * 任何一次 GC 都可能触发 use-after-free（SIGSEGV，且 flaky）。
+   * 改为内联字面量 Cypher（cypherLit 手工转义），单次 query 调用，零残留句柄。
+   */
   private async _batchInsert(rows: Record<string, unknown>[], cypher: string): Promise<void> {
     if (rows.length === 0) return;
     const BATCH = 500;
-    const ps = await this.c.prepare(cypher);
     for (let i = 0; i < rows.length; i += BATCH) {
-      await this.c.execute(ps, { rows: rows.slice(i, i + BATCH) });
+      const listLit = '[' + rows.slice(i, i + BATCH).map(structLit).join(', ') + ']';
+      await this.c.query(cypher.replace('$rows', listLit));
     }
   }
 
   // ── queries ───────────────────────────────────────────────────────────────
 
   async whoProducedCommit(hash: string): Promise<ProducedInfo[]> {
-    const ps = await this.c.prepare(
-      `MATCH (s:Session)-[e:PRODUCED]->(c:CommitNode {hash: $hash})
+    const result = await this.c.query(
+      `MATCH (s:Session)-[e:PRODUCED]->(c:CommitNode {hash: ${cypherLit(hash)}})
        RETURN s.id, s.agent, s.startedAt, s.endedAt, s.cwd, s.gitBranch, s.sourcePaths,
               e.confidence, e.matchedVia, e.sourcePath, e.matchedLines, e.fileCount
        ORDER BY e.confidence DESC`,
     );
-    const result = await this.c.execute(ps, { hash });
     const rows = await result.getAll();
     return rows.map((r) => ({
       session: {
@@ -329,12 +349,11 @@ export class KuzuGraphStore implements GraphStore {
     filePath: string,
   ): Promise<{ commit: CommitNodeData; produced: ProducedInfo[] }[]> {
     // Get all commits touching this file, ordered by authorDate ascending
-    const psCommits = await this.c.prepare(
-      `MATCH (c:CommitNode)-[:TOUCHES]->(f:File {path: $path})
+    const commitResult = await this.c.query(
+      `MATCH (c:CommitNode)-[:TOUCHES]->(f:File {path: ${cypherLit(filePath)}})
        RETURN c.hash, c.subject, c.authorDate, c.committerDate, c.isMerge
        ORDER BY c.authorDate ASC`,
     );
-    const commitResult = await this.c.execute(psCommits, { path: filePath });
     const commitRows = await commitResult.getAll();
 
     const items: { commit: CommitNodeData; produced: ProducedInfo[] }[] = [];
@@ -355,12 +374,11 @@ export class KuzuGraphStore implements GraphStore {
   async sessionsEditingFile(
     filePath: string,
   ): Promise<{ session: SessionNodeData; edge: EditedEdgeData }[]> {
-    const ps = await this.c.prepare(
-      `MATCH (s:Session)-[e:EDITED]->(f:File {path: $path})
+    const result = await this.c.query(
+      `MATCH (s:Session)-[e:EDITED]->(f:File {path: ${cypherLit(filePath)}})
        RETURN s.id, s.agent, s.startedAt, s.endedAt, s.cwd, s.gitBranch, s.sourcePaths,
               e.sourcePath, e.editCount, e.firstTs, e.lastTs`,
     );
-    const result = await this.c.execute(ps, { path: filePath });
     const rows = await result.getAll();
     return rows.map((r) => ({
       session: {
