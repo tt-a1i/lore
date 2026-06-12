@@ -112,8 +112,8 @@ describe('ViewerServer', () => {
   it('GET / body contains CDN failure notice', async () => {
     const res = await fetch(serverUrl + '/');
     const text = await res.text();
-    // The page includes an onerror handler and a #cdn-error element
-    expect(text).toContain('cdn-error');
+    // The page includes a CDN onerror handler (redesigned page uses showCdnError)
+    expect(text).toContain('showCdnError');
   });
 
   // ── API payload endpoint ──────────────────────────────────────────────────────
