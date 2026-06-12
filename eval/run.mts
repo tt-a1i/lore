@@ -2,7 +2,7 @@
 /**
  * eval/run.mts — North-star eval treadmill.
  *
- * For each task in tasks.json, runs TWO arms and a blind judge:
+ * For each task in tasks.json, runs THREE arms and a blind judge:
  *
  *   control    — `claude -p` (haiku) in a fresh copy of the fixture repo, with a
  *                generic-engineering CLAUDE.md (no lore section) and NO MCP. This
@@ -10,6 +10,11 @@
  *   treatment  — same prompt + same model, but with the lore MCP server wired in
  *                (--mcp-config) and a CLAUDE.md that contains the lore guidance
  *                section. This is "agent WITH project memory".
+ *   push       — same as control (no MCP, generic CLAUDE.md, no lore section), but
+ *                the fixture repo's .claude/settings.json has the lore SessionStart +
+ *                PreToolUse hooks installed. The agent is never told memory exists; the
+ *                hooks push constraints directly into the agent's context. This tests
+ *                "push-based memory injection for weak/headless agents".
  *
  * Both arms edit files directly (bypassPermissions); we capture `git diff` as the
  * artifact. The treatment arm runs with --output-format stream-json so we can see
@@ -27,13 +32,14 @@
  *
  * Usage:
  *   tsx eval/run.mts [--fixture <dir>] [--tasks <ids>] [--model <m>]
- *                    [--judge-model <m>] [--keep] [--dry-run]
+ *                    [--judge-model <m>] [--keep] [--dry-run] [--arms <arms>]
  *     --fixture <dir>   Use an existing fixture instead of building one.
  *     --tasks <ids>     Comma-separated task ids to run (default: all).
  *     --model <m>       Agent model for both arms (default: haiku).
  *     --judge-model <m> Judge model (default: sonnet).
  *     --keep            Do not delete per-run repo copies (for debugging).
  *     --dry-run         Build fixture + print the plan, run nothing.
+ *     --arms <arms>     Comma-separated arms to run (default: control,treatment,push).
  */
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
@@ -87,7 +93,7 @@ interface Note {
   files: string[];
 }
 
-type Arm = 'control' | 'treatment';
+type Arm = 'control' | 'treatment' | 'push';
 
 interface ArmRun {
   arm: Arm;
@@ -98,6 +104,8 @@ interface ArmRun {
   loreAvailable: boolean;
   /** treatment: did the MCP warm-up reach "connected" before the run? */
   mcpWarmed: boolean;
+  /** push: was the hook additionalContext injection observed in the stream? */
+  hookInjected: boolean;
   durationMs: number | null;
   costUSD: number | null;
   numTurns: number | null;
@@ -128,7 +136,8 @@ function parseArgs(argv: string[]) {
     judgeModel: string;
     keep: boolean;
     dryRun: boolean;
-  } = { model: 'haiku', judgeModel: 'sonnet', keep: false, dryRun: false };
+    arms: Arm[];
+  } = { model: 'haiku', judgeModel: 'sonnet', keep: false, dryRun: false, arms: ['control', 'treatment', 'push'] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--fixture') out.fixture = argv[++i];
@@ -137,6 +146,7 @@ function parseArgs(argv: string[]) {
     else if (a === '--judge-model') out.judgeModel = argv[++i]!;
     else if (a === '--keep') out.keep = true;
     else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--arms') out.arms = argv[++i]!.split(',').map((s) => s.trim()) as Arm[];
   }
   return out;
 }
@@ -235,6 +245,52 @@ function parseStreamJson(outPath: string): ClaudeResult {
     }
   }
   return { stdoutPath: outPath, durationMs, costUSD, numTurns, agentError, loreToolCalls };
+}
+
+/**
+ * Scan stream-json for evidence that the hook injection reached the agent context.
+ *
+ * The lore brief/guard hooks emit additionalContext into the stream. In Claude Code
+ * stream-json, hook-injected context appears in system-prompt messages or as
+ * additionalContext strings. We look for the lore brief header markers that
+ * renderBrief always emits (e.g. "## lore" or "constraint" or "rejected-approach").
+ *
+ * This is a best-effort scan; it returns true if any line in the stream contains
+ * the hook-injected text markers.
+ */
+function hookInjectionObserved(streamPath: string): boolean {
+  let raw = '';
+  try { raw = fs.readFileSync(streamPath, 'utf8'); } catch { return false; }
+  // The hook additionalContext is typically embedded in a system or user message.
+  // Look for the lore brief section header that renderBrief always emits.
+  const INJECTION_MARKERS = [
+    '## lore',
+    'lore memory',
+    'rejected-approach',
+    'constraint:',
+    'decision:',
+    '### Constraints',
+    '### Decisions',
+    '### Rejected',
+    'lore brief',
+    'additionalContext',
+    // The brief renders notes like "**[constraint]**" or "**[decision]**"
+    '**[constraint]',
+    '**[decision]',
+    '**[rejected',
+  ];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let msg: any;
+    try { msg = JSON.parse(t); } catch { continue; }
+    // Check system messages and user messages that carry hook context.
+    const msgStr = JSON.stringify(msg);
+    for (const marker of INJECTION_MARKERS) {
+      if (msgStr.includes(marker)) return true;
+    }
+  }
+  return false;
 }
 
 // ── git diff capture ─────────────────────────────────────────────────────────
@@ -435,7 +491,9 @@ async function runArm(opts: {
   const { task, arm, fixtureDir, model } = opts;
   const repoDir = makeRepoCopy(fixtureDir, `${task.id}-${arm}`);
 
-  // Place the per-arm CLAUDE.md (treatment = lore section, control = generic only).
+  // Place the per-arm CLAUDE.md.
+  // push arm uses the SAME generic control CLAUDE.md (no lore section, no MCP).
+  // The ONLY difference for push is the .claude/settings.json with hooks.
   const src = arm === 'treatment' ? 'CLAUDE.lore.md' : 'CLAUDE.control.md';
   fs.copyFileSync(path.join(repoDir, src), path.join(repoDir, 'CLAUDE.md'));
   // Remove the helper variants so the agent doesn't read the "other" one.
@@ -447,6 +505,11 @@ async function runArm(opts: {
   // lore_ask re-parses the right transcript. (cpSync copied them verbatim with the
   // original fixture path; fix that here.)
   if (arm === 'treatment') retargetLore(repoDir, fixtureDir);
+
+  // For push arm: install SessionStart + PreToolUse hooks in .claude/settings.json.
+  // The hooks push constraints into the agent's context without requiring MCP or
+  // any lore-aware CLAUDE.md. This tests push-based injection for weak/headless agents.
+  if (arm === 'push') installPushHooks(repoDir);
 
   const outPath = path.join(opts.logDir, `${task.id}-${arm}.stream.jsonl`);
   const mcpConfigPath = arm === 'treatment' ? writeMcpConfig(repoDir) : undefined;
@@ -471,6 +534,8 @@ async function runArm(opts: {
   const diff = gitDiff(repoDir);
   const sig = scanSignals(diff, task);
   const loreAvailable = arm === 'treatment' ? loreToolsExposed(outPath) : false;
+  // For push arm: check whether hook-injected content appeared in the stream.
+  const hookInjected = arm === 'push' ? hookInjectionObserved(outPath) : false;
 
   const run: ArmRun = {
     arm,
@@ -478,6 +543,7 @@ async function runArm(opts: {
     loreToolCalls: res.loreToolCalls,
     loreAvailable,
     mcpWarmed: warmed,
+    hookInjected,
     durationMs: res.durationMs,
     costUSD: res.costUSD,
     numTurns: res.numTurns,
@@ -486,6 +552,42 @@ async function runArm(opts: {
     signalCompliant: sig.compliant,
   };
   return { run, repoDir };
+}
+
+/**
+ * Install lore hooks (SessionStart + PreToolUse only; Stop omitted to avoid
+ * triggering a scan during the eval run) into the fixture copy's
+ * .claude/settings.json. This is the push arm setup: the agent runs with the
+ * control CLAUDE.md (no lore section, no MCP), but constraints are injected
+ * into its context by the hooks at session start and before file edits.
+ *
+ * The hook commands use absolute node paths (DIST_CLI) so they work without
+ * PATH manipulation in the eval environment.
+ */
+function installPushHooks(repoDir: string): void {
+  const claudeDir = path.join(repoDir, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const settingsPath = path.join(claudeDir, 'settings.json');
+  const sessionStartCmd = `node ${DIST_CLI} brief --repo ${repoDir} --format hook-json 2>/dev/null || true`;
+  const preToolUseCmd = `node ${DIST_CLI} guard --hook --repo ${repoDir} 2>/dev/null || true`;
+  const settings = {
+    hooks: {
+      SessionStart: [
+        {
+          matcher: '',
+          hooks: [{ type: 'command', command: sessionStartCmd }],
+        },
+      ],
+      PreToolUse: [
+        {
+          matcher: 'Edit|Write|MultiEdit',
+          hooks: [{ type: 'command', command: preToolUseCmd }],
+        },
+      ],
+      // Stop hook intentionally omitted: avoid triggering lore scan mid-eval.
+    },
+  };
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf8');
 }
 
 /** Rewrite .lore/report.json so its sessionSourceMap points inside the copy. */
@@ -553,6 +655,7 @@ async function main(): Promise<void> {
   for (const n of notesFile.notes) noteById.set(n.id, n);
 
   console.error(`[run] tasks: ${tasks.map((t) => t.id).join(', ')}`);
+  console.error(`[run] arms: ${args.arms.join(', ')}`);
   console.error(`[run] model=${args.model} judge=${args.judgeModel} claude=${CLAUDE}`);
 
   if (args.dryRun) {
@@ -579,8 +682,8 @@ async function main(): Promise<void> {
     console.error(`\n[run] ── task ${task.id} (violates ${note.kind} "${note.title.slice(0, 40)}…") ──`);
 
     // Run arms SEQUENTIALLY (avoid hammering the API / rate limits).
-    const armRuns: Record<Arm, JudgedArm> = {} as any;
-    for (const arm of ['control', 'treatment'] as Arm[]) {
+    const armRuns: Partial<Record<Arm, JudgedArm>> = {};
+    for (const arm of args.arms) {
       console.error(`[run]   ${arm}: invoking agent …`);
       const { run, repoDir } = await runArm({
         task,
@@ -591,11 +694,11 @@ async function main(): Promise<void> {
         logDir,
       });
       repoDirsToClean.push(repoDir);
-      const toolNote = arm === 'treatment'
-        ? ` lore_calls=${run.loreToolCalls.length}`
-        : '';
+      let armNote = '';
+      if (arm === 'treatment') armNote = ` lore_calls=${run.loreToolCalls.length}`;
+      if (arm === 'push') armNote = ` hook_injected=${run.hookInjected}`;
       console.error(
-        `[run]   ${arm}: diff=${run.diff.length}B sigV=${run.signalViolation} sigC=${run.signalCompliant}${toolNote} judging …`,
+        `[run]   ${arm}: diff=${run.diff.length}B sigV=${run.signalViolation} sigC=${run.signalCompliant}${armNote} judging …`,
       );
       const judged = await judgeRun(run, note, args.judgeModel);
       armRuns[arm] = judged;
@@ -604,28 +707,36 @@ async function main(): Promise<void> {
       );
     }
 
+    const armsOut: Record<string, any> = {};
+    for (const arm of args.arms) {
+      if (armRuns[arm]) armsOut[arm] = serializeArm(armRuns[arm]!);
+    }
+
     results.push({
       taskId: task.id,
       groundTruthNoteId: task.groundTruthNoteId,
       violatedKind: note.kind,
       noteTitle: note.title,
-      arms: {
-        control: serializeArm(armRuns.control),
-        treatment: serializeArm(armRuns.treatment),
-      },
+      arms: armsOut,
     });
   }
 
   // 3. Summary.
-  const summary = summarize(results);
+  const summary = summarize(results, args.arms);
 
   const today = new Date().toISOString().slice(0, 10);
-  const outPath = path.join(__dirname, `results-${today}.json`);
+  // Build a descriptive filename that includes model + arm suffix when running
+  // a subset of arms (e.g. push-only → results-2026-06-12-haiku-push.json).
+  const modelShort = args.model.replace(/^claude-/, '').replace(/-\d+(-\d+)*$/, '');
+  const armSuffix =
+    args.arms.length === 3 ? '' : `-${args.arms.join('-')}`;
+  const outPath = path.join(__dirname, `results-${today}-${modelShort}${armSuffix}.json`);
   const payload = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     model: args.model,
     judgeModel: args.judgeModel,
+    arms: args.arms,
     fixtureDir,
     taskCount: results.length,
     summary,
@@ -658,6 +769,7 @@ function serializeArm(a: JudgedArm) {
     verdicts: a.verdicts,
     loreToolCalls: a.loreToolCalls,
     loreToolCallCount: a.loreToolCalls.length,
+    hookInjected: a.hookInjected,
     durationMs: a.durationMs,
     costUSD: a.costUSD,
     numTurns: a.numTurns,
@@ -669,34 +781,44 @@ function serializeArm(a: JudgedArm) {
   };
 }
 
-function summarize(results: any[]) {
+function summarize(results: any[], arms: Arm[]) {
   function rate(arm: Arm) {
     let violated = 0;
     let disputed = 0;
     let decided = 0;
+    let present = 0;
     for (const r of results) {
       const a = r.arms[arm];
+      if (!a) continue;
+      present++;
       if (a.disputed) { disputed++; continue; }
       decided++;
       if (a.violated === true) violated++;
     }
     return {
-      n: results.length,
+      n: present,
       decided,
       disputed,
       violations: violated,
       violationRate: decided > 0 ? +(violated / decided).toFixed(3) : null,
     };
   }
-  const control = rate('control');
-  const treatment = rate('treatment');
-  const treatmentLoreCalls = results.filter((r) => r.arms.treatment.loreToolCallCount > 0).length;
-  return {
-    control,
-    treatment,
-    treatmentTasksThatCalledLore: treatmentLoreCalls,
-    treatmentTaskCount: results.length,
-  };
+  const out: Record<string, any> = {};
+  for (const arm of arms) {
+    out[arm] = rate(arm);
+  }
+  if (arms.includes('treatment')) {
+    out.treatmentTasksThatCalledLore = results.filter(
+      (r) => r.arms.treatment && r.arms.treatment.loreToolCallCount > 0,
+    ).length;
+  }
+  if (arms.includes('push')) {
+    out.pushTasksWithHookInjected = results.filter(
+      (r) => r.arms.push && r.arms.push.hookInjected === true,
+    ).length;
+  }
+  out.taskCount = results.length;
+  return out;
 }
 
 main().catch((e) => {

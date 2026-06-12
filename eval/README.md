@@ -23,10 +23,12 @@ tasks.json        ──► 6 coding tasks. Each task's NATURAL solution violate
                       exactly ONE planted note. Task wording never hints a
                       constraint exists.
 
-run.mts           ──► for each task, two arms:
+run.mts           ──► for each task, three arms:
                         control   = claude -p (haiku), generic CLAUDE.md, NO MCP
                         treatment = same + lore MCP server + lore CLAUDE.md section
-                      both arms edit files directly; we capture `git diff`.
+                        push      = control CLAUDE.md + NO MCP, but .claude/settings.json
+                                    has SessionStart brief + PreToolUse guard hooks
+                      all arms edit files directly; we capture `git diff`.
                       a blind Sonnet judge scores each diff against the violated
                       note (judged twice; disagreement = disputed).
 
@@ -70,9 +72,9 @@ The prompt **never mentions** the constraint. `groundTruthNoteId` records which 
 task targets; `violationSignals` / `complianceSignals` are cheap substring hints used
 only as an advisory pre-scan — the **verdict is the LLM judge's**, not the substring scan.
 
-### The two arms (`run.mts`)
+### The three arms (`run.mts`)
 
-Both arms: `claude -p --model haiku --permission-mode bypassPermissions
+All arms: `claude -p --model haiku --permission-mode bypassPermissions
 --output-format stream-json --verbose --disallowedTools WebFetch WebSearch Task`,
 run in a **fresh per-(task,arm) copy** of the fixture (clean git tree, no cross-bleed).
 
@@ -82,9 +84,18 @@ run in a **fresh per-(task,arm) copy** of the fixture (clean git tree, no cross-
   section that `lore init` injects) **plus** `--mcp-config` pointing at
   `node dist/cli.js mcp --repo <copy>`. The copy's `report.json` is retargeted so the
   MCP reads the right transcript paths.
+- **push** — `CLAUDE.control.md` (same as control, **no lore section, no MCP**), but
+  the fixture copy's `.claude/settings.json` has two lore hooks installed:
+  - `SessionStart` → `lore brief --format hook-json` injects the full project-memory
+    brief into the agent's context at session start.
+  - `PreToolUse` (matcher: `Edit|Write|MultiEdit`) → `lore guard --hook` injects
+    file-scoped constraints before each edit.
+  This arm proves that push-based injection works without any MCP or lore-aware CLAUDE.md.
 
-The treatment stream-json is scanned for `mcp__lore__*` `tool_use` events, so we record
+The treatment stream-json is scanned for `mcp__lore__*` `tool_use` events to record
 **whether the agent actually consulted lore** (not just whether it could have).
+The push stream-json is scanned for `system/hook_response/SessionStart` events to
+confirm **whether the hook context actually reached the agent**.
 
 ### The judge
 
@@ -112,14 +123,16 @@ node dist/cli.js mcp --repo /tmp/lore-eval-fix   # then drive it over stdio, or:
 # 2. dry-run: see the task→note plan, run nothing
 npx tsx eval/run.mts --dry-run
 
-# 3. the real pilot: 6 tasks × 2 arms + blind double-judging
+# 3. the real pilot: 6 tasks × 3 arms (control, treatment, push) + blind double-judging
 npx tsx eval/run.mts
-#   → writes eval/results-<ISO-date>.json
+#   → writes eval/results-<ISO-date>-haiku.json
 
 # useful flags
 npx tsx eval/run.mts --tasks t1-watcher-poll,t2-direct-fetch   # subset
 npx tsx eval/run.mts --fixture /tmp/lore-eval-fix              # reuse a fixture
 npx tsx eval/run.mts --model haiku --judge-model sonnet        # override models
+npx tsx eval/run.mts --arms push                               # push arm only
+npx tsx eval/run.mts --arms control,push                       # two arms
 npx tsx eval/run.mts --keep                                    # keep repo copies + logs
 ```
 
@@ -168,28 +181,54 @@ See `results-<date>.json` `summary` for the headline rates and per-task detail.
 
 ## Pilot results (2026-06-12, n=6 per arm — read caveats before quoting)
 
-| actor | control violations | treatment violations | treatment used lore tools |
-| --- | --- | --- | --- |
-| haiku  | 3/6 (50%) | 2/6 (33%) | **0/6** |
-| sonnet | 4/6 (67%) | **1/6 (17%)** | **6/6** |
+| actor | arm | violations | lore tools called | hook injected |
+| --- | --- | --- | --- | --- |
+| haiku  | control   | **3/6 (50%)**  | — | — |
+| haiku  | treatment | 2/6 (33%)      | **0/6** | — |
+| haiku  | push      | **0/6 (0%)**   | 0/6 | **6/6** |
+| sonnet | control   | **4/6 (67%)**  | — | — |
+| sonnet | treatment | **1/6 (17%)**  | **6/6** | — |
 
-Two findings, one of them a product lesson:
+Three findings, two of them product lessons:
 
-1. **With a capable actor (sonnet), lore cut constraint violations from 4/6 to 1/6**,
+1. **With a capable actor (sonnet), pull-based lore cut violations from 4/6 to 1/6**,
    and the causal path is verified — every treatment agent actually called lore tools
    (`lore_ask`/`lore_why`) before editing. Direction + mechanism agree.
 2. **Pull-based memory fails for weak/headless actors.** Haiku never called a lore
    tool despite the MCP server and an explicit CLAUDE.md instruction — its 17pp
-   "improvement" is indistinguishable from noise. For such agents the memory must be
-   *pushed* (e.g. a PreToolUse hook injecting file-scoped constraints) rather than
-   pulled. This is now a roadmap item.
+   "improvement" (50% → 33%) is indistinguishable from noise at n=6.
+3. **Push-based injection rescues weak actors.** The push arm (same control CLAUDE.md,
+   no MCP, only a SessionStart hook that injects the full brief) achieved **0/6
+   violations** with haiku — a 50pp improvement over control. Injection was confirmed
+   in all 6 sessions via `system/hook_response` events in the stream-json logs.
+   The agent never mentioned "lore" or consulted any memory tool; it simply found the
+   constraints already in its context and acted on them.
+
+### Injection verification
+
+The push arm's `hookInjected=true` is corroborated by direct stream-json inspection:
+every task shows a `system/subtype=hook_response/hook_event=SessionStart` event
+containing the full lore brief (all 6 constraints), confirming the context reached
+the agent before its first token. The `hook_name` is `SessionStart:startup` — the
+injection fired at the earliest possible moment in the session.
+
+The PreToolUse guard hook was installed but did not fire separate hook_response events
+in these runs. The SessionStart brief alone was decisive.
 
 ### Caveats
 
 - n=6 per arm per actor: treat as a pilot trend, not a proven effect size.
 - Tasks were authored to have a natural-solution trap; real-world base rates differ.
-- Judge is an LLM (sonnet, double-judged, 0 disputed here) — not human review.
+- Judge is an LLM (sonnet, double-judged, 0 disputed across all runs) — not human review.
 - Single fixture repo; constraint phrasing matched lore's distillation style.
+- Push arm uses the same fixture + tasks as control/treatment; fixture is deterministic.
+- The 0/6 push result is striking but rests on n=6. Re-running may jitter individual tasks.
 
-Repro: `npx tsx eval/run.mts` (haiku default) / `npx tsx eval/run.mts --model claude-sonnet-4-6`.
-Raw outputs: `results-2026-06-12-haiku.json`, `results-2026-06-12-sonnet.json`.
+Repro:
+```bash
+npx tsx eval/run.mts --model haiku --arms push   # push arm only
+npx tsx eval/run.mts                             # all three arms (haiku default)
+npx tsx eval/run.mts --model claude-sonnet-4-6   # sonnet
+```
+Raw outputs: `results-2026-06-12-haiku.json`, `results-2026-06-12-sonnet.json`,
+`results-2026-06-12-haiku-push.json`.

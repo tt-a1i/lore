@@ -134,6 +134,40 @@ async function loadMcpServer(): Promise<{
 }
 
 /**
+ * 推送式记忆模块（brief/guard）。惰性 import：只在 brief/guard 路径加载，
+ * 不拖累其它命令（更重要的是不拖累钩子启动延迟——这些模块零重依赖，
+ * 不碰匹配引擎/graph/parser）。
+ */
+async function loadBrief(): Promise<{
+  renderBrief: typeof import('./brief/render.js').renderBrief;
+  readGeneratedAt: typeof import('./brief/load.js').readGeneratedAt;
+  readActiveNotes: typeof import('./brief/load.js').readActiveNotes;
+  readHeadTime: typeof import('./brief/load.js').readHeadTime;
+  detectLoreMcp: typeof import('./brief/load.js').detectLoreMcp;
+  parseHookInput: typeof import('./brief/hook.js').parseHookInput;
+  extractFilePath: typeof import('./brief/hook.js').extractFilePath;
+  sessionStartEnvelope: typeof import('./brief/hook.js').sessionStartEnvelope;
+  preToolUseEnvelope: typeof import('./brief/hook.js').preToolUseEnvelope;
+}> {
+  const [render, load, hook] = await Promise.all([
+    import('./brief/render.js'),
+    import('./brief/load.js'),
+    import('./brief/hook.js'),
+  ]);
+  return {
+    renderBrief: render.renderBrief,
+    readGeneratedAt: load.readGeneratedAt,
+    readActiveNotes: load.readActiveNotes,
+    readHeadTime: load.readHeadTime,
+    detectLoreMcp: load.detectLoreMcp,
+    parseHookInput: hook.parseHookInput,
+    extractFilePath: hook.extractFilePath,
+    sessionStartEnvelope: hook.sessionStartEnvelope,
+    preToolUseEnvelope: hook.preToolUseEnvelope,
+  };
+}
+
+/**
  * 摘录快照固化：scan 写完 report 后据此算并落 .lore/excerpts.json。
  * 让 `lore why` / viewer 在 Claude Code 清理 transcript 后仍能出对话摘录。
  * 收进 excerpts 模块，cli 只做一次调用。
@@ -1683,6 +1717,133 @@ async function cmdStatus(opts: { repo: string; json?: boolean }): Promise<void> 
   }));
 }
 
+// ── lore brief (push-based memory: SessionStart) ──────────────────────────────
+
+/**
+ * `lore brief` —— 紧凑项目记忆简报。推送式记忆的 SessionStart 注入源。
+ *
+ * 性能契约 <150ms：只读 .lore/notes.json + report.json 的 generatedAt，外加
+ * 一次 `git log -1`。绝不加载匹配引擎/graph/parser（loadBrief 模块零重依赖）。
+ *
+ * --format text     人读文本（默认）。
+ * --format hook-json  SessionStart hookSpecificOutput.additionalContext 信封。
+ * --file <f>        只输出与该文件相关的约束。
+ */
+async function cmdBrief(opts: {
+  repo: string;
+  file?: string;
+  format?: string;
+}): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const b = await loadBrief();
+
+  // 并发读三个来源——三者互不依赖，省往返。
+  const [generatedAt, notes, headTime, hasMcp] = await Promise.all([
+    b.readGeneratedAt(repoPath),
+    b.readActiveNotes(repoPath),
+    b.readHeadTime(repoPath),
+    b.detectLoreMcp(repoPath),
+  ]);
+
+  const briefInput = {
+    repoPath,
+    generatedAt,
+    headTime,
+    nowMs: Date.now(),
+    notes,
+    hasMcp,
+    ...(opts.file ? { file: opts.file } : {}),
+  };
+  const text = b.renderBrief(briefInput);
+
+  if (opts.format === 'hook-json') {
+    // SessionStart 信封。注意：即便文本为空也输出有效 JSON（钩子不报错）。
+    console.log(b.sessionStartEnvelope(text));
+    return;
+  }
+  console.log(text);
+}
+
+// ── lore guard --hook (push-based memory: PreToolUse) ─────────────────────────
+
+/**
+ * `lore guard --hook` —— 专为 PreToolUse 钩子设计。
+ *
+ * 从 stdin 读 hook 协议 JSON（tool_input.file_path），找该文件的活跃约束：
+ *   - 有 → PreToolUse additionalContext 信封注入（不带 permissionDecision，绝不 block）。
+ *   - 无约束 / stdin 非 JSON / .lore 缺失 → 静默 exit 0（钩子绝不搞挂 session）。
+ *
+ * 容错铁律：任何异常都吞掉、静默 exit 0。同 <150ms 预算。
+ */
+async function cmdGuard(opts: { repo: string }): Promise<void> {
+  // 读 stdin（hook 协议 JSON）。读不到 / 出错 → 静默退出。
+  let raw = '';
+  try {
+    raw = await readStdin();
+  } catch {
+    return; // 读 stdin 失败 → 静默
+  }
+
+  let b: Awaited<ReturnType<typeof loadBrief>>;
+  try {
+    b = await loadBrief();
+  } catch {
+    return; // 模块加载失败 → 静默（绝不报错给钩子）
+  }
+
+  const input = b.parseHookInput(raw);
+  if (!input) return; // 非 JSON / 空 → 静默
+
+  const filePath = b.extractFilePath(input);
+  if (!filePath) return; // 没有被编辑文件 → 静默
+
+  // repo 优先用 --repo；否则退回 hook 输入里的 cwd；再退回当前 cwd。
+  const repoPath = path.resolve(
+    opts.repo && opts.repo !== '.' ? opts.repo
+      : (typeof input.cwd === 'string' && input.cwd ? input.cwd : '.'),
+  );
+
+  let notes: Awaited<ReturnType<typeof b.readActiveNotes>>;
+  try {
+    notes = await b.readActiveNotes(repoPath);
+  } catch {
+    return; // 读 notes 失败 → 静默
+  }
+  if (notes.length === 0) return; // 无 notes → 静默
+
+  // 渲染 file-scoped 约束（renderBrief 在 file 模式下省略 freshness 头之外的指引）。
+  // guard 只要「与该文件相关的约束」本身——给 renderBrief 传 file，并丢掉新鲜度行
+  // 之外不必要的噪声：我们用 file 模式，但若该文件无相关约束则静默。
+  const { noteRelatedToFile } = await import('./brief/render.js');
+  const relevant = notes.filter((n) => noteRelatedToFile(n, filePath, repoPath));
+  if (relevant.length === 0) return; // 该文件无相关约束 → 静默
+
+  const text = b.renderBrief({
+    repoPath,
+    generatedAt: null,
+    headTime: null,
+    nowMs: Date.now(),
+    notes: relevant,
+    hasMcp: false,
+    file: filePath,
+    suppressFreshness: true, // guard 不渲新鲜度行（保最短）——纯 file-scoped 约束
+  });
+
+  // PreToolUse 信封——永远放行，只注入上下文。
+  console.log(b.preToolUseEnvelope(text));
+}
+
+/** 读 process.stdin 全文（hook 协议）。非 TTY 才读；TTY 立即返回空串。 */
+async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  const chunks: Buffer[] = [];
+  return await new Promise<string>((resolve, reject) => {
+    process.stdin.on('data', (c: Buffer) => chunks.push(c));
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    process.stdin.on('error', reject);
+  });
+}
+
 // ── lore hook install/uninstall ───────────────────────────────────────────────
 
 /**
@@ -1721,6 +1882,41 @@ function hookCommand(repoPath: string): string {
   return `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
 }
 
+/**
+ * 解析「跑 lore CLI」的命令前缀，用于 SessionStart/PreToolUse 钩子。
+ *
+ * 性能要求：钩子在每次 session 启动 / 每次 Edit 前都跑，启动延迟敏感。
+ * 优先用 `node <绝对 dist/cli.js>`（零 npx 解析延迟）；若当前进程不是从 dist 跑的
+ * （如开发态 tsx），退回 `npx -y lore`（保证可用，牺牲启动速度）。
+ *
+ * 解析逻辑：import.meta.url 指向正在执行的 cli 文件。生产态它是 .../dist/cli.js；
+ * 开发态（tsx）是 .../src/cli.ts。仅当落在一个名为 dist 的目录且是 .js 时，才信任
+ * 它作为 `node <path>` 的目标。
+ */
+function loreRunPrefix(): string {
+  try {
+    const self = fileURLToPath(import.meta.url);
+    const real = _resolveReal(self);
+    // 只有当真实路径是 dist 下的 .js 才用 node 直跑（最快）。
+    if (real.endsWith('.js') && real.split(path.sep).includes('dist')) {
+      return `node ${real}`;
+    }
+  } catch {
+    // 落到 npx 兜底。
+  }
+  return 'npx -y lore';
+}
+
+/** SessionStart 钩子命令：注入项目简报（hook-json 信封）。 */
+function sessionStartCommand(repoPath: string): string {
+  return `${loreRunPrefix()} brief --repo ${repoPath} --format hook-json 2>/dev/null || true`;
+}
+
+/** PreToolUse 钩子命令：注入被编辑文件的相关约束（绝不 block）。 */
+function preToolUseCommand(repoPath: string): string {
+  return `${loreRunPrefix()} guard --hook --repo ${repoPath} 2>/dev/null || true`;
+}
+
 interface HookEntry {
   type: string;
   command: string;
@@ -1731,22 +1927,97 @@ interface HookMatcher {
   hooks: HookEntry[];
 }
 
-async function cmdHookInstall(opts: { repo: string; global?: boolean }): Promise<void> {
-  const repoPath = path.resolve(opts.repo);
-  const command = hookCommand(repoPath);
+/** PreToolUse 钩子的 matcher：仅在写文件类工具上触发。 */
+const GUARD_MATCHER = 'Edit|Write|MultiEdit';
 
-  // Determine settings file path.
-  let settingsPath: string;
-  if (opts.global) {
+/**
+ * 三钩规格：event → { matcher, command }。install/uninstall 共用同一份清单，
+ * 保证两端对称（uninstall 移除的正是 install 装的）。
+ */
+function hookSpecs(repoPath: string): {
+  event: string;
+  matcher: string;
+  command: string;
+}[] {
+  return [
+    { event: 'SessionStart', matcher: '', command: sessionStartCommand(repoPath) },
+    { event: 'PreToolUse', matcher: GUARD_MATCHER, command: preToolUseCommand(repoPath) },
+    { event: 'Stop', matcher: '', command: hookCommand(repoPath) },
+  ];
+}
+
+/**
+ * 把一条 (event, matcher, command) 幂等地装进 settings.hooks。
+ * 返回 true=新装，false=已存在（按 command 字面相等判定，不重复追加）。
+ *
+ * 注意：guard/brief 命令含 loreRunPrefix()（可能是绝对 node 路径），幂等判定按
+ * 完整 command 字符串相等。若 dist 路径变了（如 npm 全局升级），旧 command 不匹配，
+ * 会并存——uninstall 用「event+repo 关键片段」宽松匹配清掉残留（见 removeHookSpec）。
+ */
+function installHookSpec(
+  hooks: Record<string, unknown>,
+  event: string,
+  matcher: string,
+  command: string,
+): boolean {
+  if (!Array.isArray(hooks[event])) hooks[event] = [];
+  const list = hooks[event] as HookMatcher[];
+  const exists = list.some(
+    (m) => Array.isArray(m.hooks) && m.hooks.some((h) => h.command === command),
+  );
+  if (exists) return false;
+  list.push({ matcher, hooks: [{ type: 'command', command }] });
+  return true;
+}
+
+/**
+ * 从 settings.hooks 移除某 event 下属于本 repo 的 lore 钩子。
+ * 宽松匹配：command 同时含 `lore` 关键字 + 该 repoPath，即视为本 repo 的 lore 钩子，
+ * 不论前缀是 `node …/dist/cli.js` 还是 `npx -y lore`（容忍升级导致的路径漂移）。
+ * 返回移除条数。
+ */
+function removeHookSpec(
+  hooks: Record<string, unknown>,
+  event: string,
+  repoPath: string,
+  subcommand: string,
+): number {
+  if (!Array.isArray(hooks[event])) return 0;
+  const list = hooks[event] as HookMatcher[];
+  let removed = 0;
+  const filtered = list
+    .map((m) => {
+      if (!Array.isArray(m.hooks)) return m;
+      const kept = m.hooks.filter((h) => {
+        const cmd = h.command ?? '';
+        const isLoreForRepo =
+          cmd.includes('lore') && cmd.includes(repoPath) && cmd.includes(subcommand);
+        if (isLoreForRepo) { removed++; return false; }
+        return true;
+      });
+      return { ...m, hooks: kept };
+    })
+    .filter((m) => Array.isArray(m.hooks) && m.hooks.length > 0);
+  hooks[event] = filtered;
+  return removed;
+}
+
+/** 解析 install/uninstall 的 settings.json 路径（--global → ~/.claude）。 */
+function resolveSettingsPath(repoPath: string, global?: boolean): string {
+  if (global) {
     const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
     if (!homeDir) {
       console.error(`${red('Error:')} cannot determine home directory for --global flag`);
       process.exit(1);
     }
-    settingsPath = path.join(homeDir, '.claude', 'settings.json');
-  } else {
-    settingsPath = path.join(repoPath, '.claude', 'settings.json');
+    return path.join(homeDir, '.claude', 'settings.json');
   }
+  return path.join(repoPath, '.claude', 'settings.json');
+}
+
+async function cmdHookInstall(opts: { repo: string; global?: boolean }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const settingsPath = resolveSettingsPath(repoPath, opts.global);
 
   let data: Record<string, unknown>;
   try {
@@ -1757,35 +2028,28 @@ async function cmdHookInstall(opts: { repo: string; global?: boolean }): Promise
     process.exit(1);
   }
 
-  // Navigate to hooks.Stop — create if absent, leave other keys intact.
+  // hooks 对象——缺则建，其它 key 不动。
   if (typeof data['hooks'] !== 'object' || data['hooks'] === null) {
     data['hooks'] = {};
   }
   const hooks = data['hooks'] as Record<string, unknown>;
 
-  if (!Array.isArray(hooks['Stop'])) {
-    hooks['Stop'] = [];
+  // 三钩幂等安装：SessionStart(brief) + PreToolUse(guard) + Stop(scan refresh)。
+  const specs = hookSpecs(repoPath);
+  const installed: string[] = [];
+  const skipped: string[] = [];
+  for (const spec of specs) {
+    const added = installHookSpec(hooks, spec.event, spec.matcher, spec.command);
+    if (added) installed.push(spec.event);
+    else skipped.push(spec.event);
   }
-  const stopHooks = hooks['Stop'] as HookMatcher[];
 
-  // Check if an identical command already exists anywhere in Stop hooks.
-  const alreadyExists = stopHooks.some(
-    (matcher) => Array.isArray(matcher.hooks) && matcher.hooks.some((h) => h.command === command),
-  );
-
-  if (alreadyExists) {
-    console.log(`${dim('–')} hook already installed in: ${settingsPath}`);
-    console.log(`  (same command found — no changes made)`);
+  if (installed.length === 0) {
+    console.log(`${dim('–')} all hooks already installed in: ${settingsPath}`);
+    console.log(`  (SessionStart + PreToolUse + Stop present — no changes made)`);
     return;
   }
 
-  // Append a new matcher entry.
-  stopHooks.push({
-    matcher: '',
-    hooks: [{ type: 'command', command }],
-  });
-
-  // Ensure directory exists.
   await fs.mkdir(path.dirname(settingsPath), { recursive: true });
   try {
     await writeSettingsJson(settingsPath, data);
@@ -1794,26 +2058,19 @@ async function cmdHookInstall(opts: { repo: string; global?: boolean }): Promise
     process.exit(1);
   }
 
-  console.log(`${green('✓')} hook installed: ${settingsPath}`);
-  console.log(`  Every Claude Code session ending will now auto-refresh lore data for:`);
-  console.log(`  ${repoPath}`);
+  console.log(`${green('✓')} lore hooks installed: ${settingsPath}`);
+  console.log(`  ${green('SessionStart')} → inject project-memory brief at session start`);
+  console.log(`  ${green('PreToolUse')}   → inject file constraints before Edit/Write/MultiEdit`);
+  console.log(`  ${green('Stop')}         → auto-refresh lore index at session end`);
+  console.log(`  repo: ${repoPath}`);
+  if (skipped.length > 0) {
+    console.log(`  ${dim('(' + skipped.join(', ') + ' already present)')}`);
+  }
 }
 
 async function cmdHookUninstall(opts: { repo: string; global?: boolean }): Promise<void> {
   const repoPath = path.resolve(opts.repo);
-  const command = hookCommand(repoPath);
-
-  let settingsPath: string;
-  if (opts.global) {
-    const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
-    if (!homeDir) {
-      console.error(`${red('Error:')} cannot determine home directory for --global flag`);
-      process.exit(1);
-    }
-    settingsPath = path.join(homeDir, '.claude', 'settings.json');
-  } else {
-    settingsPath = path.join(repoPath, '.claude', 'settings.json');
-  }
+  const settingsPath = resolveSettingsPath(repoPath, opts.global);
 
   let data: Record<string, unknown>;
   let existed: boolean;
@@ -1832,31 +2089,23 @@ async function cmdHookUninstall(opts: { repo: string; global?: boolean }): Promi
   }
 
   const hooksObj = data['hooks'];
-  if (typeof hooksObj !== 'object' || hooksObj === null || !Array.isArray((hooksObj as Record<string, unknown>)['Stop'])) {
-    console.log(`${dim('–')} no Stop hooks found in: ${settingsPath}  (nothing to remove)`);
+  if (typeof hooksObj !== 'object' || hooksObj === null) {
+    console.log(`${dim('–')} no hooks found in: ${settingsPath}  (nothing to remove)`);
     return;
   }
+  const hooks = hooksObj as Record<string, unknown>;
 
-  const stopHooks = (hooksObj as Record<string, unknown>)['Stop'] as HookMatcher[];
+  // 三钩全移除（按 event + repo + 子命令宽松匹配，容忍前缀路径漂移）。
   let removed = 0;
-
-  const filtered = stopHooks
-    .map((matcher) => {
-      if (!Array.isArray(matcher.hooks)) return matcher;
-      const filteredHooks = matcher.hooks.filter((h) => {
-        if (h.command === command) { removed++; return false; }
-        return true;
-      });
-      return { ...matcher, hooks: filteredHooks };
-    })
-    .filter((matcher) => matcher.hooks.length > 0);
+  removed += removeHookSpec(hooks, 'SessionStart', repoPath, 'brief');
+  removed += removeHookSpec(hooks, 'PreToolUse', repoPath, 'guard');
+  removed += removeHookSpec(hooks, 'Stop', repoPath, 'scan');
 
   if (removed === 0) {
-    console.log(`${dim('–')} hook not found in: ${settingsPath}  (nothing to remove)`);
+    console.log(`${dim('–')} no lore hooks found in: ${settingsPath}  (nothing to remove)`);
     return;
   }
 
-  (data['hooks'] as Record<string, unknown>)['Stop'] = filtered;
   try {
     await writeSettingsJson(settingsPath, data);
   } catch (e) {
@@ -1864,8 +2113,8 @@ async function cmdHookUninstall(opts: { repo: string; global?: boolean }): Promi
     process.exit(1);
   }
 
-  console.log(`${green('✓')} hook removed from: ${settingsPath}`);
-  console.log(`  Auto-refresh for ${repoPath} is now disabled.`);
+  console.log(`${green('✓')} lore hooks removed from: ${settingsPath}  (${removed} hook${removed === 1 ? '' : 's'})`);
+  console.log(`  Push-based memory + auto-refresh for ${repoPath} is now disabled.`);
 }
 
 // ── Commander wiring ─────────────────────────────────────────────────────────
@@ -2074,15 +2323,51 @@ program
     );
   });
 
+program
+  .command('brief')
+  .description(
+    'Print a compact project-memory brief (freshness + active notes by kind + a one-line usage hint). ' +
+    'Designed for SessionStart hook injection — reads only .lore/*.json, no engine load (<150ms).',
+  )
+  .option('--repo <path>', 'path to the git repository (default: cwd)', '.')
+  .option('--file <path>', 'only output constraints relevant to this file')
+  .option('--format <fmt>', 'output format: text | hook-json (SessionStart additionalContext envelope)', 'text')
+  .action((opts: { repo: string; file?: string; format?: string }) => {
+    cmdBrief(opts).then(
+      () => process.exit(0),
+      (e) => {
+        console.error(red('brief failed:'), e);
+        process.exit(1);
+      },
+    );
+  });
+
+program
+  .command('guard')
+  .description(
+    'PreToolUse hook: read a Claude Code hook-protocol JSON on stdin, find active constraints for the ' +
+    'edited file, and inject them as additionalContext. Never blocks a tool call. Silent on any error.',
+  )
+  .option('--repo <path>', 'path to the git repository (default: hook cwd, else .)', '.')
+  .option('--hook', 'PreToolUse hook mode (read stdin, emit additionalContext envelope)')
+  .action((opts: { repo: string; hook?: boolean }) => {
+    // 容错铁律：guard 绝不让钩子搞挂 session。任何失败一律静默 exit 0。
+    cmdGuard(opts).then(
+      () => process.exit(0),
+      () => process.exit(0), // 失败也 exit 0——钩子绝不报错
+    );
+  });
+
 const hookCmd = program
   .command('hook')
-  .description('Manage Claude Code Stop hooks that auto-refresh lore data at session end');
+  .description('Manage Claude Code hooks that push lore memory into agents and auto-refresh the index');
 
 hookCmd
   .command('install')
   .description(
-    'Inject a Claude Code Stop hook into <repo>/.claude/settings.json ' +
-    '(or ~/.claude/settings.json with --global). Idempotent — safe to run multiple times.',
+    'Install three Claude Code hooks into <repo>/.claude/settings.json (or ~/.claude with --global): ' +
+    'SessionStart (inject project-memory brief), PreToolUse (inject file constraints before Edit/Write/MultiEdit), ' +
+    'Stop (auto-refresh the lore index). Idempotent — safe to run multiple times.',
   )
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--global', 'install into ~/.claude/settings.json instead of <repo>/.claude/settings.json')
@@ -2098,7 +2383,7 @@ hookCmd
 
 hookCmd
   .command('uninstall')
-  .description('Remove the lore Stop hook from settings.json (reverse of hook install)')
+  .description('Remove all three lore hooks (SessionStart + PreToolUse + Stop) from settings.json (reverse of hook install)')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--global', 'remove from ~/.claude/settings.json instead of <repo>/.claude/settings.json')
   .action((opts: { repo: string; global?: boolean }) => {

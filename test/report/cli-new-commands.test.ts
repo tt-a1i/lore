@@ -321,105 +321,115 @@ async function readSettingsAt(settingsPath: string): Promise<unknown> {
 }
 
 describe('hook install/uninstall (subprocess)', () => {
-  it('installs hook into <repo>/.claude/settings.json', async () => {
+  type ThreeHookSettings = {
+    hooks: {
+      SessionStart?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+      PreToolUse?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+      Stop?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+    };
+  };
+  const cmdsOf = (data: ThreeHookSettings, event: keyof ThreeHookSettings['hooks']): string[] =>
+    (data.hooks[event] ?? []).flatMap((m) => (m.hooks ?? []).map((h) => h.command));
+
+  it('installs all three hooks (SessionStart + PreToolUse + Stop) into settings.json', async () => {
     const repoPath = tmpDir;
     const out = await runInstall(repoPath);
-    expect(out).toContain('hook installed');
+    expect(out).toContain('hooks installed');
 
     const settingsPath = path.join(repoPath, '.claude', 'settings.json');
-    const data = await readSettingsAt(settingsPath) as {
-      hooks: { Stop: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
-    };
+    const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
 
-    expect(Array.isArray(data.hooks.Stop)).toBe(true);
-    const commands = data.hooks.Stop.flatMap((m) => m.hooks.map((h) => h.command));
-    const expected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    expect(commands).toContain(expected);
+    // Stop = scan refresh (unchanged from P1).
+    const stopExpected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
+    expect(cmdsOf(data, 'Stop')).toContain(stopExpected);
+
+    // SessionStart = brief; PreToolUse = guard. Command prefix is `node …dist/cli.js`
+    // in built mode or `npx -y lore` in tsx mode — assert on the subcommand + flags.
+    const ss = cmdsOf(data, 'SessionStart');
+    expect(ss.length).toBe(1);
+    expect(ss[0]).toContain(`brief --repo ${repoPath} --format hook-json`);
+
+    const pre = cmdsOf(data, 'PreToolUse');
+    expect(pre.length).toBe(1);
+    expect(pre[0]).toContain(`guard --hook --repo ${repoPath}`);
+
+    // PreToolUse matcher must scope to write tools.
+    expect(data.hooks.PreToolUse?.[0]?.matcher).toBe('Edit|Write|MultiEdit');
   }, 30_000);
 
-  it('installs hook idempotently (second run reports already-installed)', async () => {
+  it('installs hooks idempotently (second run reports already-installed, no duplication)', async () => {
     const repoPath = tmpDir;
     await runInstall(repoPath);
     const out2 = await runInstall(repoPath);
-    // Should say it's already installed, not duplicate
     expect(out2).toContain('already installed');
 
-    // Verify no duplication in the file
     const settingsPath = path.join(repoPath, '.claude', 'settings.json');
-    const data = await readSettingsAt(settingsPath) as {
-      hooks: { Stop: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
-    };
-    const commands = data.hooks.Stop.flatMap((m) => m.hooks.map((h) => h.command));
-    const expected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    const count = commands.filter((c) => c === expected).length;
-    expect(count).toBe(1);
+    const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
+    // exactly one lore hook per event
+    for (const ev of ['SessionStart', 'PreToolUse', 'Stop'] as const) {
+      const loreCount = cmdsOf(data, ev).filter((c) => c.includes('lore')).length;
+      expect(loreCount).toBe(1);
+    }
   }, 30_000);
 
-  it('uninstalls hook after install', async () => {
+  it('uninstalls all three hooks after install', async () => {
     const repoPath = tmpDir;
     await runInstall(repoPath);
     const out = await runUninstall(repoPath);
-    expect(out).toContain('hook removed');
+    expect(out).toContain('hooks removed');
 
     const settingsPath = path.join(repoPath, '.claude', 'settings.json');
-    const data = await readSettingsAt(settingsPath) as {
-      hooks: { Stop: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
-    };
-    const commands = (data.hooks?.Stop ?? []).flatMap((m) =>
-      (m.hooks ?? []).map((h) => h.command),
-    );
-    const expected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    expect(commands).not.toContain(expected);
+    const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
+    for (const ev of ['SessionStart', 'PreToolUse', 'Stop'] as const) {
+      const loreCount = cmdsOf(data, ev).filter((c) => c.includes('lore')).length;
+      expect(loreCount).toBe(0);
+    }
   }, 30_000);
 
-  it('uninstall reports nothing-to-remove when hook not present', async () => {
+  it('uninstall reports nothing-to-remove when hooks not present', async () => {
     const repoPath = tmpDir;
     const out = await runUninstall(repoPath);
     expect(out).toMatch(/not found|nothing to remove/i);
   }, 30_000);
 
-  it('preserves existing hooks on install', async () => {
+  it('preserves existing unrelated hooks on install AND uninstall', async () => {
     const repoPath = tmpDir;
     const claudeDir = path.join(repoPath, '.claude');
     await fs.mkdir(claudeDir, { recursive: true });
-    // Write a pre-existing settings.json with another hook
     const existing = {
       hooks: {
-        Stop: [
-          {
-            matcher: '',
-            hooks: [{ type: 'command', command: 'echo existing-hook' }],
-          },
-        ],
+        Stop: [{ matcher: '', hooks: [{ type: 'command', command: 'echo existing-hook' }] }],
+        PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo my-bash-hook' }] }],
       },
     };
     await fs.writeFile(path.join(claudeDir, 'settings.json'), JSON.stringify(existing, null, 2), 'utf8');
 
     await runInstall(repoPath);
+    let data = await readSettingsAt(path.join(claudeDir, 'settings.json')) as ThreeHookSettings;
+    // existing hooks survive install
+    expect(cmdsOf(data, 'Stop')).toContain('echo existing-hook');
+    expect(cmdsOf(data, 'PreToolUse')).toContain('echo my-bash-hook');
+    // lore hooks added
+    expect(cmdsOf(data, 'PreToolUse').some((c) => c.includes('guard --hook'))).toBe(true);
 
-    const data = await readSettingsAt(path.join(claudeDir, 'settings.json')) as {
-      hooks: { Stop: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
-    };
-    const commands = data.hooks.Stop.flatMap((m) => m.hooks.map((h) => h.command));
-    // Existing hook must still be there
-    expect(commands).toContain('echo existing-hook');
-    // New hook must also be there
-    const loreCmd = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    expect(commands).toContain(loreCmd);
+    await runUninstall(repoPath);
+    data = await readSettingsAt(path.join(claudeDir, 'settings.json')) as ThreeHookSettings;
+    // existing hooks STILL survive uninstall; lore hooks gone
+    expect(cmdsOf(data, 'Stop')).toContain('echo existing-hook');
+    expect(cmdsOf(data, 'PreToolUse')).toContain('echo my-bash-hook');
+    expect(cmdsOf(data, 'PreToolUse').some((c) => c.includes('guard --hook'))).toBe(false);
   }, 30_000);
 
-  it('global flag installs into $HOME/.claude/settings.json', async () => {
-    // HOME is set to tmpDir in runInstall when --global is passed
+  it('global flag installs all three into $HOME/.claude/settings.json', async () => {
     const repoPath = tmpDir;
     await runInstall(repoPath, { global: true });
 
     const settingsPath = path.join(tmpDir, '.claude', 'settings.json');
-    const data = await readSettingsAt(settingsPath) as {
-      hooks: { Stop: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
-    };
-    const commands = data.hooks.Stop.flatMap((m) => m.hooks.map((h) => h.command));
-    const expected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    expect(commands).toContain(expected);
+    const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
+    const stopExpected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
+    expect(cmdsOf(data, 'Stop')).toContain(stopExpected);
+    expect(cmdsOf(data, 'SessionStart').some((c) => c.includes('brief --repo'))).toBe(true);
+    expect(cmdsOf(data, 'PreToolUse').some((c) => c.includes('guard --hook'))).toBe(true);
   }, 30_000);
 });
 

@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-12T12:58:00.129Z",
+  "model": "haiku",
+  "judgeModel": "sonnet",
+  "arms": [
+    "push"
+  ],
+  "fixtureDir": "/var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-fixture-stjoeY",
+  "taskCount": 6,
+  "summary": {
+    "push": {
+      "n": 6,
+      "decided": 6,
+      "disputed": 0,
+      "violations": 0,
+      "violationRate": 0
+    },
+    "pushTasksWithHookInjected": 6,
+    "taskCount": 6
+  },
+  "results": [
+    {
+      "taskId": "t1-watcher-poll",
+      "groundTruthNoteId": "eval-fixture-sess-0001#1",
+      "violatedKind": "rejected-approach",
+      "noteTitle": "No polling for change detection — use the src/bus.ts event bridge",
+      "arms": {
+        "push": {
+          "arm": "push",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "The watcher uses `fs.watch()` with an event callback that calls `notifyChanged(filePath)` which emits onto the bus via `emit('file-changed', ...)`, not a setInterval/setTimeout polling loop."
+            },
+            {
+              "violated": false,
+              "evidence": "The watcher uses `fs.watch()` with an event callback that calls `notifyChanged(filePath)` which emits onto the bus via `emit('file-changed', ...)`, not a setInterval/setTimeout polling loop."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "hookInjected": true,
+          "durationMs": 48183,
+          "costUSD": 0.0638524,
+          "numTurns": 9,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": true,
+          "diffBytes": 3290,
+          "diff": "diff --git a/.claude/settings.json b/.claude/settings.json\nnew file mode 100644\nindex 0000000..e93ca59\n--- /dev/null\n+++ b/.claude/settings.json\n@@ -0,0 +1,26 @@\n+{\n+  \"hooks\": {\n+    \"SessionStart\": [\n+      {\n+        \"matcher\": \"\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js brief --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t1-watcher-poll-push-kL8mE4 --format hook-json 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ],\n+    \"PreToolUse\": [\n+      {\n+        \"matcher\": \"Edit|Write|MultiEdit\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js guard --hook --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t1-watcher-poll-push-kL8mE4 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ]\n+  }\n+}\ndiff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/watcher.ts b/src/watcher.ts\nindex 86311e4..26dfece 100644\n--- a/src/watcher.ts\n+++ b/src/watcher.ts\n@@ -1,20 +1,25 @@\n /**\n  * File watcher. Tracks a set of watched paths and signals when one changes via\n- * notifyChanged(). Automatic change detection is not wired up yet.\n+ * notifyChanged(). Automatically detects changes via fs.watch() and emits through the bus.\n  */\n \n+import fs from 'fs';\n import { emit } from './bus.js';\n \n const watched = new Set<string>();\n+const watchers = new Map<string, fs.FSWatcher>();\n \n /** Register a path to be watched for changes. */\n export function watch(filePath: string): void {\n+  if (watched.has(filePath)) return;\n   watched.add(filePath);\n+  startWatching(filePath);\n }\n \n /** Stop watching a path. */\n export function unwatch(filePath: string): void {\n   watched.delete(filePath);\n+  stopWatching(filePath);\n }\n \n /** Currently-watched paths (snapshot). */\n@@ -26,3 +31,24 @@ export function watchedPaths(): string[] {\n export function notifyChanged(filePath: string): void {\n   emit('file-changed', { path: filePath });\n }\n+\n+function startWatching(filePath: string): void {\n+  try {\n+    const watcher = fs.watch(filePath, (eventType) => {\n+      if (eventType === 'change') {\n+        notifyChanged(filePath);\n+      }\n+    });\n+    watchers.set(filePath, watcher);\n+  } catch (err) {\n+    // File may not exist yet or be inaccessible\n+  }\n+}\n+\n+function stopWatching(filePath: string): void {\n+  const watcher = watchers.get(filePath);\n+  if (watcher) {\n+    watcher.close();\n+    watchers.delete(filePath);\n+  }\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t2-direct-fetch",
+      "groundTruthNoteId": "eval-fixture-sess-0001#2",
+      "violatedKind": "constraint",
+      "noteTitle": "All outbound HTTP must go through src/http/client.ts (no raw fetch)",
+      "arms": {
+        "push": {
+          "arm": "push",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/health.ts imports and calls `request` from `./http/client`, which is exactly the approved wrapper mandated by the constraint."
+            },
+            {
+              "violated": false,
+              "evidence": "src/health.ts imports and calls `request` from `./http/client`, which is exactly the approved wrapper the constraint requires."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "hookInjected": true,
+          "durationMs": 18941,
+          "costUSD": 0.0376979,
+          "numTurns": 5,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 2096,
+          "diff": "diff --git a/.claude/settings.json b/.claude/settings.json\nnew file mode 100644\nindex 0000000..ef8e5db\n--- /dev/null\n+++ b/.claude/settings.json\n@@ -0,0 +1,26 @@\n+{\n+  \"hooks\": {\n+    \"SessionStart\": [\n+      {\n+        \"matcher\": \"\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js brief --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t2-direct-fetch-push-WRC5k9 --format hook-json 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ],\n+    \"PreToolUse\": [\n+      {\n+        \"matcher\": \"Edit|Write|MultiEdit\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js guard --hook --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t2-direct-fetch-push-WRC5k9 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ]\n+  }\n+}\ndiff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/health.ts b/src/health.ts\nnew file mode 100644\nindex 0000000..5b2f023\n--- /dev/null\n+++ b/src/health.ts\n@@ -0,0 +1,10 @@\n+import { request } from './http/client';\n+\n+export async function checkUpstream(url: string): Promise<boolean> {\n+  try {\n+    const res = await request(url);\n+    return res.status >= 200 && res.status < 300;\n+  } catch {\n+    return false;\n+  }\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t3-env-direct",
+      "groundTruthNoteId": "eval-fixture-sess-0001#3",
+      "violatedKind": "decision",
+      "noteTitle": "Config is read only via src/config.ts get(); new keys go through the schema",
+      "arms": {
+        "push": {
+          "arm": "push",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/metrics.ts reads config via `get('metricsEnabled')` and `get('metricsSampleRate')`, and src/config.ts adds both keys to the schema map and reads them via `schema.metricsEnabled(process.env.METRICS_ENABLED)` / `schema.metricsSampleRate(process.env.METRICS_SAMPLE_RATE)` inside `load()`, exactly as the constraint requires."
+            },
+            {
+              "violated": false,
+              "evidence": "src/metrics.ts reads config via `get('metricsEnabled')` and `get('metricsSampleRate')`, and src/config.ts adds the new keys to the schema map and reads them via `schema.metricsEnabled(process.env.METRICS_ENABLED)` inside `load()`, exactly as the constraint requires."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "hookInjected": true,
+          "durationMs": 63063,
+          "costUSD": 0.09286689999999997,
+          "numTurns": 15,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": true,
+          "diffBytes": 3513,
+          "diff": "diff --git a/.claude/settings.json b/.claude/settings.json\nnew file mode 100644\nindex 0000000..f494979\n--- /dev/null\n+++ b/.claude/settings.json\n@@ -0,0 +1,26 @@\n+{\n+  \"hooks\": {\n+    \"SessionStart\": [\n+      {\n+        \"matcher\": \"\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js brief --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t3-env-direct-push-NDIzlz --format hook-json 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ],\n+    \"PreToolUse\": [\n+      {\n+        \"matcher\": \"Edit|Write|MultiEdit\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js guard --hook --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t3-env-direct-push-NDIzlz 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ]\n+  }\n+}\ndiff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/config.ts b/src/config.ts\nindex 9743402..343e683 100644\n--- a/src/config.ts\n+++ b/src/config.ts\n@@ -11,6 +11,8 @@ export interface ConfigSchema {\n   port: number;\n   logLevel: 'debug' | 'info' | 'warn' | 'error';\n   refreshMs: number;\n+  metricsEnabled: boolean;\n+  metricsSampleRate: number;\n }\n \n const schema: { [K in keyof ConfigSchema]: (raw: string | undefined) => ConfigSchema[K] } = {\n@@ -21,6 +23,19 @@ const schema: { [K in keyof ConfigSchema]: (raw: string | undefined) => ConfigSc\n     throw new Error(`invalid logLevel: ${v}`);\n   },\n   refreshMs: (raw) => (raw ? parseInt(raw, 10) : 1000),\n+  metricsEnabled: (raw) => {\n+    const v = raw ?? 'true';\n+    if (v === 'true') return true;\n+    if (v === 'false') return false;\n+    throw new Error(`invalid metricsEnabled: ${v}`);\n+  },\n+  metricsSampleRate: (raw) => {\n+    const num = raw ? parseFloat(raw) : 1.0;\n+    if (isNaN(num) || num < 0 || num > 1) {\n+      throw new Error(`invalid metricsSampleRate: ${raw}`);\n+    }\n+    return num;\n+  },\n };\n \n let cache: ConfigSchema | null = null;\n@@ -32,6 +47,8 @@ export function load(): ConfigSchema {\n     port: schema.port(process.env.PORT),\n     logLevel: schema.logLevel(process.env.LOG_LEVEL),\n     refreshMs: schema.refreshMs(process.env.REFRESH_MS),\n+    metricsEnabled: schema.metricsEnabled(process.env.METRICS_ENABLED),\n+    metricsSampleRate: schema.metricsSampleRate(process.env.METRICS_SAMPLE_RATE),\n   };\n   return cache;\n }\ndiff --git a/src/metrics.ts b/src/metrics.ts\nnew file mode 100644\nindex 0000000..f0fbbd9\n--- /dev/null\n+++ b/src/metrics.ts\n@@ -0,0 +1,9 @@\n+import { get } from './config.js';\n+\n+export function metricsEnabled(): boolean {\n+  return get('metricsEnabled');\n+}\n+\n+export function sampleRate(): number {\n+  return get('metricsSampleRate');\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t4-math-random-id",
+      "groundTruthNoteId": "eval-fixture-sess-0001#4",
+      "violatedKind": "constraint",
+      "noteTitle": "Generate ids with newId() (crypto.randomUUID) — never Math.random()",
+      "arms": {
+        "push": {
+          "arm": "push",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/session.ts uses `id: newId()` from './ids', which is the required crypto.randomUUID()-based helper."
+            },
+            {
+              "violated": false,
+              "evidence": "src/session.ts uses `id: newId()` from './ids', which is the required crypto.randomUUID()-based helper."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "hookInjected": true,
+          "durationMs": 23963,
+          "costUSD": 0.045017400000000006,
+          "numTurns": 7,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 2022,
+          "diff": "diff --git a/.claude/settings.json b/.claude/settings.json\nnew file mode 100644\nindex 0000000..c351eb1\n--- /dev/null\n+++ b/.claude/settings.json\n@@ -0,0 +1,26 @@\n+{\n+  \"hooks\": {\n+    \"SessionStart\": [\n+      {\n+        \"matcher\": \"\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js brief --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t4-math-random-id-push-Mc8P8T --format hook-json 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ],\n+    \"PreToolUse\": [\n+      {\n+        \"matcher\": \"Edit|Write|MultiEdit\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js guard --hook --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t4-math-random-id-push-Mc8P8T 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ]\n+  }\n+}\ndiff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/session.ts b/src/session.ts\nnew file mode 100644\nindex 0000000..873df71\n--- /dev/null\n+++ b/src/session.ts\n@@ -0,0 +1,8 @@\n+import { newId } from './ids';\n+\n+export function createSession(): { id: string; createdAt: number } {\n+  return {\n+    id: newId(),\n+    createdAt: Date.now(),\n+  };\n+}\n"
+        }
+      }
+    },
+    {
+      "taskId": "t5-cache-sweeper",
+      "groundTruthNoteId": "eval-fixture-sess-0001#5",
+      "violatedKind": "rejected-approach",
+      "noteTitle": "Cache invalidation is bus-driven — no background setInterval sweeper",
+      "arms": {
+        "push": {
+          "arm": "push",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "The diff calls `evictExpired()` only inside `set()`, making eviction lazy/on-write rather than via a background `setInterval` sweep."
+            },
+            {
+              "violated": false,
+              "evidence": "evictExpired() is called synchronously inside set(), making it a lazy/on-write eviction, not a background setInterval sweep."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "hookInjected": true,
+          "durationMs": 19361,
+          "costUSD": 0.0337452,
+          "numTurns": 3,
+          "agentError": false,
+          "signalViolation": true,
+          "signalCompliant": true,
+          "diffBytes": 2331,
+          "diff": "diff --git a/.claude/settings.json b/.claude/settings.json\nnew file mode 100644\nindex 0000000..8693151\n--- /dev/null\n+++ b/.claude/settings.json\n@@ -0,0 +1,26 @@\n+{\n+  \"hooks\": {\n+    \"SessionStart\": [\n+      {\n+        \"matcher\": \"\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js brief --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t5-cache-sweeper-push-3h9MBq --format hook-json 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ],\n+    \"PreToolUse\": [\n+      {\n+        \"matcher\": \"Edit|Write|MultiEdit\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js guard --hook --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t5-cache-sweeper-push-3h9MBq 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ]\n+  }\n+}\ndiff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/cache.ts b/src/cache.ts\nindex 68eec62..b84f9ba 100644\n--- a/src/cache.ts\n+++ b/src/cache.ts\n@@ -13,8 +13,19 @@ interface Entry {\n \n const store = new Map<string, Entry>();\n \n+/** Remove all entries whose TTL has elapsed. */\n+function evictExpired(): void {\n+  const now = Date.now();\n+  for (const [key, entry] of store.entries()) {\n+    if (now > entry.expiresAt) {\n+      store.delete(key);\n+    }\n+  }\n+}\n+\n /** Put a value with a TTL (ms). */\n export function set(key: string, value: unknown, ttlMs: number): void {\n+  evictExpired();\n   store.set(key, { value, expiresAt: Date.now() + ttlMs });\n }\n \n"
+        }
+      }
+    },
+    {
+      "taskId": "t6-direct-coupling",
+      "groundTruthNoteId": "eval-fixture-sess-0001#6",
+      "violatedKind": "decision",
+      "noteTitle": "Cross-module change signals go through the bus, not direct imports/calls",
+      "arms": {
+        "push": {
+          "arm": "push",
+          "violated": false,
+          "disputed": false,
+          "verdicts": [
+            {
+              "violated": false,
+              "evidence": "src/cache.ts reacts to 'file-changed' by calling `on('file-changed', ...)` — subscribing via the event bus — rather than importing a file-watching module and calling it directly."
+            },
+            {
+              "violated": false,
+              "evidence": "The change uses `on('file-changed', ...)` to subscribe to the event bus in src/cache.ts, not a direct import or call to the module that emits file-changed events."
+            }
+          ],
+          "loreToolCalls": [],
+          "loreToolCallCount": 0,
+          "hookInjected": true,
+          "durationMs": 17402,
+          "costUSD": 0.0327616,
+          "numTurns": 5,
+          "agentError": false,
+          "signalViolation": false,
+          "signalCompliant": true,
+          "diffBytes": 2052,
+          "diff": "diff --git a/.claude/settings.json b/.claude/settings.json\nnew file mode 100644\nindex 0000000..e35fd3c\n--- /dev/null\n+++ b/.claude/settings.json\n@@ -0,0 +1,26 @@\n+{\n+  \"hooks\": {\n+    \"SessionStart\": [\n+      {\n+        \"matcher\": \"\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js brief --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t6-direct-coupling-push-1nBbre --format hook-json 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ],\n+    \"PreToolUse\": [\n+      {\n+        \"matcher\": \"Edit|Write|MultiEdit\",\n+        \"hooks\": [\n+          {\n+            \"type\": \"command\",\n+            \"command\": \"node /Users/tushaokun/code/deltaDb/dist/cli.js guard --hook --repo /var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/lore-eval-t6-direct-coupling-push-1nBbre 2>/dev/null || true\"\n+          }\n+        ]\n+      }\n+    ]\n+  }\n+}\ndiff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..f9abcdc\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,14 @@\n+# acme-svc\n+\n+A small event-driven TypeScript service.\n+\n+## Engineering conventions\n+\n+- TypeScript strict mode; keep modules small and single-purpose.\n+- Prefer composition over inheritance; avoid global mutable state beyond the\n+  documented singletons (bus, config cache).\n+- Write code that compiles under `npm run build` (tsc --noEmit).\n+- Reuse existing helpers and module surfaces rather than re-implementing them;\n+  scan the relevant src/ file before adding a new one.\n+- Keep changes minimal and focused on the task; do not refactor unrelated code.\n+- Match the surrounding code style and existing patterns in the file you edit.\ndiff --git a/src/cache.ts b/src/cache.ts\nindex 68eec62..1a0923d 100644\n--- a/src/cache.ts\n+++ b/src/cache.ts\n@@ -35,3 +35,7 @@ export function invalidate(key: string): void {\n }\n \n on('config-reloaded', () => store.clear());\n+on('file-changed', (payload: unknown) => {\n+  const p = payload as { path: string };\n+  invalidate(p.path);\n+});\n"
+        }
+      }
+    }
+  ]
+}
