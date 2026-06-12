@@ -19,10 +19,11 @@ import path from 'node:path';
 import os from 'node:os';
 
 import { createViewerServer } from '../../src/viewer/server.js';
-import type { ViewerPayload } from '../../src/viewer/types.js';
+import type { ViewerPayload, ViewerExcerpt } from '../../src/viewer/types.js';
 import type { GraphData } from '../../src/graph/types.js';
 import type { NotesFile, DistilledNote } from '../../src/distill/types.js';
 import { makeData } from '../graph/fixture.js';
+import { writeSnapshot } from '../../src/excerpts/snapshot.js';
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -335,6 +336,36 @@ describe('ViewerServer', () => {
     } finally {
       await srvNR.stop();
       await fs.rm(tmpDirNR, { recursive: true, force: true });
+    }
+  });
+
+  it('payload.excerpts is served from the snapshot when no transcript exists', async () => {
+    // Snapshot present, but no report.json/transcript at all — viewer must still
+    // serve excerpts from .lore/excerpts.json (snapshot is the fallback source).
+    const tmpDirSnap = await fs.mkdtemp(path.join(os.tmpdir(), 'lore-viewer-snap-'));
+    const graphDirSnap = path.join(tmpDirSnap, '.lore', 'graph');
+    await fs.mkdir(graphDirSnap, { recursive: true });
+    await fs.writeFile(
+      path.join(graphDirSnap, 'graph.json'),
+      JSON.stringify(makeData(), null, 2),
+      'utf8',
+    );
+    const snapExcerpts: Record<string, ViewerExcerpt[]> = {
+      deadbeef: [
+        { sessionId: 'ses-snap', seq: 0, role: 'user', text: 'snapshotted intent', ts: '2026-06-01T10:00:00.000Z' },
+      ],
+    };
+    await writeSnapshot(tmpDirSnap, snapExcerpts);
+
+    const srvSnap = createViewerServer(tmpDirSnap);
+    const pSnap = await srvSnap.start(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${pSnap}/api/payload`);
+      const payload = await res.json() as ViewerPayload;
+      expect(payload.excerpts).toEqual(snapExcerpts);
+    } finally {
+      await srvSnap.stop();
+      await fs.rm(tmpDirSnap, { recursive: true, force: true });
     }
   });
 

@@ -52,8 +52,11 @@ lore sits **on top of Git** — no new VCS, no migration, works with your existi
 | `lore history <file> --repo <path> [--json]` | Show the full evolution timeline of a file with conversation attributions per commit |
 | `lore distill --repo <path> [--max-sessions N]` | LLM-distill sessions into Decision / Constraint / RejectedApproach notes via `claude -p` |
 | `lore ask "<question>" --repo <path> [--include-superseded] [--json]` | Full-text search across distilled decisions and conversation messages |
+| `lore note --repo <path> --kind <decision\|constraint\|rejected-approach> --title "…" --body "…" --source <agent\|human>` | Write a note directly (agent live-capture or human entry); deduplicates on title |
+| `lore status --repo <path> [--json]` | Show attribution coverage, staleness, and note counts at a glance |
+| `lore hook install --repo <path>` / `uninstall` | Install a Claude Code `Stop` hook that auto-runs `lore scan` after every session |
 | `lore sample --repo <path> -n <N> [--tier strong\|weak]` | Sample matches from the report for spot-checking attribution accuracy |
-| `lore mcp --repo <path>` | Start the stdio MCP server exposing `lore_why`, `lore_ask`, `lore_history` tools |
+| `lore mcp --repo <path>` | Start the stdio MCP server exposing `lore_why`, `lore_ask`, `lore_history`, `lore_note`, `lore_status` tools |
 | `lore serve --repo <path> [--port 4017]` | Start the local graph viewer at `http://localhost:4017` |
 
 ### MCP server (for agents)
@@ -71,7 +74,40 @@ Add to your `claude_desktop_config.json` (or any MCP host):
 }
 ```
 
-The agent gains three tools: `lore_why` (line-level attribution), `lore_ask` (decision search), `lore_history` (file evolution). New sessions stop being cold starts.
+The agent gains five tools:
+
+| MCP tool | What it does |
+|----------|-------------|
+| `lore_why` | Line-level attribution — which session wrote this line and why |
+| `lore_ask` | Full-text search across distilled decisions and raw conversation messages |
+| `lore_history` | File evolution timeline — every commit that touched a path with session attribution |
+| `lore_note` | Write a decision / constraint / rejected-approach note with `source="agent"` (high-trust, deduplicates on title) |
+| `lore_status` | One-shot coverage snapshot — staleness, match tier counts, note totals |
+
+**Agent workflow example — a day with lore:**
+
+```
+# 1. Start of session: orient with a trust snapshot
+lore_status
+→ coverage 71%, last scan 2h ago, 12 active notes
+
+# 2. Before touching a file: understand prior decisions
+lore_ask "why is upload chunked at 4 MB?"
+→ [agent] constraint: "4 MB chunk keeps memory under worker limit" (2026-05-14)
+
+# 3. After discovering a new constraint mid-task: record it immediately
+lore_note kind=constraint title="Retry must be idempotent — upload IDs are content-addressed" \
+          body="Discovered during stress test: re-uploading identical bytes must be a no-op or downstream dedup breaks." \
+          files=["src/upload/store.ts"] source=agent
+
+# 4. Any time: trace a suspicious line
+lore_why src/upload/store.ts:87
+→ session 13caa43d (2026-06-11) — User: "两阶段删除 …"
+```
+
+New sessions stop being cold starts; notes written by agents surface with an `[agent]` badge in the viewer.
+
+Or use `lore hook install --repo <path>` to run `lore scan` automatically after every Claude Code session — no manual step needed.
 
 ## Viewer — four views
 

@@ -125,6 +125,29 @@ export const CSS = `
 .constraint .dec-kind-dot { background: var(--blue); }
 .rejected .dec-kind-dot  { background: var(--danger); }
 
+/* source badge — agent / human only; distilled = no badge */
+.dec-source-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  vertical-align: middle;
+  letter-spacing: 0.02em;
+}
+.dec-source-badge.source-agent {
+  color: var(--blue);
+  border-color: color-mix(in srgb, var(--blue) 30%, transparent);
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+}
+.dec-source-badge.source-human {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 30%, transparent);
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+}
+
 /* superseded corner badge */
 .dec-superseded-badge {
   position: absolute;
@@ -382,6 +405,14 @@ export const JS = `
       self.onTimeline(ctx.cutoffMs);
     },
 
+    _sourceBadgeHtml: function(source) {
+      // distilled (default) and undefined → no badge
+      if (!source || source === 'distilled') return '';
+      var cls = source === 'agent' ? 'source-agent' : 'source-human';
+      var label = source === 'agent' ? 'agent' : 'human';
+      return '<span class="dec-source-badge ' + cls + '">' + label + '</span>';
+    },
+
     _cardHtml: function(note) {
       var klass = kindClass(note.kind);
       var isSup = !!note.invalidAt;
@@ -425,13 +456,16 @@ export const JS = `
       if (note.supersededBy) {
         supByPart = '<span class="dec-sup-link" data-target="' + esc(note.supersededBy) + '">→ ' + esc(note.supersededBy.slice(0,16)) + '</span>';
       }
+      var sourceBadgePart = self._sourceBadgeHtml(note.source);
 
       var footerHtml =
         '<div class="dec-footer">' +
           sessionPart +
           (sessionPart && datePart ? '<span style="opacity:0.3">·</span>' : '') +
           datePart +
-          (supByPart ? '<span style="margin-left:auto">' + supByPart + '</span>' : '') +
+          (sourceBadgePart ? '<span style="margin-left:auto">' + sourceBadgePart + '</span>' : '') +
+          (!sourceBadgePart && supByPart ? '<span style="margin-left:auto">' + supByPart + '</span>' : '') +
+          (sourceBadgePart && supByPart ? '<span style="margin-left:4px">' + supByPart + '</span>' : '') +
         '</div>';
 
       return '<div class="' + cardClasses + '" data-id="' + esc(note.id) + '" data-valid-at="' + esc(note.validAt || '') + '">' +
@@ -478,11 +512,13 @@ export const JS = `
 
       var html = '';
       html += '<h3 style="padding-right:30px">' + esc(note.title || '(no title)') + '</h3>';
-      html += '<div style="margin-bottom:10px">' +
+      var drawerSourceBadge = self._sourceBadgeHtml(note.source);
+      html += '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
         '<span class="dec-kind ' + klass + '" style="font-size:11px">' +
           '<span class="dec-kind-dot"></span>' + esc(kindLabel(note.kind)) +
         '</span>' +
-        (note.invalidAt ? ' <span style="font-size:11px;color:var(--text-faint);margin-left:6px">superseded ' + esc(fmtDate(note.invalidAt)) + '</span>' : '') +
+        (drawerSourceBadge ? drawerSourceBadge : '') +
+        (note.invalidAt ? ' <span style="font-size:11px;color:var(--text-faint)">superseded ' + esc(fmtDate(note.invalidAt)) + '</span>' : '') +
         '</div>';
 
       if (note.body) {

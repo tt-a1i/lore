@@ -133,6 +133,22 @@ async function loadMcpServer(): Promise<{
   return await import('./mcp/server.js');
 }
 
+/**
+ * 摘录快照固化：scan 写完 report 后据此算并落 .lore/excerpts.json。
+ * 让 `lore why` / viewer 在 Claude Code 清理 transcript 后仍能出对话摘录。
+ * 收进 excerpts 模块，cli 只做一次调用。
+ */
+async function loadExcerptsSnapshotter(): Promise<{
+  computeExcerpts: (repoPath: string) => Promise<Record<string, import('./viewer/types.js').ViewerExcerpt[]>>;
+  writeSnapshot: (repoPath: string, excerpts: Record<string, import('./viewer/types.js').ViewerExcerpt[]>) => Promise<void>;
+}> {
+  const [compute, snapshot] = await Promise.all([
+    import('./excerpts/compute.js'),
+    import('./excerpts/snapshot.js'),
+  ]);
+  return { computeExcerpts: compute.computeExcerpts, writeSnapshot: snapshot.writeSnapshot };
+}
+
 // ── ANSI color helpers (raw escape codes; gated on process.stdout.isTTY) ─────
 
 const USE_COLOR = process.stdout.isTTY && process.env['NO_COLOR'] === undefined;
@@ -667,6 +683,22 @@ async function cmdScan(opts: {
   const reportPath = path.join(loreDir, 'report.json');
   await fs.writeFile(reportPath, JSON.stringify(loreReport, null, 2), 'utf8');
   progress(`\n${green('✓')} [write]    ${reportPath}  ${dim(elapsed(t0) + ' total')}\n`);
+
+  // 6.5 Excerpts snapshot：固化对话摘录到 .lore/excerpts.json，让记忆不再依赖
+  //     Claude Code 的 transcript 留存窗口。失败不阻塞 scan——只警告。
+  {
+    const te = now();
+    try {
+      const { computeExcerpts, writeSnapshot } = await loadExcerptsSnapshotter();
+      const excerpts = await computeExcerpts(repoPath);
+      await writeSnapshot(repoPath, excerpts);
+      progress(
+        `${green('✓')} [excerpts] snapshot ${Object.keys(excerpts).length} commits  ${dim(elapsed(te))}`,
+      );
+    } catch (e) {
+      progressWarn(`${yellow('⚠')} [excerpts] snapshot failed (${String(e)})`);
+    }
+  }
 
   // 7. Print human summary (skipped in --json mode)
   if (!opts.json) progress(renderReport(report));

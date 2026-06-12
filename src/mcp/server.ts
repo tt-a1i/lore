@@ -23,6 +23,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { existsSync } from 'node:fs';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -379,6 +380,92 @@ async function renderStatusBlock(
   return parts.join('\n');
 }
 
+// ── multi-repo resolution ──────────────────────────────────────────────────────
+
+/**
+ * Cache: directory path → resolved git root. Used by resolveRepo when inferring
+ * the repo from a file's parent directory. We cache the dir→root mapping so that
+ * repeated calls for files in the same directory skip the git subprocess.
+ */
+const _gitRootCache = new Map<string, string>();
+
+/**
+ * Validate that a resolved root has been indexed by lore (has .lore/report.json).
+ * Throws a descriptive error (never silently falls back) when the report is absent.
+ */
+function assertLoreIndexed(root: string): void {
+  const reportPath = path.join(root, '.lore', 'report.json');
+  if (!existsSync(reportPath)) {
+    throw new Error(
+      `Repo at "${root}" has not been indexed by lore — run \`lore scan\` there first. ` +
+      `(Expected: ${reportPath})`,
+    );
+  }
+}
+
+/**
+ * Resolve the target repo root from the caller-supplied input.
+ *
+ * Priority:
+ *   1. Explicit `repo` param — must contain .lore/report.json, else hard error.
+ *   2. Absolute `file` path — infer root via `git -C <dir> rev-parse --show-toplevel`
+ *      (result cached per directory); root must also have .lore/report.json.
+ *   3. Default — the startup repoPath the server was created with (always trusted;
+ *      it was already validated at startup).
+ *
+ * The function NEVER silently falls back to the startup repo when an explicit
+ * target is given — that would attribute answers to the wrong project.
+ *
+ * @param startupRoot  The repo path supplied to createLoreMcpServer().
+ * @param input        Optional { repo?, file? } from the tool call args.
+ */
+async function resolveRepo(
+  startupRoot: string,
+  input?: { repo?: string; file?: string },
+): Promise<string> {
+  // 1. Explicit repo param.
+  if (input?.repo !== undefined && input.repo.trim() !== '') {
+    const root = path.resolve(input.repo);
+    assertLoreIndexed(root);
+    return root;
+  }
+
+  // 2. Absolute file path → infer root via git.
+  if (input?.file !== undefined && path.isAbsolute(input.file)) {
+    const dir = path.dirname(input.file);
+    const cached = _gitRootCache.get(dir);
+    if (cached !== undefined) {
+      assertLoreIndexed(cached);
+      return cached;
+    }
+    let root: string;
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['-C', dir, 'rev-parse', '--show-toplevel'],
+        { encoding: 'utf8' },
+      );
+      root = stdout.trim();
+    } catch {
+      throw new Error(
+        `Could not determine git root for file "${input.file}". ` +
+        `Is the file inside a git repository?`,
+      );
+    }
+    if (!root) {
+      throw new Error(
+        `git reported an empty root for "${input.file}" — unexpected state.`,
+      );
+    }
+    _gitRootCache.set(dir, root);
+    assertLoreIndexed(root);
+    return root;
+  }
+
+  // 3. Default: startup root (already validated).
+  return startupRoot;
+}
+
 /** git HEAD committer date (ISO), or null if git is unavailable / not a repo. */
 async function headCommitISO(repoPath: string): Promise<string | null> {
   try {
@@ -416,13 +503,20 @@ export function createLoreMcpServer(
     version: '0.0.1',
   });
 
-  // Freshness header is computed once and reused across all tool calls.
-  let headerCache: string | null | undefined;
-  async function freshnessHeader(): Promise<string | undefined> {
-    if (headerCache === undefined) {
-      headerCache = await buildFreshnessHeader(repoPath);
+  // Per-root freshness header cache: root → cached header string (or null).
+  const _headerCache = new Map<string, string | null>();
+
+  async function freshnessHeaderFor(root: string): Promise<string | undefined> {
+    if (!_headerCache.has(root)) {
+      _headerCache.set(root, await buildFreshnessHeader(root));
     }
-    return headerCache ?? undefined;
+    return _headerCache.get(root) ?? undefined;
+  }
+
+  // Convenience: freshness header for the startup root (kept for backward compat
+  // inside tool handlers that already resolved the root separately).
+  async function freshnessHeader(): Promise<string | undefined> {
+    return freshnessHeaderFor(repoPath);
   }
 
   // ── lore_why ────────────────────────────────────────────────────────────────
@@ -440,9 +534,18 @@ export function createLoreMcpServer(
         '(pass include_weak:true to surface it; weak results are prefixed "⚠ LOW-CONFIDENCE"). ' +
         'matchedVia=sha means an exact commit-hash anchor (certain); matchedVia=content means ' +
         'edited-lines were matched to commit lines (heuristic). ' +
-        'Each [sessionId+seq] is a PERMANENT anchor you can quote or re-look-up.',
+        'Each [sessionId+seq] is a PERMANENT anchor you can quote or re-look-up.\n' +
+        'CROSS-REPO: pass an absolute file path and the repo is inferred automatically via ' +
+        '`git rev-parse --show-toplevel`. The inferred repo must have been indexed by ' +
+        '`lore scan`; if not, lore tells you what to do rather than silently using the wrong repo.',
       inputSchema: {
-        file: z.string().describe('Repo-relative file path, e.g. "src/cli.ts"'),
+        file: z
+          .string()
+          .describe(
+            'File path — repo-relative (e.g. "src/cli.ts") uses the startup repo; ' +
+            'absolute path (e.g. "/home/user/other-repo/src/cli.ts") infers the repo ' +
+            'automatically via git and queries that repo instead.',
+          ),
         line: z.number().int().positive().describe('1-based line number'),
         include_weak: z
           .boolean()
@@ -454,6 +557,14 @@ export function createLoreMcpServer(
     },
     async (args) => {
       try {
+        const root = await resolveRepo(repoPath, { file: args.file });
+        // When the file is absolute and was resolved to a different root, pass it
+        // repo-relative to the engine (strip the root prefix + leading separator).
+        let fileArg = args.file;
+        if (path.isAbsolute(args.file) && args.file.startsWith(root)) {
+          fileArg = args.file.slice(root.length).replace(/^[\\/]/, '');
+        }
+
         let whyEngine: WhyEngine;
         if (engines?.whyEngine) {
           whyEngine = engines.whyEngine;
@@ -463,8 +574,8 @@ export function createLoreMcpServer(
           whyEngine = mod.engine;
         }
         const includeWeak = args.include_weak ?? false;
-        const result = await whyEngine.why(repoPath, args.file, args.line, { includeWeak });
-        const header = await freshnessHeader();
+        const result = await whyEngine.why(root, fileArg, args.line, { includeWeak });
+        const header = await freshnessHeaderFor(root);
         return { content: [{ type: 'text', text: renderWhyCompact(result, header) }] };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -490,9 +601,19 @@ export function createLoreMcpServer(
         'engineering knowledge extracted from the conversation — prefer these. ' +
         'A "msg" hit = a RAW, unvetted conversation snippet (low-trust, may be noisy or ' +
         'speculative) shown only as a fallback when notes do not cover the query. ' +
-        'Superseded (overturned) notes are hidden unless include_weak / includeSuperseded is set.',
+        'Superseded (overturned) notes are hidden unless include_weak / includeSuperseded is set.\n' +
+        'CROSS-REPO: pass repo="/abs/path/to/other-repo" to query a different repository. ' +
+        'The target repo must have been indexed by `lore scan`; otherwise lore tells you ' +
+        'what to run rather than silently using the startup repo.',
       inputSchema: {
         question: z.string().describe('Natural-language question about the codebase'),
+        repo: z
+          .string()
+          .optional()
+          .describe(
+            'Absolute path to the target repo root. Omit to use the startup repo. ' +
+            'The repo must already have been indexed by `lore scan` (i.e. have .lore/report.json).',
+          ),
         includeSuperseded: z
           .boolean()
           .optional()
@@ -509,6 +630,7 @@ export function createLoreMcpServer(
     },
     async (args) => {
       try {
+        const root = await resolveRepo(repoPath, args.repo !== undefined ? { repo: args.repo } : undefined);
         let askEngine: AskEngine;
         if (engines?.askEngine) {
           askEngine = engines.askEngine;
@@ -521,8 +643,8 @@ export function createLoreMcpServer(
           includeSuperseded: args.includeSuperseded ?? false,
         };
         if (args.file !== undefined) askOpts.file = args.file;
-        const result = await askEngine.ask(repoPath, args.question, askOpts);
-        const header = await freshnessHeader();
+        const result = await askEngine.ask(root, args.question, askOpts);
+        const header = await freshnessHeaderFor(root);
         return { content: [{ type: 'text', text: renderAskCompact(result, header) }] };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -546,13 +668,29 @@ export function createLoreMcpServer(
         'each either attributed to a session or marked (unattributed).\n' +
         'TRUST MODEL — conf ≥ 0.8 = "strong" (reliable); conf < 0.8 = "weak", flagged ' +
         '"⚠ LOW-CONFIDENCE" (treat as a hint, not fact). session:<id> is a PERMANENT anchor ' +
-        'you can pass to lore_why or quote in a follow-up.',
+        'you can pass to lore_why or quote in a follow-up.\n' +
+        'CROSS-REPO: pass an absolute path and the repo is inferred automatically via ' +
+        '`git rev-parse --show-toplevel`. The inferred repo must have been indexed by ' +
+        '`lore scan`; if not, lore tells you what to do rather than silently using the wrong repo.',
       inputSchema: {
-        path: z.string().describe('Repo-relative file path, e.g. "src/cli.ts"'),
+        path: z
+          .string()
+          .describe(
+            'File path — repo-relative (e.g. "src/cli.ts") uses the startup repo; ' +
+            'absolute path (e.g. "/home/user/other-repo/src/cli.ts") infers the repo ' +
+            'automatically via git and queries that repo instead.',
+          ),
       },
     },
     async (args) => {
       try {
+        const root = await resolveRepo(repoPath, { file: args.path });
+        // Strip root prefix when file is absolute, so the graph store gets a repo-relative path.
+        let fileArg = args.path;
+        if (path.isAbsolute(args.path) && args.path.startsWith(root)) {
+          fileArg = args.path.slice(root.length).replace(/^[\\/]/, '');
+        }
+
         let store: GraphStore;
         if (engines?.graphStore) {
           store = engines.graphStore;
@@ -561,14 +699,14 @@ export function createLoreMcpServer(
           const mod = await import('../graph/factory.js') as {
             createGraphStore: (p: string) => Promise<GraphStore>;
           };
-          store = await mod.createGraphStore(repoPath);
+          store = await mod.createGraphStore(root);
           await store.init();
         }
         try {
-          const history = await store.fileHistory(args.path);
-          const header = await freshnessHeader();
+          const history = await store.fileHistory(fileArg);
+          const header = await freshnessHeaderFor(root);
           return {
-            content: [{ type: 'text', text: renderHistoryCompact(args.path, history, header) }],
+            content: [{ type: 'text', text: renderHistoryCompact(fileArg, history, header) }],
           };
         } finally {
           // Only close stores we created ourselves, not injected test stores.
@@ -607,7 +745,9 @@ export function createLoreMcpServer(
         'source="agent" (higher trust than offline-distilled notes) and surfaces in lore_ask. ' +
         'Same-title agent notes are updated in place (no duplicates). Use supersedes to ' +
         'overturn an earlier note by id (it is marked invalid, not deleted). ' +
-        'Keep it terse: title ≤120 chars, body ≤2000.',
+        'Keep it terse: title ≤120 chars, body ≤2000.\n' +
+        'CROSS-REPO: pass repo="/abs/path/to/other-repo" to write a note into a different ' +
+        'repository. The target repo must have been indexed by `lore scan`.',
       inputSchema: {
         kind: z
           .enum(['decision', 'constraint', 'rejected-approach'])
@@ -616,6 +756,13 @@ export function createLoreMcpServer(
         body: z
           .string()
           .describe('2-4 sentences: what + why. For rejected-approach, state why it was rejected.'),
+        repo: z
+          .string()
+          .optional()
+          .describe(
+            'Absolute path to the target repo root. Omit to use the startup repo. ' +
+            'The repo must already have been indexed by `lore scan` (i.e. have .lore/report.json).',
+          ),
         files: z
           .array(z.string())
           .optional()
@@ -628,6 +775,7 @@ export function createLoreMcpServer(
     },
     async (args) => {
       try {
+        const root = await resolveRepo(repoPath, args.repo !== undefined ? { repo: args.repo } : undefined);
         // Abuse guards — fail loudly with guidance rather than store an essay.
         const title = args.title.trim();
         const body = args.body.trim();
@@ -661,7 +809,7 @@ export function createLoreMcpServer(
         } = { kind: args.kind, title, body, source: 'agent' };
         if (args.files !== undefined) appendArgs.files = args.files;
         if (args.supersedes !== undefined) appendArgs.supersedes = args.supersedes;
-        const res = await store.appendNote(repoPath, appendArgs);
+        const res = await store.appendNote(root, appendArgs);
 
         const verb = res.updated ? 'updated' : 'created';
         const sup = res.superseded ? ` superseded=${res.superseded}` : '';
@@ -690,20 +838,31 @@ export function createLoreMcpServer(
         'Returns a compact snapshot: data freshness (generated date + stale flag), commit ' +
         'coverage, sessions seen vs contributing, note counts bucketed by kind and by source ' +
         '(agent / distilled / human), the last distill time, and the transcript window end. ' +
-        'If coverage is low or the data is stale, weight lore_ask / lore_why results accordingly.',
-      inputSchema: {},
+        'If coverage is low or the data is stale, weight lore_ask / lore_why results accordingly.\n' +
+        'CROSS-REPO: pass repo="/abs/path/to/other-repo" to check the status of a different ' +
+        'repository. The target repo must have been indexed by `lore scan`.',
+      inputSchema: {
+        repo: z
+          .string()
+          .optional()
+          .describe(
+            'Absolute path to the target repo root. Omit to use the startup repo. ' +
+            'The repo must already have been indexed by `lore scan` (i.e. have .lore/report.json).',
+          ),
+      },
     },
-    async () => {
+    async (args) => {
       try {
-        const header = await freshnessHeader();
+        const root = await resolveRepo(repoPath, args.repo !== undefined ? { repo: args.repo } : undefined);
+        const header = await freshnessHeaderFor(root);
         let notesFile: NotesFile | null = null;
         try {
           const store = await getNotesStore();
-          notesFile = await store.load(repoPath);
+          notesFile = await store.load(root);
         } catch {
           notesFile = null;
         }
-        const text = await renderStatusBlock(repoPath, header, notesFile);
+        const text = await renderStatusBlock(root, header, notesFile);
         return { content: [{ type: 'text', text }] };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -728,4 +887,7 @@ export const __test__ = {
   renderStatusBlock,
   buildFreshnessHeader,
   slimSession,
+  resolveRepo,
+  /** Expose the git-root cache so tests can inspect/clear it between cases. */
+  _gitRootCache,
 };

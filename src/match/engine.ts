@@ -346,6 +346,10 @@ export class ContentTimeMatchEngine implements MatchEngine {
       }
     }
 
+    // tier 在 commit 级互斥：同一 commit 既有 strong 又有 weak 候选时只计 strong——
+    // 否则 strong+weak 会超过 commitsTotal（实测 23+15>27），下游 coverage/unmatched 全部失真。
+    for (const h of strongCommits) weakCommits.delete(h);
+
     return {
       repo: repoPath,
       generatedAt: new Date().toISOString(),

@@ -36,6 +36,7 @@ import type {
 } from './types.js';
 import type { MatchCandidate, RepoMatchReport } from '../match/types.js';
 import type { TranscriptParser, ParsedSession, LoreEvent } from '../schema/events.js';
+import { loadSnapshot, excerptsForCommit, type ExcerptsSnapshot } from '../excerpts/snapshot.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -216,10 +217,15 @@ export class DeterministicWhyEngine implements WhyEngine {
     // 3. report.json 取 (commitHash, filePath) 的 candidate，confidence 降序 top 3。
     const candidates = await this.loadCandidates(repo, commit.hash, file, hash, minConfidence);
 
-    // 4. 每个 candidate 构建归因（parse sourcePath，抽摘录）。
+    // 摘录快照（fallback 链末环）：transcript 被 Claude Code 清理后实时 parse 会落空，
+    // 此时归因摘录改从 scan 固化的 .lore/excerpts.json 出，而不是静默空。
+    // 一次 why 只读一次快照（why 是一次性命令）；读失败 / 缺失 → null，正常降级。
+    const snapshot = await loadSnapshot(repo);
+
+    // 4. 每个 candidate 构建归因（parse sourcePath，抽摘录；摘录空时回落快照）。
     const attributions: WhyAttribution[] = [];
     for (const cand of candidates) {
-      const attribution = await this.buildAttribution(repo, commit, cand);
+      const attribution = await this.buildAttribution(repo, commit, cand, snapshot);
       if (attribution) attributions.push(attribution);
     }
 
@@ -289,11 +295,16 @@ export class DeterministicWhyEngine implements WhyEngine {
     return matched.slice(0, TOP_ATTRIBUTIONS);
   }
 
-  /** parse candidate.sourcePath，按 editSeqs 抽摘录，组装 WhyAttribution。 */
+  /**
+   * parse candidate.sourcePath，按 editSeqs 抽摘录，组装 WhyAttribution。
+   * 摘录 fallback：实时 parse 出的摘录为空（transcript 已被清理 / parse 失败）时，
+   * 回落到 scan 固化的快照（按 commit.hash 命中），保证记忆不依赖 transcript 留存窗口。
+   */
   private async buildAttribution(
     repoPath: string,
     commit: CommitNodeData,
     cand: MatchCandidate,
+    snapshot: ExcerptsSnapshot | null,
   ): Promise<WhyAttribution | null> {
     let session: ParsedSession | null = null;
     if (cand.sourcePath) {
@@ -305,7 +316,15 @@ export class DeterministicWhyEngine implements WhyEngine {
       }
     }
 
-    const excerpts = session ? buildExcerpts(session, cand.editSeqs) : [];
+    let excerpts: ConversationExcerpt[] = session ? buildExcerpts(session, cand.editSeqs) : [];
+    // transcript 还在但 parse 出的摘录为空，或 transcript 已不在 → 用快照兜底。
+    // ViewerExcerpt 与 ConversationExcerpt 同构（sessionId/seq/role/text/ts），可直接采用。
+    if (excerpts.length === 0 && snapshot) {
+      const fromSnapshot = excerptsForCommit(snapshot, commit.hash);
+      if (fromSnapshot && fromSnapshot.length > 0) {
+        excerpts = fromSnapshot;
+      }
+    }
 
     // ProducedInfo 形态：ProducedEdgeData + session 节点。从 candidate + 图谱拼。
     const sessionNode = await this.sessionNodeFor(cand.sessionId, session, commit);
