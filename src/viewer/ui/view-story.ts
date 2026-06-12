@@ -1,9 +1,750 @@
-/** 占位：由实现 agent 填充。导出协议：CSS 字符串 + JS 字符串（JS 内 LORE_VIEWS.push 注册）。 */
-export const CSS = '';
+/**
+ * view-story —— "Software is made between commits" 的时间轴叙事（主打视图）。
+ *
+ * 全屏 SVG 水平时间轴：
+ *   - 顶部 session 泳道（蓝色胶囊，贪心装行）
+ *   - 中央 commit 带（圆角方块，∝ 触碰文件数，归因者带绿辉光）
+ *   - 归因丝带（session → 其归因 commit 的贝塞尔，蓝→绿渐变，宽 ∝ confidence）
+ *   - 底部 decision 菱形（琥珀，supersede 链虚线相连）
+ *   - d3.zoom 仅缩放 x（rescaleX），自适应刻度
+ *
+ * 协议：导出 CSS / JS 字符串；JS 内 IIFE + LORE_VIEWS.push 注册。
+ * 注意：JS 处于 TS 模板字符串内，禁用反引号与 ${}，一律字符串拼接。
+ */
+
+export const CSS = `
+#view-story { background: transparent; }
+.story-svg { width: 100%; height: 100%; display: block; cursor: grab; }
+.story-svg.grabbing { cursor: grabbing; }
+
+.story-axis line, .story-axis path { stroke: var(--border); shape-rendering: crispEdges; }
+.story-axis text { fill: var(--text-faint); font-size: 10.5px; font-family: var(--font); }
+.story-axis .domain { display: none; }
+
+.story-lane-label { fill: var(--text-faint); font-size: 10px; font-family: var(--font); letter-spacing: 0.04em; text-transform: uppercase; }
+
+.story-session {
+  cursor: pointer;
+  transition: opacity var(--t-fast);
+}
+.story-session rect.cap {
+  fill: rgba(88,166,255,0.12);
+  stroke: var(--blue);
+  stroke-width: 1;
+  transition: fill var(--t-fast), stroke-width var(--t-fast);
+}
+.story-session:hover rect.cap { fill: rgba(88,166,255,0.22); stroke-width: 1.5; }
+.story-session text { fill: var(--blue); font-size: 10px; font-family: var(--mono); pointer-events: none; }
+
+.story-commit {
+  cursor: pointer;
+  transition: opacity var(--t-fast);
+}
+.story-commit rect {
+  transition: filter var(--t-fast), stroke-width var(--t-fast);
+  stroke: rgba(0,0,0,0.35);
+  stroke-width: 0.5;
+}
+.story-commit:hover rect { stroke: var(--text); stroke-width: 1.5; }
+
+.story-ribbon {
+  fill: none;
+  transition: opacity var(--t-fast), stroke-width var(--t-fast);
+  pointer-events: none;
+}
+
+.story-decision { cursor: pointer; transition: opacity var(--t-fast); }
+.story-decision rect {
+  fill: rgba(227,179,65,0.16);
+  stroke: var(--amber);
+  stroke-width: 1;
+  transition: fill var(--t-fast);
+}
+.story-decision:hover rect { fill: rgba(227,179,65,0.32); }
+.story-supersede { stroke: var(--amber); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.4; fill: none; }
+
+.story-nowline line { stroke: var(--green); stroke-width: 1; shape-rendering: crispEdges; }
+.story-nowline polygon { fill: var(--green); }
+
+.story-tooltip {
+  position: absolute; z-index: 40; pointer-events: none;
+  max-width: 320px; padding: 7px 11px;
+  background: var(--panel-solid); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow);
+  font-size: 12px; color: var(--text); opacity: 0;
+  transition: opacity var(--t-fast);
+}
+.story-tooltip.show { opacity: 1; }
+.story-tooltip .tt-hash { font-family: var(--mono); font-size: 10.5px; color: var(--green); }
+.story-tooltip .tt-sub { color: var(--text-dim); margin-top: 2px; }
+
+.story-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 8px; color: var(--text-faint); text-align: center;
+}
+.story-empty .big { font-size: 15px; color: var(--text-dim); }
+.story-empty .small { font-size: 12.5px; }
+
+.story-legend {
+  position: absolute; left: 24px; bottom: 92px; z-index: 20;
+  display: flex; gap: 14px; align-items: center;
+  padding: 7px 13px; pointer-events: none;
+}
+.story-legend .lg { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); }
+.story-legend .sw { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+
+.story-confbar { height: 5px; border-radius: 3px; background: rgba(240,246,252,0.08); overflow: hidden; margin-top: 3px; }
+.story-confbar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); border-radius: 3px; }
+.drawer-link { color: var(--blue); cursor: pointer; }
+.drawer-link:hover { text-decoration: underline; }
+.kind-badge {
+  display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10.5px;
+  border: 1px solid var(--amber); color: var(--amber); background: rgba(227,179,65,0.1);
+}
+`;
+
 export const JS = `
-window.LORE_VIEWS.push({
-  id: 'story', label: 'story',
-  mount(el, ctx) { el.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:var(--text-faint)">story view — coming up</div>'; },
-  onTimeline() {},
-});
+(function () {
+  'use strict';
+
+  // ── 安全样式取值（避免 SSR/无 CSS 时 NaN）─────────────────────────
+  function cssVar(name, fallback) {
+    try {
+      var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v || fallback;
+    } catch (e) { return fallback; }
+  }
+
+  var MARGIN_TOP = 70, MARGIN_BOTTOM = 80, MARGIN_X = 24;
+  var LANE_H = 22, LANE_GAP = 4, CAP_H = 18;
+  var COMMIT_Y_FRAC = 0.62;
+  var DECISION_SIZE = 9;
+
+  LORE_VIEWS.push({
+    id: 'story',
+    label: 'Story',
+
+    mount: function (el, ctx) {
+      this.ctx = ctx;
+      this.el = el;
+
+      var g = (ctx.payload && ctx.payload.graph) || {};
+      var commits = (g.commits || []).filter(function (c) { return c && !isNaN(+new Date(c.authorDate)); });
+      var sessions = g.sessions || [];
+      var notes = ctx.payload.notes || [];
+      var produced = g.produced || [];
+      var touches = g.touches || [];
+
+      // 空态
+      if (!commits.length) {
+        el.innerHTML =
+          '<div class="story-empty">' +
+          '<div class="big">No commits to tell a story yet</div>' +
+          '<div class="small">Run <span class="mono">lore build</span> on a repo with history to populate the timeline.</div>' +
+          '</div>';
+        return;
+      }
+
+      // ── 预聚合 ─────────────────────────────────────────────────────
+      // commit -> 触碰文件数
+      var touchCount = {};
+      for (var i = 0; i < touches.length; i++) {
+        var h = touches[i] && touches[i].commitHash;
+        if (!h) continue;
+        touchCount[h] = (touchCount[h] || 0) + 1;
+      }
+      // session id -> session
+      var sessionById = {};
+      for (var s = 0; s < sessions.length; s++) {
+        if (sessions[s] && sessions[s].id) sessionById[sessions[s].id] = sessions[s];
+      }
+      // session -> 其归因 commit 列表（含 confidence）
+      var sessionProduced = {};
+      // commit -> 归因边（也用 ctx.attributionIndex，但这里建简表给丝带）
+      for (var p = 0; p < produced.length; p++) {
+        var pe = produced[p];
+        if (!pe || !pe.sessionId) continue;
+        (sessionProduced[pe.sessionId] = sessionProduced[pe.sessionId] || []).push(pe);
+      }
+      // commit hash -> commit
+      var commitByHash = {};
+      for (var ci = 0; ci < commits.length; ci++) commitByHash[commits[ci].hash] = commits[ci];
+
+      var fmt = ctx.fmt;
+      var esc = fmt.esc;
+
+      // ── DOM 骨架 ───────────────────────────────────────────────────
+      el.innerHTML = '';
+      var tooltip = document.createElement('div');
+      tooltip.className = 'story-tooltip';
+      el.appendChild(tooltip);
+      this.tooltip = tooltip;
+
+      // 图例
+      var legend = document.createElement('div');
+      legend.className = 'story-legend glass';
+      legend.innerHTML =
+        '<div class="lg"><span class="sw" style="background:var(--blue)"></span>session</div>' +
+        '<div class="lg"><span class="sw" style="background:var(--commit-new)"></span>commit</div>' +
+        '<div class="lg"><span class="sw" style="background:var(--green);box-shadow:0 0 6px var(--green)"></span>attributed</div>' +
+        '<div class="lg"><span class="sw" style="background:var(--amber);border-radius:2px;transform:rotate(45deg)"></span>decision</div>';
+      el.appendChild(legend);
+
+      var svg = d3.select(el).append('svg').attr('class', 'story-svg');
+      this.svg = svg;
+
+      // defs：辉光滤镜 + 丝带渐变
+      var defs = svg.append('defs');
+      var glow = defs.append('filter').attr('id', 'story-glow').attr('x', '-60%').attr('y', '-60%').attr('width', '220%').attr('height', '220%');
+      glow.append('feDropShadow')
+        .attr('dx', 0).attr('dy', 0).attr('stdDeviation', 1.6)
+        .attr('flood-color', cssVar('--green', '#56d364')).attr('flood-opacity', 0.85);
+      var grad = defs.append('linearGradient').attr('id', 'story-ribbon-grad').attr('x1', '0').attr('y1', '0').attr('x2', '0').attr('y2', '1');
+      grad.append('stop').attr('offset', '0%').attr('stop-color', cssVar('--blue', '#58a6ff'));
+      grad.append('stop').attr('offset', '100%').attr('stop-color', cssVar('--green', '#56d364'));
+
+      // 分层（绘制顺序 = 视觉层级）
+      var gAxis = svg.append('g').attr('class', 'story-axis');
+      var gContent = svg.append('g').attr('class', 'story-content'); // 受 zoom 变换的 x 由 scale 控制，这里只装元素
+      var gRibbons = gContent.append('g').attr('class', 'story-ribbons');
+      var gSessions = gContent.append('g').attr('class', 'story-sessions');
+      var gCommits = gContent.append('g').attr('class', 'story-commits');
+      var gDecisions = gContent.append('g').attr('class', 'story-decisions');
+      var gNow = svg.append('g').attr('class', 'story-nowline');
+
+      // ── 时间标尺（domain 固定，range 随尺寸/zoom 变）───────────────
+      var tMin = ctx.tMin, tMax = ctx.tMax;
+      // 给 domain 两端各留一点呼吸
+      var pad = Math.max(1, (tMax - tMin) * 0.02);
+      var xBase = d3.scaleTime().domain([new Date(tMin - pad), new Date(tMax + pad)]);
+      var x = xBase; // 当前生效 scale（zoom 后被 rescaleX 替换）
+
+      // ── session 泳道贪心装行 ──────────────────────────────────────
+      // 先按 startedAt 排序，贪心放入第一个不重叠的行
+      var laidSessions = sessions
+        .filter(function (ss) { return ss && ss.startedAt && !isNaN(+new Date(ss.startedAt)); })
+        .map(function (ss) {
+          var st = +new Date(ss.startedAt);
+          var en = ss.endedAt ? +new Date(ss.endedAt) : st;
+          if (isNaN(en) || en < st) en = st;
+          return { s: ss, start: st, end: en };
+        })
+        .sort(function (a, b) { return a.start - b.start; });
+
+      // 行分配在像素层做（因为最小宽度 24px 影响占位），但缩放会变——
+      // 折中：用时间域贪心装行，最小占位按"全幅下 24px 对应的时间跨度"估算。
+      function assignLanes(minSpanMs) {
+        var laneEnds = []; // 每行最后占用的时间
+        for (var k = 0; k < laidSessions.length; k++) {
+          var item = laidSessions[k];
+          var occEnd = Math.max(item.end, item.start + minSpanMs);
+          var placed = -1;
+          for (var ln = 0; ln < laneEnds.length; ln++) {
+            if (item.start >= laneEnds[ln]) { placed = ln; break; }
+          }
+          if (placed < 0) { placed = laneEnds.length; laneEnds.push(0); }
+          laneEnds[placed] = occEnd;
+          item.lane = placed;
+        }
+        return laneEnds.length;
+      }
+
+      this.commits = commits;
+      this.touchCount = touchCount;
+      this.sessionProduced = sessionProduced;
+      this.sessionById = sessionById;
+      this.commitByHash = commitByHash;
+      this.notes = notes;
+      this.laidSessions = laidSessions;
+      this.xBase = xBase;
+      this.assignLanes = assignLanes;
+      this.gAxis = gAxis;
+      this.gRibbons = gRibbons;
+      this.gSessions = gSessions;
+      this.gCommits = gCommits;
+      this.gDecisions = gDecisions;
+      this.gNow = gNow;
+      this.tooltip = tooltip;
+
+      // ── zoom（仅 x，rescaleX）─────────────────────────────────────
+      var self = this;
+      var zoom = d3.zoom()
+        .scaleExtent([1, 64])
+        .filter(function (ev) {
+          // 允许滚轮缩放 + 拖拽平移；阻止双击放大（避免误触）
+          return (!ev.button) && ev.type !== 'dblclick';
+        })
+        .on('start', function () { svg.classed('grabbing', true); })
+        .on('end', function () { svg.classed('grabbing', false); })
+        .on('zoom', function (ev) {
+          self.transform = ev.transform;
+          self.x = ev.transform.rescaleX(self.xBase);
+          self.render(false);
+        });
+      this.zoom = zoom;
+      svg.call(zoom);
+      this.transform = d3.zoomIdentity;
+
+      this.resize();
+      this.render(true);
+
+      // 默认聚焦"有 session 的时间段"——Story 的主角是 session↔commit 关联，
+      // 全量 54 天里 session 往往集中在最近几天；老 commit 缩放出去仍可达。
+      var starts = (ctx.payload.graph.sessions || [])
+        .map(function (s) { return +new Date(s.startedAt); })
+        .filter(function (t) { return !isNaN(t); });
+      if (starts.length) {
+        var focusStart = Math.min.apply(null, starts) - 3 * 86400e3;
+        var d0 = this.xBase.domain();
+        var full = d0[1] - d0[0];
+        var span = Math.max(d0[1] - focusStart, full * 0.02);
+        var k = Math.min(64, Math.max(1, full / span));
+        if (k > 1.2) {
+          var xAt = this.xBase(new Date(+d0[1] - span));
+          var t = d3.zoomIdentity.scale(k).translate(-xAt, 0);
+          svg.transition().duration(500).call(zoom.transform, t);
+        }
+      }
+    },
+
+    // 计算当前尺寸并设定 range
+    resize: function () {
+      if (!this.el) return;
+      var w = this.el.clientWidth || 1200;
+      var h = this.el.clientHeight || 700;
+      this.W = w; this.H = h;
+      this.innerLeft = MARGIN_X;
+      this.innerRight = w - MARGIN_X;
+      this.xBase.range([this.innerLeft, this.innerRight]);
+      // 应用现有 zoom 变换
+      this.x = (this.transform || d3.zoomIdentity).rescaleX(this.xBase);
+      // 最小 session 占位：24px 对应的时间跨度（用 base scale 估算）
+      var spanMs = this.xBase.invert(this.innerLeft + 24) - this.xBase.invert(this.innerLeft);
+      this.minSpanMs = Math.max(0, spanMs);
+      this.laneCount = this.assignLanes(this.minSpanMs);
+      this.commitY = MARGIN_TOP + (h - MARGIN_TOP - MARGIN_BOTTOM) * COMMIT_Y_FRAC;
+      // session 泳道区：从 MARGIN_TOP 往下排，但不能压到 commit 带
+      this.laneTop = MARGIN_TOP + 6;
+      this.decisionY = this.commitY + 46;
+    },
+
+    onResize: function () {
+      if (!this.svg) return;
+      this.resize();
+      this.render(true);
+    },
+
+    // full=true 表示尺寸/数据变化，需要重建元素；false 表示仅 zoom 平移，更新位置
+    render: function (full) {
+      if (!this.svg) return;
+      var ctx = this.ctx, x = this.x, self = this;
+      var fmt = ctx.fmt, esc = fmt.esc;
+
+      // 触碰文件数 → 方块边长（4..8）
+      var counts = this.commits.map(function (c) { return self.touchCount[c.hash] || 0; });
+      var maxTouch = Math.max(1, d3.max(counts) || 1);
+      var sizeScale = d3.scaleSqrt().domain([0, maxTouch]).range([4, 8]).clamp(true);
+
+      // ── 轴 ────────────────────────────────────────────────────────
+      var axis = d3.axisBottom(x).ticks(Math.max(3, Math.floor(this.W / 130))).tickSizeOuter(0).tickPadding(8);
+      this.gAxis
+        .attr('transform', 'translate(0,' + (this.H - MARGIN_BOTTOM + 18) + ')')
+        .call(axis);
+      // 刻度上引一条极淡的网格线（往上到顶）
+      this.gAxis.selectAll('.tick line')
+        .attr('y1', 0).attr('y2', -(this.H - MARGIN_TOP - MARGIN_BOTTOM + 18))
+        .attr('stroke', cssVar('--border', 'rgba(240,246,252,0.09)')).attr('stroke-opacity', 0.5);
+
+      // ── commit 带（带同刻 jitter）─────────────────────────────────
+      // 计算每个 commit 的纵向微抖：用 hash 派生稳定偏移
+      function jitter(hash) {
+        var n = 0;
+        for (var i = 0; i < hash.length; i++) n = (n * 31 + hash.charCodeAt(i)) & 0xffff;
+        return ((n % 9) - 4); // -4..4 px
+      }
+
+      var commitsSel = this.gCommits.selectAll('g.story-commit')
+        .data(this.commits, function (c) { return c.hash; });
+      if (full) {
+        commitsSel.exit().remove();
+        var cEnter = commitsSel.enter().append('g').attr('class', 'story-commit');
+        cEnter.append('rect');
+        commitsSel = cEnter.merge(commitsSel);
+        // 事件只绑一次（enter）
+        cEnter
+          .on('mouseenter', function (ev, c) { self.showTip(ev, c); })
+          .on('mousemove', function (ev) { self.moveTip(ev); })
+          .on('mouseleave', function () { self.hideTip(); })
+          .on('click', function (ev, c) { ev.stopPropagation(); self.openCommit(c); });
+      }
+      commitsSel.attr('transform', function (c) {
+        var px = x(new Date(c.authorDate));
+        return 'translate(' + px + ',' + (self.commitY + jitter(c.hash)) + ')';
+      });
+      commitsSel.select('rect').each(function (c) {
+        var sz = sizeScale(self.touchCount[c.hash] || 0);
+        var attributed = ctx.attributionIndex.has(c.hash);
+        d3.select(this)
+          .attr('x', -sz / 2).attr('y', -sz / 2)
+          .attr('width', sz).attr('height', sz)
+          .attr('rx', Math.min(2.5, sz / 3))
+          .attr('fill', ctx.commitColor(+new Date(c.authorDate)))
+          .attr('filter', attributed ? 'url(#story-glow)' : null);
+      });
+      commitsSel.style('opacity', function (c) {
+        return ctx.attributionIndex.has(c.hash) ? 1 : 0.35;
+      });
+
+      // ── session 胶囊 ──────────────────────────────────────────────
+      var sessSel = this.gSessions.selectAll('g.story-session')
+        .data(this.laidSessions, function (d) { return d.s.id; });
+      if (full) {
+        sessSel.exit().remove();
+        var sEnter = sessSel.enter().append('g').attr('class', 'story-session');
+        sEnter.append('rect').attr('class', 'cap').attr('rx', 6).attr('ry', 6).attr('height', CAP_H);
+        sEnter.append('clipPath').attr('id', function (d, i) { return 'sclip-' + cssId(d.s.id); })
+          .append('rect').attr('height', CAP_H);
+        sEnter.append('text').attr('dy', '0.32em');
+        sessSel = sEnter.merge(sessSel);
+        sEnter
+          .on('mouseenter', function (ev, d) { self.emphasizeSession(d.s.id, true); })
+          .on('mouseleave', function (ev, d) { self.emphasizeSession(d.s.id, false); })
+          .on('click', function (ev, d) { ev.stopPropagation(); self.openSession(d.s); });
+      }
+      // 每次 render 按当前像素区间重新贪心分道（缩放后区间变化，固定 lane 会无谓堆叠）
+      var laneEnds = [];
+      var ordered = [];
+      sessSel.each(function (d) { ordered.push(d); });
+      ordered.sort(function (a, b) { return a.start - b.start; });
+      for (var oi = 0; oi < ordered.length; oi++) {
+        var od = ordered[oi];
+        var ox0 = x(new Date(od.start));
+        var ox1 = Math.max(ox0 + 24, x(new Date(od.end)));
+        var lane = 0;
+        while (lane < laneEnds.length && laneEnds[lane] > ox0 - 6) lane++;
+        laneEnds[lane] = ox1;
+        od.lane = lane;
+      }
+      sessSel.each(function (d) {
+        var x0 = x(new Date(d.start));
+        var x1 = x(new Date(d.end));
+        var w = Math.max(24, x1 - x0);
+        var y = self.laneTop + d.lane * (LANE_H + LANE_GAP);
+        // 不让胶囊压到 commit 带
+        if (y + CAP_H > self.commitY - 14) y = self.commitY - 14 - CAP_H;
+        d.px = x0; d.pw = w; d.py = y;
+        var node = d3.select(this);
+        node.select('rect.cap').attr('x', x0).attr('y', y).attr('width', w);
+        node.select('clipPath rect').attr('x', x0).attr('y', y).attr('width', Math.max(0, w - 8));
+        var label = (d.s.agent || 'session') + ' ' + String(d.s.id).slice(0, 6);
+        node.select('text')
+          .attr('x', x0 + 7).attr('y', y + CAP_H / 2)
+          .attr('clip-path', 'url(#sclip-' + cssId(d.s.id) + ')')
+          .text(w > 40 ? label : '');
+      });
+
+      // ── 归因丝带 ──────────────────────────────────────────────────
+      // 每条 produced 边一条丝带：从 session 胶囊底中点 → commit
+      var ribbons = [];
+      for (var si = 0; si < this.laidSessions.length; si++) {
+        var item = this.laidSessions[si];
+        var edges = this.sessionProduced[item.s.id] || [];
+        for (var e = 0; e < edges.length; e++) {
+          var pe = edges[e];
+          var c = this.commitByHash[pe.commitHash];
+          if (!c) continue;
+          ribbons.push({ key: item.s.id + '>' + pe.commitHash, sid: item.s.id, edge: pe, src: item, commit: c });
+        }
+      }
+      var ribSel = this.gRibbons.selectAll('path.story-ribbon').data(ribbons, function (r) { return r.key; });
+      if (full) ribSel.exit().remove();
+      var ribEnter = full ? ribSel.enter().append('path').attr('class', 'story-ribbon') : d3.select(null);
+      if (full) ribSel = ribEnter.merge(ribSel);
+      var confW = d3.scaleLinear().domain([0, 1]).range([1.5, 6]).clamp(true);
+      ribSel.each(function (r) {
+        var sx = (r.src.px || 0) + (r.src.pw || 24) / 2;
+        var sy = (r.src.py != null ? r.src.py : self.laneTop) + CAP_H;
+        var cx = x(new Date(r.commit.authorDate));
+        var cy = self.commitY;
+        var midY = (sy + cy) / 2;
+        var path = 'M' + sx + ',' + sy +
+                   ' C' + sx + ',' + midY + ' ' + cx + ',' + midY + ' ' + cx + ',' + cy;
+        d3.select(this)
+          .attr('d', path)
+          .attr('stroke', 'url(#story-ribbon-grad)')
+          .attr('stroke-width', confW(r.edge.confidence || 0))
+          .attr('stroke-linecap', 'round')
+          .style('opacity', 0.45);
+      });
+      this.ribbonsBySession = {};
+      var rb = this.ribbonsBySession;
+      ribSel.each(function (r) { (rb[r.sid] = rb[r.sid] || []).push(this); });
+
+      // ── decision 菱形 ─────────────────────────────────────────────
+      var decData = this.notes.filter(function (n) { return n && n.validAt && !isNaN(+new Date(n.validAt)); });
+      // supersede 链：id -> note
+      var noteById = {};
+      for (var ni = 0; ni < decData.length; ni++) noteById[decData[ni].id] = decData[ni];
+
+      var decSel = this.gDecisions.selectAll('g.story-decision').data(decData, function (n) { return n.id; });
+      if (full) {
+        decSel.exit().remove();
+        var dEnter = decSel.enter().append('g').attr('class', 'story-decision');
+        dEnter.append('rect')
+          .attr('x', -DECISION_SIZE / 2).attr('y', -DECISION_SIZE / 2)
+          .attr('width', DECISION_SIZE).attr('height', DECISION_SIZE).attr('rx', 1.5);
+        decSel = dEnter.merge(decSel);
+        dEnter
+          .on('mouseenter', function (ev, n) { self.showDecisionTip(ev, n); })
+          .on('mousemove', function (ev) { self.moveTip(ev); })
+          .on('mouseleave', function () { self.hideTip(); })
+          .on('click', function (ev, n) { ev.stopPropagation(); self.openDecision(n, noteById); });
+      }
+      decSel.attr('transform', function (n) {
+        return 'translate(' + x(new Date(n.validAt)) + ',' + self.decisionY + ') rotate(45)';
+      });
+      decSel.style('opacity', function (n) { return n.invalidAt ? 0.4 : 1; });
+
+      // supersede 连线
+      var links = [];
+      for (var di = 0; di < decData.length; di++) {
+        var n = decData[di];
+        if (n.supersededBy && noteById[n.supersededBy]) {
+          links.push({ a: n, b: noteById[n.supersededBy] });
+        }
+      }
+      var linkSel = this.gDecisions.selectAll('line.story-supersede').data(links, function (l) { return l.a.id + '>' + l.b.id; });
+      if (full) linkSel.exit().remove();
+      var linkEnter = full ? linkSel.enter().insert('line', ':first-child').attr('class', 'story-supersede') : d3.select(null);
+      if (full) linkSel = linkEnter.merge(linkSel);
+      linkSel
+        .attr('x1', function (l) { return x(new Date(l.a.validAt)); })
+        .attr('y1', self.decisionY)
+        .attr('x2', function (l) { return x(new Date(l.b.validAt)); })
+        .attr('y2', self.decisionY);
+
+      // ── lane labels ───────────────────────────────────────────────
+      this.gSessions.selectAll('text.story-lane-label').remove();
+      // 时间轴回放当前态
+      this.applyCutoff(ctx.cutoffMs);
+    },
+
+    // ── 时间轴回放：cutoff 右侧元素淡出 + 当前时刻竖线 ────────────────
+    onTimeline: function (cutoffMs) { this.applyCutoff(cutoffMs); },
+
+    applyCutoff: function (cutoffMs) {
+      if (!this.svg) return;
+      var self = this, x = this.x;
+      var future = function (t) { return cutoffMs != null && +new Date(t) > cutoffMs; };
+
+      this.gCommits.selectAll('g.story-commit').style('opacity', function (c) {
+        if (future(c.authorDate)) return 0.07;
+        return self.ctx.attributionIndex.has(c.hash) ? 1 : 0.35;
+      }).style('pointer-events', function (c) { return future(c.authorDate) ? 'none' : null; });
+
+      this.gRibbons.selectAll('path.story-ribbon').style('opacity', function (r) {
+        return future(r.commit.authorDate) ? 0.05 : 0.45;
+      });
+
+      this.gDecisions.selectAll('g.story-decision').style('opacity', function (n) {
+        if (future(n.validAt)) return 0.07;
+        return n.invalidAt ? 0.4 : 1;
+      });
+
+      this.gSessions.selectAll('g.story-session').style('opacity', function (d) {
+        return future(d.start) ? 0.12 : 1;
+      });
+
+      // 当前时刻竖线
+      var ng = this.gNow;
+      ng.selectAll('*').remove();
+      if (cutoffMs != null) {
+        var px = x(new Date(cutoffMs));
+        if (px >= this.innerLeft - 2 && px <= this.innerRight + 2) {
+          ng.append('line').attr('x1', px).attr('x2', px)
+            .attr('y1', MARGIN_TOP - 4).attr('y2', this.H - MARGIN_BOTTOM + 18);
+          ng.append('polygon').attr('points',
+            (px - 4) + ',' + (MARGIN_TOP - 4) + ' ' + (px + 4) + ',' + (MARGIN_TOP - 4) + ' ' + px + ',' + (MARGIN_TOP + 2));
+        }
+      }
+    },
+
+    // ── session 强调（hover 胶囊时丝带 + 其 commit 提亮，其余压暗）────
+    emphasizeSession: function (sid, on) {
+      if (!this.svg) return;
+      var self = this;
+      var related = {};
+      var edges = this.sessionProduced[sid] || [];
+      for (var i = 0; i < edges.length; i++) related[edges[i].commitHash] = true;
+
+      this.gRibbons.selectAll('path.story-ribbon').style('opacity', function (r) {
+        if (!on) return self._cutoffFutureRibbon(r) ? 0.05 : 0.45;
+        return r.sid === sid ? 0.95 : 0.1;
+      }).style('stroke-width', function (r) {
+        var base = (1.5 + 4.5 * (r.edge.confidence || 0));
+        return (on && r.sid === sid) ? base + 1 : base;
+      });
+
+      this.gCommits.selectAll('g.story-commit').style('opacity', function (c) {
+        if (!on) return self._cutoffFutureCommit(c) ? 0.07 : (self.ctx.attributionIndex.has(c.hash) ? 1 : 0.35);
+        return related[c.hash] ? 1 : 0.12;
+      });
+    },
+
+    _cutoffFutureCommit: function (c) {
+      var co = this.ctx.cutoffMs;
+      return co != null && +new Date(c.authorDate) > co;
+    },
+    _cutoffFutureRibbon: function (r) {
+      var co = this.ctx.cutoffMs;
+      return co != null && +new Date(r.commit.authorDate) > co;
+    },
+
+    // ── tooltip ───────────────────────────────────────────────────
+    showTip: function (ev, c) {
+      var fmt = this.ctx.fmt;
+      var sub = String(c.subject || '').slice(0, 40);
+      this.tooltip.innerHTML =
+        '<div class="tt-hash">' + fmt.esc(fmt.hash(c.hash)) + '</div>' +
+        '<div class="tt-sub">' + fmt.esc(sub) + (String(c.subject || '').length > 40 ? '…' : '') + '</div>';
+      this.tooltip.classList.add('show');
+      this.moveTip(ev);
+    },
+    showDecisionTip: function (ev, n) {
+      var fmt = this.ctx.fmt;
+      this.tooltip.innerHTML =
+        '<div class="tt-hash" style="color:var(--amber)">' + fmt.esc(n.kind || 'decision') + '</div>' +
+        '<div class="tt-sub">' + fmt.esc(String(n.title || '').slice(0, 60)) + '</div>';
+      this.tooltip.classList.add('show');
+      this.moveTip(ev);
+    },
+    moveTip: function (ev) {
+      var rect = this.el.getBoundingClientRect();
+      var px = ev.clientX - rect.left + 14;
+      var py = ev.clientY - rect.top + 14;
+      // 防溢出右/下边
+      var tw = this.tooltip.offsetWidth || 0, th = this.tooltip.offsetHeight || 0;
+      if (px + tw > rect.width - 8) px = ev.clientX - rect.left - tw - 14;
+      if (py + th > rect.height - 8) py = ev.clientY - rect.top - th - 14;
+      this.tooltip.style.left = px + 'px';
+      this.tooltip.style.top = py + 'px';
+    },
+    hideTip: function () { if (this.tooltip) this.tooltip.classList.remove('show'); },
+
+    // ── drawers ───────────────────────────────────────────────────
+    openCommit: function (c) {
+      var ctx = this.ctx, fmt = ctx.fmt, esc = fmt.esc;
+      var attrs = ctx.attributionIndex.get(c.hash) || [];
+      var touch = this.touchCount[c.hash] || 0;
+      var html = '<h3>' + esc(String(c.subject || '(no subject)')) + '</h3>';
+      html += '<div class="row"><span class="k">hash</span><span class="v mono">' + esc(c.hash) + '</span></div>';
+      html += '<div class="row"><span class="k">date</span><span class="v">' + esc(fmt.datetime(c.authorDate)) + '</span></div>';
+      html += '<div class="row"><span class="k">touches</span><span class="v">' + touch + ' file' + (touch === 1 ? '' : 's') + '</span></div>';
+      if (c.isMerge) html += '<div class="row"><span class="k"></span><span class="v"><span class="chip">merge</span></span></div>';
+      html += '<div class="sep"></div>';
+      if (!attrs.length) {
+        html += '<div class="row"><span class="v" style="color:var(--text-faint)">No session attributed to this commit.</span></div>';
+      } else {
+        html += '<div class="row"><span class="k">attribution</span><span class="v">' + attrs.length + (attrs.length === 1 ? ' session' : ' sessions') + '</span></div>';
+        for (var i = 0; i < attrs.length; i++) {
+          var a = attrs[i];
+          var sess = this.sessionById[a.sessionId];
+          var pct = Math.round((a.confidence || 0) * 100);
+          html += '<div style="margin:10px 0 4px">';
+          html += '<div class="drawer-link" data-session="' + esc(a.sessionId) + '">' +
+                  ((sess && sess.agent ? esc(sess.agent) + ' · ' : '')) +
+                  '<span class="mono">' + esc(String(a.sessionId).slice(0, 8)) + '</span></div>';
+          html += '<div class="story-confbar"><i style="width:' + pct + '%"></i></div>';
+          html += '<div class="row" style="margin-top:4px"><span class="k">confidence</span><span class="v">' + pct + '%</span></div>';
+          html += '<div class="row"><span class="k">via</span><span class="v">' + esc(a.matchedVia || '—') + '</span></div>';
+          html += '<div class="row"><span class="k">lines</span><span class="v">' + (a.matchedLines || 0) + ' matched · ' + (a.fileCount || 0) + ' files</span></div>';
+          html += '</div>';
+        }
+      }
+      ctx.drawer.show(html);
+      this.wireSessionLinks();
+    },
+
+    openSession: function (s) {
+      var ctx = this.ctx, fmt = ctx.fmt, esc = fmt.esc, self = this;
+      var produced = this.sessionProduced[s.id] || [];
+      var html = '<h3>' + esc(s.agent || 'session') + '</h3>';
+      html += '<div class="row"><span class="k">id</span><span class="v mono">' + esc(s.id) + '</span></div>';
+      html += '<div class="row"><span class="k">started</span><span class="v">' + esc(fmt.datetime(s.startedAt)) + '</span></div>';
+      html += '<div class="row"><span class="k">ended</span><span class="v">' + esc(s.endedAt ? fmt.datetime(s.endedAt) : 'open') + '</span></div>';
+      if (s.gitBranch) html += '<div class="row"><span class="k">branch</span><span class="v mono">' + esc(s.gitBranch) + '</span></div>';
+      var sp = (s.sourcePaths || []).length;
+      html += '<div class="row"><span class="k">sources</span><span class="v">' + sp + ' transcript' + (sp === 1 ? '' : 's') + '</span></div>';
+      html += '<div class="sep"></div>';
+      html += '<div class="row"><span class="k">produced</span><span class="v">' + produced.length + (produced.length === 1 ? ' commit' : ' commits') + '</span></div>';
+      if (produced.length) {
+        var sorted = produced.slice().sort(function (a, b) { return (b.confidence || 0) - (a.confidence || 0); });
+        for (var i = 0; i < sorted.length; i++) {
+          var pe = sorted[i];
+          var c = this.commitByHash[pe.commitHash];
+          var subj = c ? String(c.subject || '').slice(0, 38) : '(unknown)';
+          var pct = Math.round((pe.confidence || 0) * 100);
+          html += '<div class="row" style="margin-top:7px"><span class="v">' +
+                  '<span class="drawer-link" data-commit="' + esc(pe.commitHash) + '"><span class="mono">' + esc(fmt.hash(pe.commitHash)) + '</span></span> ' +
+                  esc(subj) + ' <span style="color:var(--text-faint)">· ' + pct + '%</span>' +
+                  '</span></div>';
+        }
+      } else {
+        html += '<div class="row"><span class="v" style="color:var(--text-faint)">This session edited files but matched no commit.</span></div>';
+      }
+      ctx.drawer.show(html);
+      this.wireCommitLinks();
+    },
+
+    openDecision: function (n, noteById) {
+      var ctx = this.ctx, fmt = ctx.fmt, esc = fmt.esc;
+      var html = '<h3>' + esc(String(n.title || '(untitled)')) + '</h3>';
+      html += '<div class="row"><span class="k"></span><span class="v"><span class="kind-badge">' + esc(n.kind || 'decision') + '</span></span></div>';
+      html += '<div class="row"><span class="k">valid</span><span class="v">' + esc(fmt.date(n.validAt)) + '</span></div>';
+      if (n.invalidAt) html += '<div class="row"><span class="k">invalid</span><span class="v">' + esc(fmt.date(n.invalidAt)) + '</span></div>';
+      if (n.body) html += '<div class="quote">' + esc(n.body) + '</div>';
+      var files = n.files || [];
+      if (files.length) {
+        var chips = '';
+        for (var i = 0; i < files.length; i++) chips += '<span class="chip" style="margin:2px 3px 0 0">' + esc(files[i]) + '</span>';
+        html += '<div class="row" style="margin-top:8px"><span class="k">files</span><span class="v">' + chips + '</span></div>';
+      }
+      // supersede 链
+      if (n.supersededBy && noteById && noteById[n.supersededBy]) {
+        html += '<div class="sep"></div>';
+        html += '<div class="row"><span class="k">superseded by</span><span class="v">' + esc(noteById[n.supersededBy].title || n.supersededBy) + '</span></div>';
+      }
+      ctx.drawer.show(html);
+    },
+
+    // drawer 内 session 链接 → 打开对应 session
+    wireSessionLinks: function () {
+      var self = this;
+      var links = document.querySelectorAll('#drawer-body [data-session]');
+      for (var i = 0; i < links.length; i++) {
+        (function (link) {
+          link.addEventListener('click', function () {
+            var s = self.sessionById[link.getAttribute('data-session')];
+            if (s) self.openSession(s);
+          });
+        })(links[i]);
+      }
+    },
+    wireCommitLinks: function () {
+      var self = this;
+      var links = document.querySelectorAll('#drawer-body [data-commit]');
+      for (var i = 0; i < links.length; i++) {
+        (function (link) {
+          link.addEventListener('click', function () {
+            var c = self.commitByHash[link.getAttribute('data-commit')];
+            if (c) self.openCommit(c);
+          });
+        })(links[i]);
+      }
+    },
+  });
+
+  // 把任意 id 变成合法 CSS/选择器片段
+  function cssId(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+})();
 `;

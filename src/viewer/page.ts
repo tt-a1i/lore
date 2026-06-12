@@ -40,6 +40,7 @@ function showCdnError() {
 </script>
 <script src="https://cdn.jsdelivr.net/npm/d3@7" crossorigin="anonymous" onerror="showCdnError()"></script>
 <script>
+window.LORE_VIEWS = [];
 ${VIEWS.map((v) => v.JS).join('\n')}
 ${SHELL_JS}
 </script>

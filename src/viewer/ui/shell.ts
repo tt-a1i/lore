@@ -140,7 +140,8 @@ export const SHELL_CSS = `
 `;
 
 export const SHELL_JS = `
-window.LORE_VIEWS = [];
+// LORE_VIEWS 由组装器在视图脚本之前初始化（视图先注册、shell 后启动）。
+window.LORE_VIEWS = window.LORE_VIEWS || [];
 
 async function bootShell() {
   let payload;
