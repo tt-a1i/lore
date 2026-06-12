@@ -45,6 +45,17 @@ export interface AssistantMessageEvent extends BaseEvent {
   text: string;
 }
 
+/**
+ * diff hunk，行内容保留 +/-/空格 前缀（与 Claude Code toolUseResult.structuredPatch 同构）。
+ */
+export interface PatchHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: string[];
+}
+
 /** 文件编辑——匹配引擎的核心输入。 */
 export interface FileEditEvent extends BaseEvent {
   kind: 'file-edit';
@@ -55,8 +66,26 @@ export interface FileEditEvent extends BaseEvent {
   /** edit 的被替换文本；write（整文件覆盖）为 null。 */
   oldText: string | null;
   newText: string;
+  /**
+   * harness 预计算的 diff（Claude Code: toolUseResult.structuredPatch）。
+   * 有它时匹配引擎优先用它，比从 old/new text 重建更可靠。
+   */
+  patch: PatchHunk[] | null;
+  /** harness 标记的"用户在工具调用前手改过文件"（Claude Code: userModified）。 */
+  userModified: boolean | null;
   /** 对应 tool_result 是否成功；未知为 null。失败的编辑不参与匹配。 */
   succeeded: boolean | null;
+}
+
+/**
+ * session 内发生的 git commit——匹配引擎的 Tier-0 精确锚点。
+ * 来源：Claude Code Bash toolUseResult.gitOperation.commit.sha（短 hash）。
+ * 注意：rebase/squash 会改写 hash，消费方需做前缀匹配 + 找不到时降级到内容匹配。
+ */
+export interface GitCommitEvent extends BaseEvent {
+  kind: 'git-commit';
+  /** 可能是短 hash（7 位）。 */
+  sha: string;
 }
 
 /** shell 执行——commit 动作本身、测试运行等都在这里。 */
@@ -70,6 +99,7 @@ export type LoreEvent =
   | UserMessageEvent
   | AssistantMessageEvent
   | FileEditEvent
+  | GitCommitEvent
   | ShellExecEvent;
 
 export interface ParsedSession {
