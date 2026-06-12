@@ -1,0 +1,5 @@
+{"timestamp":"2026-06-11T07:00:00.000Z","type":"session_meta","payload":{"id":"sess-mm","cwd":"/Users/x/code/myproject","cli_version":"0.138.0-alpha.7"}}
+{"timestamp":"2026-06-11T07:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"first turn"}}
+{"timestamp":"2026-06-11T07:00:02.000Z","type":"compacted","payload":{"message":"","replacement_history":[]}}
+{"timestamp":"2026-06-11T07:00:03.000Z","type":"session_meta","payload":{"id":"sess-mm","cwd":"/some/other/dir","cli_version":"0.139.0"}}
+{"timestamp":"2026-06-11T07:00:04.000Z","type":"event_msg","payload":{"type":"user_message","message":"second turn"}}

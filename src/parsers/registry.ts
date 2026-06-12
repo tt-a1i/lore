@@ -8,9 +8,11 @@
 
 import type { TranscriptParser } from '../schema/events.js';
 import { claudeCodeParser } from './claude-code.js';
+import { codexParser } from './codex.js';
+import { opencodeParser } from './opencode.js';
 
 export const allParsers: TranscriptParser[] = [
   claudeCodeParser,
-  // M4: codexParser（~/.codex/sessions rollout jsonl）
-  // M4: opencodeParser（~/.local/share/opencode/opencode.db，node:sqlite）
+  codexParser,    // M4: ~/.codex/sessions rollout jsonl
+  opencodeParser, // M4: ~/.local/share/opencode/opencode.db，node:sqlite
 ];

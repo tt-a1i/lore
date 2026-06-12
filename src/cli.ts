@@ -9,6 +9,7 @@
  *   lore distill  --repo <path> [--max-sessions N]
  *   lore ask      <question> --repo <path> [--include-superseded] [--json]
  *   lore mcp      --repo <path>
+ *   lore serve    --repo <path> [--port 4017]
  */
 
 import { program } from 'commander';
@@ -44,10 +45,9 @@ export interface LoreReportFile extends RepoMatchReport {
 
 // ── Dynamic imports for sibling modules (implemented by others) ──────────────
 
-async function loadParser(): Promise<TranscriptParser> {
-  const mod = await import('./parsers/claude-code.js');
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-  return mod.parser as TranscriptParser;
+async function loadParsers(): Promise<TranscriptParser[]> {
+  const mod = await import('./parsers/registry.js');
+  return mod.allParsers as TranscriptParser[];
 }
 
 async function loadGitReader(): Promise<GitHistoryReader> {
@@ -270,16 +270,38 @@ async function cmdScan(opts: {
 
   console.log(`\nlore scan: ${repoPath}\n`);
 
-  // 1. Discover transcripts
+  // 1. Discover transcripts — run all registered parsers
   const t1 = now();
-  const parser = await loadParser();
-  const transcriptPaths = await parser.discover(repoPath, { broad: opts.broad === true });
-  console.log(`[discover] found ${transcriptPaths.length} transcripts  ${elapsed(t1)}`);
+  const parsers = await loadParsers();
+  const discoverOpts = { broad: opts.broad === true };
 
-  // 2. Parse concurrently — warn and skip failures
+  // Per-parser discover, collected in parallel
+  const perParserPaths = await Promise.all(
+    parsers.map((p) => p.discover(repoPath, discoverOpts)),
+  );
+
+  const parserCountParts: string[] = [];
+  for (let i = 0; i < parsers.length; i++) {
+    const p = parsers[i]!;
+    const paths = perParserPaths[i]!;
+    parserCountParts.push(`${p.agent}=${paths.length}`);
+  }
+  const totalPaths = perParserPaths.reduce((s, ps) => s + ps.length, 0);
+  console.log(`[discover] found ${totalPaths} transcripts  ${parserCountParts.join(' ')}  ${elapsed(t1)}`);
+
+  // 2. Parse concurrently across all parsers — warn and skip failures
   const t2 = now();
+  // Flatten: (parser, path) pairs
+  const parseJobs: { parser: TranscriptParser; path: string }[] = [];
+  for (let i = 0; i < parsers.length; i++) {
+    const p = parsers[i]!;
+    for (const tp of perParserPaths[i]!) {
+      parseJobs.push({ parser: p, path: tp });
+    }
+  }
+
   const settled = await Promise.allSettled(
-    transcriptPaths.map((p) => parser.parse(p)),
+    parseJobs.map((job) => job.parser.parse(job.path)),
   );
 
   const parseResults: ParseResult[] = [];
@@ -289,10 +311,10 @@ async function cmdScan(opts: {
     if (s.status === 'fulfilled') {
       parseResults.push(s.value);
     } else {
-      console.warn(`[parse] WARN: skipped ${transcriptPaths[i]}: ${String(s.reason)}`);
+      console.warn(`[parse] WARN: skipped ${parseJobs[i]!.path}: ${String(s.reason)}`);
     }
   }
-  console.log(`[parse]    parsed ${parseResults.length}/${transcriptPaths.length} sessions  ${elapsed(t2)}`);
+  console.log(`[parse]    parsed ${parseResults.length}/${totalPaths} sessions  ${elapsed(t2)}`);
 
   // 3. Read git history
   const t3 = now();
@@ -414,7 +436,7 @@ async function cmdSample(opts: {
   }
 
   const sampled = randomSample(pool, Math.min(n, pool.length));
-  const parser = await loadParser();
+  const parsers = await loadParsers();
 
   // Group by sessionId to avoid re-parsing the same file multiple times
   // 按解析单元（candidate.sourcePath）分组——证据上下文必须取自真正包含编辑的文件，
@@ -435,11 +457,18 @@ async function cmdSample(opts: {
       continue;
     }
 
+    // Pick the right parser for this source path by trying each in turn.
     let parseResult: ParseResult | null = null;
-    try {
-      parseResult = await parser.parse(sourcePath);
-    } catch (e) {
-      console.warn(`WARN: failed to re-parse ${sourcePath}: ${String(e)}`);
+    for (const p of parsers) {
+      try {
+        parseResult = await p.parse(sourcePath);
+        break;
+      } catch {
+        // not this parser's format — try the next one
+      }
+    }
+    if (parseResult === null) {
+      console.warn(`WARN: failed to re-parse ${sourcePath} with any known parser`);
     }
 
     for (const match of matches) {
@@ -781,6 +810,21 @@ async function cmdMcp(opts: { repo: string }): Promise<void> {
   // The process will stay alive as long as the transport connection is open.
 }
 
+// ── lore serve ────────────────────────────────────────────────────────────────
+
+async function cmdServe(opts: { repo: string; port?: number }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const port = opts.port ?? 4017;
+
+  const mod = await import('./viewer/server.js');
+  const server = mod.createViewerServer(repoPath);
+  const actualPort = await server.start(port);
+  const url = `http://localhost:${actualPort}`;
+  console.log(`\nlore serve: ${repoPath}`);
+  console.log(`  → ${url}\n`);
+  // Long-lived: stay alive until SIGINT/SIGTERM.
+}
+
 // ── Commander wiring ─────────────────────────────────────────────────────────
 
 program
@@ -910,6 +954,19 @@ program
     // Any startup failure does exit(1) so the MCP host can detect it.
     cmdMcp(opts).catch((e) => {
       process.stderr.write(`[lore-mcp] fatal: ${String(e)}\n`);
+      process.exit(1);
+    });
+  });
+
+program
+  .command('serve')
+  .description('Start the local graph visualisation server (D3 force-directed graph + timeline playback)')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--port <n>', 'port to listen on (default: 4017)', (v) => parseInt(v, 10))
+  .action((opts: { repo: string; port?: number }) => {
+    // lore serve is a long-lived process: no process.exit(0).
+    cmdServe(opts).catch((e) => {
+      console.error('serve failed:', e);
       process.exit(1);
     });
   });
