@@ -21,7 +21,11 @@
  *   编辑时间落在该文件的归因窗口内——
  *   (上一个触碰该文件的 commit 时间, 本 commit 时间 + 2min 时钟容差]。
  *   窗口同时对 authorDate 和 committerDate 计算，取较优（rebase 会让两者漂移）。
- *   窗口外的内容匹配降权而非淘汰（应对 stash/延迟提交）。
+ *   窗口外的内容匹配降权而非淘汰（应对 stash/延迟提交）：
+ *   线性衰减，每超出窗口 1h 扣 1/24，地板 0。
+ *
+ * contentScore 的分母是 commit 侧归一化后的有效 addedLines 总数
+ * （语义："这个 hunk 有多少出自该 session"——commit 是被归因对象）。
  *
  * 已知困难（来自 hive-private 画像，验证阶段重点观察）：
  * 超大 squash commit（最大 429 文件）、单日 107 commit 的密集提交、
@@ -36,6 +40,8 @@ export interface MatchCandidate {
   sessionId: string;
   /** 贡献了内容的 FileEditEvent.seq 列表。 */
   editSeqs: number[];
+  /** 归因路径：sha = Tier-0 精确锚定；content = Tier-1/2 信号匹配。 */
+  matchedVia: 'sha' | 'content';
   /** 0-1，归一化行重叠率。 */
   contentScore: number;
   /** 0-1，时间窗符合度。 */

@@ -1,0 +1,5 @@
+{"type":"user","uuid":"u-0001","parentUuid":null,"sessionId":"sess-bad","cwd":"/Users/x/code/proj","gitBranch":"main","version":"2.1.170","timestamp":"2026-06-01T16:00:00.000Z","isMeta":false,"message":{"role":"user","content":"Fix the bug."}}
+this is not json at all and should be skipped
+{"type":"assistant","uuid":"a-0001","parentUuid":"u-0001","sessionId":"sess-bad","cwd":"/Users/x/code/proj","gitBranch":"main","version":"2.1.170","timestamp":"2026-06-01T16:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll fix the bug now."}],"stop_reason":"end_turn","model":"claude-sonnet-4-5"}}
+{invalid json line: missing quote}
+{"type":"system","subtype":"compact_boundary","sessionId":"sess-bad"}
