@@ -31,6 +31,13 @@ export interface DistilledNote {
   invalidAt: string | null;
   /** 推翻它的 note id。 */
   supersededBy: string | null;
+  /**
+   * 笔记来源（信任分级的依据之一）：
+   * 'distilled' = LLM 离线蒸馏（默认；旧数据缺省此字段视为 distilled）
+   * 'agent'     = agent 在任务中通过 lore_note / lore note 主动记录
+   * 'human'     = 人工录入
+   */
+  source?: 'distilled' | 'agent' | 'human';
 }
 
 /** 喂给蒸馏器的会话摘要包（调用方负责构建，控制 token 量）。 */
@@ -80,4 +87,32 @@ export interface NotesFile {
   /** sessionId → 摘要包内容 hash，用于跳过已蒸馏且未变化的 session。 */
   distilledSessions: Record<string, string>;
   notes: DistilledNote[];
+  /** 最近一次蒸馏运行时间（agent 笔记写入不更新此字段）。 */
+  distilledAt?: string;
+}
+
+/**
+ * NotesStore —— notes.json 的唯一读写入口（蒸馏编排、lore note CLI、
+ * MCP lore_note 共用；杜绝三处各写各的格式漂移）。
+ *
+ * 写路径语义：
+ * - appendNote：分配 id（agent 来源用 `agent-<base36 时间戳>-<4位随机>`），
+ *   validAt=now，source 必填；可选 supersedes（旧 note 打 invalidAt+supersededBy）。
+ * - 防重：同 source='agent' 且 title 完全相同且 invalidAt===null 的既存笔记 →
+ *   更新其 body/files（保 id）而非追加，返回 { updated: true }。
+ * - 并发安全：写前重读文件做合并（last-writer-wins 按 note id），原子写（tmp+rename）。
+ */
+export interface NotesStore {
+  load(repoPath: string): Promise<NotesFile>;
+  appendNote(
+    repoPath: string,
+    note: {
+      kind: NoteKind;
+      title: string;
+      body: string;
+      files?: string[];
+      source: 'agent' | 'human';
+      supersedes?: string;
+    },
+  ): Promise<{ id: string; updated: boolean; superseded: string | null }>;
 }
