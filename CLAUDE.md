@@ -5,17 +5,32 @@
 <!-- lore:start -->
 <!-- This block is managed by `lore init` — do not edit manually. -->
 
-Before editing an unfamiliar file, run:
-```
-npx lore why <file>:<line> --repo .
-```
+**When to use lore (trigger moments):**
 
-Before making a design decision, run:
-```
-npx lore ask "<your question>" --repo .
-```
+1. **Before editing a file changed by another session in the last 30 days** →
+   ```
+   npx lore why <file>:<line> --repo .
+   ```
+
+2. **Before proposing a design decision** →
+   ```
+   npx lore ask "<your question>" --repo .
+   # To check constraints on a specific file:
+   npx lore ask "<question>" --repo . --file <path>
+   ```
+
+3. **After making an important decision, discovering a hard constraint, or rejecting an approach** →
+   ```
+   npx lore note --repo . --kind decision --title "..." --body "..." --source agent
+   npx lore note --repo . --kind constraint --title "..." --body "..." --source agent
+   npx lore note --repo . --kind rejected-approach --title "..." --body "..." --source agent
+   ```
+
+4. **At session start — check data freshness** →
+   ```
+   npx lore status --repo .
+   ```
 
 Distilled constraints in `.lore/notes.json` encode prior decisions — respect them.
-Run `npx lore go --repo .` to rebuild the graph and open the viewer.
 
 <!-- lore:end -->

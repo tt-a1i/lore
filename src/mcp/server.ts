@@ -29,12 +29,36 @@ import { z } from 'zod';
 
 import type { WhyEngine, WhyResult } from '../why/types.js';
 import type { AskEngine, AskResult } from '../ask/types.js';
-import type { GraphStore } from '../graph/types.js';
+import type { GraphStore, SessionNodeData } from '../graph/types.js';
+import type { NotesStore, NotesFile, DistilledNote } from '../distill/types.js';
 
 const execFileAsync = promisify(execFile);
 
 /** Strong-tier floor: attributions at or above this confidence are "trustworthy". */
 const STRONG_FLOOR = 0.8;
+
+/** lore_note abuse guards: a note is a terse留言, not an essay. */
+const NOTE_TITLE_MAX = 120;
+const NOTE_BODY_MAX = 2000;
+
+// ── session sourcePaths slimming ───────────────────────────────────────────────
+
+/**
+ * Slim a session's `sourcePaths` array down to a count + the basename of the
+ * primary (first) source, for token-frugal responses. Full absolute paths cost
+ * tokens and leak the user's home layout while telling the agent nothing it can
+ * act on; `sourceCount` + `primarySource` (basename only) carries the signal.
+ */
+function slimSession(session: SessionNodeData): {
+  sourceCount: number;
+  primarySource: string;
+} {
+  const paths = Array.isArray(session.sourcePaths) ? session.sourcePaths : [];
+  const first = paths[0] ?? '';
+  // basename: last path segment, tolerating both / and \ separators.
+  const primarySource = first ? first.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '' : '';
+  return { sourceCount: paths.length, primarySource };
+}
 
 // ── compact renderers (token-friendly, no ANSI, deterministic) ────────────────
 
@@ -85,7 +109,10 @@ function renderWhyCompact(result: WhyResult, header?: string): string {
   const tier = isWeak ? 'weak' : 'strong';
   parts.push(`confidence:${p.confidence.toFixed(3)}(${tier})`);
 
-  const sessionLine = `session:${p.sessionId.slice(0, 16)} via=${p.matchedVia} lines=${p.matchedLines}`;
+  // sourcePaths slimmed to count + primary basename (token-frugal, no home leak).
+  const slim = slimSession(p.session);
+  const srcSeg = slim.sourceCount > 0 ? ` src=${slim.sourceCount}(${slim.primarySource})` : '';
+  const sessionLine = `session:${p.sessionId.slice(0, 16)} via=${p.matchedVia} lines=${p.matchedLines}${srcSeg}`;
   parts.push(isWeak ? `⚠ LOW-CONFIDENCE ${sessionLine}` : sessionLine);
 
   if (isWeak) {
@@ -115,7 +142,24 @@ function renderWhyCompact(result: WhyResult, header?: string): string {
 }
 
 /**
- * Render AskResult as compact text: top5 notes + top3 message hits.
+ * Map a note's `source` field to a trust marker. Missing source = 'distilled'
+ * (the bi-temporal types.ts law: legacy notes without source are distilled).
+ */
+function sourceMarker(source: DistilledNote['source']): string {
+  return source === 'agent' ? '[agent]' : source === 'human' ? '[human]' : '[distilled]';
+}
+
+/**
+ * Render AskResult as compact text, partitioned into two TRUST ZONES so the
+ * consuming agent never confuses vetted knowledge with raw chatter:
+ *
+ *   DISTILLED KNOWLEDGE (vetted)  — the notes. Each carries a source marker:
+ *     [agent]     recorded live by an agent via lore_note (high intent)
+ *     [distilled] extracted offline by the LLM distiller (default)
+ *     [human]     entered by a person
+ *   RAW CONVERSATION (unvetted)   — message hits, a low-trust fallback. Messages
+ *     show only their RANK (msg1, msg2…), not a raw score, so the agent does not
+ *     read precision into a noisy heuristic number.
  *
  * @param header  Optional freshness header prepended as the first line.
  */
@@ -130,26 +174,34 @@ function renderAskCompact(result: AskResult, header?: string): string {
   }
 
   const topNotes = result.hits.slice(0, 5);
-  for (let i = 0; i < topNotes.length; i++) {
-    const h = topNotes[i]!;
-    const n = h.note;
-    const anchor = n.anchors.length > 0
-      ? `[${n.anchors[0]!.sessionId.slice(0, 8)}+${n.anchors[0]!.seq}]`
-      : '';
-    parts.push(
-      `note${i + 1} kind=${n.kind} score=${h.score.toFixed(3)} ${anchor} ${truncate(n.title, 60)}`
-    );
-    parts.push(`  body:${truncate(n.body, 200)}`);
-    if (n.files.length > 0) {
-      parts.push(`  files:${n.files.slice(0, 3).join(',')}`);
+  if (topNotes.length > 0) {
+    parts.push('── DISTILLED KNOWLEDGE (vetted) ──');
+    for (let i = 0; i < topNotes.length; i++) {
+      const h = topNotes[i]!;
+      const n = h.note;
+      const anchor = n.anchors.length > 0
+        ? `[${n.anchors[0]!.sessionId.slice(0, 8)}+${n.anchors[0]!.seq}]`
+        : '';
+      const marker = sourceMarker(n.source);
+      parts.push(
+        `note${i + 1} ${marker} kind=${n.kind} score=${h.score.toFixed(3)} ${anchor} ${truncate(n.title, 60)}`
+      );
+      parts.push(`  body:${truncate(n.body, 200)}`);
+      if (n.files.length > 0) {
+        parts.push(`  files:${n.files.slice(0, 3).join(',')}`);
+      }
     }
   }
 
   const topMsgs = result.messageHits.slice(0, 3);
-  for (let i = 0; i < topMsgs.length; i++) {
-    const m = topMsgs[i]!;
-    const anchor = `[${m.sessionId.slice(0, 8)}+${m.seq}]`;
-    parts.push(`msg${i + 1} ${anchor} score=${m.score.toFixed(3)} ${truncate(m.text, 200)}`);
+  if (topMsgs.length > 0) {
+    parts.push('── RAW CONVERSATION (unvetted) ──');
+    for (let i = 0; i < topMsgs.length; i++) {
+      const m = topMsgs[i]!;
+      const anchor = `[${m.sessionId.slice(0, 8)}+${m.seq}]`;
+      // Show RANK, not raw score (heuristic; precision would mislead).
+      parts.push(`msg${i + 1} rank=${i + 1} ${anchor} ${truncate(m.text, 200)}`);
+    }
   }
 
   return parts.join('\n');
@@ -250,6 +302,83 @@ async function buildFreshnessHeader(repoPath: string): Promise<string | null> {
   return segs.join(' · ');
 }
 
+/** Fuller report shape for the status block (superset of the header shape). */
+interface ReportStatusShape extends ReportHeaderShape {
+  sessionsSeen?: number;
+  sessionsContributing?: number;
+  window?: { start: string; end: string } | null;
+}
+
+/**
+ * Render the compact lore_status block — a one-shot trust/coverage snapshot the
+ * agent should read FIRST to judge how much to trust the rest of lore. Reuses the
+ * P0 freshness header (coverage / generated / stale) verbatim, then adds:
+ *   - sessions: seen / contributing
+ *   - notes:  total, bucketed by kind and by source
+ *   - distilledAt + window.end (how current the underlying data is)
+ *
+ * Degrades gracefully: a missing report.json or notes.json yields "unknown"
+ * segments rather than an error — the block is always renderable.
+ */
+async function renderStatusBlock(
+  repoPath: string,
+  header: string | undefined,
+  notesFile: NotesFile | null,
+): Promise<string> {
+  const parts: string[] = ['lore_status'];
+  // 1. Freshness header (coverage / generated / stale) — reuse P0 verbatim.
+  parts.push(header ? header : 'coverage:unknown · generated:unknown (no report.json)');
+
+  // 2. Sessions seen / contributing (from report.json).
+  let report: ReportStatusShape | null = null;
+  try {
+    const raw = await fs.readFile(path.join(repoPath, '.lore', 'report.json'), 'utf8');
+    report = JSON.parse(raw) as ReportStatusShape;
+  } catch {
+    report = null;
+  }
+  if (report) {
+    const seen = typeof report.sessionsSeen === 'number' ? report.sessionsSeen : 0;
+    const contributing =
+      typeof report.sessionsContributing === 'number' ? report.sessionsContributing : 0;
+    parts.push(`sessions:seen=${seen} contributing=${contributing}`);
+    const windowEnd =
+      report.window && typeof report.window.end === 'string' ? report.window.end : 'unknown';
+    parts.push(`window.end:${windowEnd}`);
+  } else {
+    parts.push('sessions:unknown');
+    parts.push('window.end:unknown');
+  }
+
+  // 3. Notes bucketed by kind and by source.
+  const notes = notesFile?.notes ?? [];
+  const byKind = new Map<string, number>();
+  const bySource = new Map<string, number>();
+  let valid = 0;
+  for (const n of notes) {
+    if (n.invalidAt === null) valid += 1;
+    byKind.set(n.kind, (byKind.get(n.kind) ?? 0) + 1);
+    // Missing source = distilled (types.ts law).
+    const src = n.source ?? 'distilled';
+    bySource.set(src, (bySource.get(src) ?? 0) + 1);
+  }
+  const kindStr = ['decision', 'constraint', 'rejected-approach']
+    .map((k) => `${k}=${byKind.get(k) ?? 0}`)
+    .join(' ');
+  const srcStr = ['agent', 'distilled', 'human']
+    .map((s) => `${s}=${bySource.get(s) ?? 0}`)
+    .join(' ');
+  parts.push(`notes:total=${notes.length} valid=${valid}`);
+  parts.push(`  byKind:${kindStr}`);
+  parts.push(`  bySource:${srcStr}`);
+
+  // 4. distilledAt (last distill run; agent notes do not update it).
+  const distilledAt = notesFile?.distilledAt ?? 'never';
+  parts.push(`distilledAt:${distilledAt}`);
+
+  return parts.join('\n');
+}
+
 /** git HEAD committer date (ISO), or null if git is unavailable / not a repo. */
 async function headCommitISO(repoPath: string): Promise<string | null> {
   try {
@@ -279,6 +408,7 @@ export function createLoreMcpServer(
     whyEngine?: WhyEngine;
     askEngine?: AskEngine;
     graphStore?: GraphStore;
+    notesStore?: NotesStore;
   },
 ): McpServer {
   const server = new McpServer({
@@ -367,6 +497,14 @@ export function createLoreMcpServer(
           .boolean()
           .optional()
           .describe('Include invalidated/superseded notes (default: false)'),
+        file: z
+          .string()
+          .optional()
+          .describe(
+            'Scope to one file before you change it: returns only the constraints / ' +
+              'decisions attached to this path (repo-relative or absolute, suffix-matched). ' +
+              'Raw conversation hits are omitted when scoped — notes only.',
+          ),
       },
     },
     async (args) => {
@@ -378,10 +516,12 @@ export function createLoreMcpServer(
           const mod = await import('../ask/engine.js') as { engine: AskEngine };
           askEngine = mod.engine;
         }
-        const result = await askEngine.ask(repoPath, args.question, {
+        const askOpts: { topK: number; includeSuperseded: boolean; file?: string } = {
           topK: 5,
           includeSuperseded: args.includeSuperseded ?? false,
-        });
+        };
+        if (args.file !== undefined) askOpts.file = args.file;
+        const result = await askEngine.ask(repoPath, args.question, askOpts);
         const header = await freshnessHeader();
         return { content: [{ type: 'text', text: renderAskCompact(result, header) }] };
       } catch (e) {
@@ -446,6 +586,135 @@ export function createLoreMcpServer(
     },
   );
 
+  // ── notes store loader (shared by lore_note / lore_status) ────────────────────
+
+  async function getNotesStore(): Promise<NotesStore> {
+    if (engines?.notesStore) return engines.notesStore;
+    const mod = (await import('../notes/store.js')) as { notesStore: NotesStore };
+    return mod.notesStore;
+  }
+
+  // ── lore_note ─────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    'lore_note',
+    {
+      description:
+        'Leave a durable note for FUTURE agents. CALL THIS the moment you (a) make a ' +
+        'decision someone will later ask "why?" about, (b) discover a hard constraint that ' +
+        'must not be violated, or (c) reject an approach (record WHY you rejected it). ' +
+        'This is a message in a bottle to whoever touches this code next — it is recorded as ' +
+        'source="agent" (higher trust than offline-distilled notes) and surfaces in lore_ask. ' +
+        'Same-title agent notes are updated in place (no duplicates). Use supersedes to ' +
+        'overturn an earlier note by id (it is marked invalid, not deleted). ' +
+        'Keep it terse: title ≤120 chars, body ≤2000.',
+      inputSchema: {
+        kind: z
+          .enum(['decision', 'constraint', 'rejected-approach'])
+          .describe('decision | constraint | rejected-approach'),
+        title: z.string().describe('One-line summary (≤120 chars)'),
+        body: z
+          .string()
+          .describe('2-4 sentences: what + why. For rejected-approach, state why it was rejected.'),
+        files: z
+          .array(z.string())
+          .optional()
+          .describe('Repo-relative paths this note concerns (helps file-scoped lore_ask)'),
+        supersedes: z
+          .string()
+          .optional()
+          .describe('Id of an earlier note this overturns (it is marked invalid, not deleted)'),
+      },
+    },
+    async (args) => {
+      try {
+        // Abuse guards — fail loudly with guidance rather than store an essay.
+        const title = args.title.trim();
+        const body = args.body.trim();
+        if (title.length === 0) {
+          throw new Error('title is empty — give a one-line summary of the decision/constraint.');
+        }
+        if (title.length > NOTE_TITLE_MAX) {
+          throw new Error(
+            `title too long (${title.length} > ${NOTE_TITLE_MAX}). Tighten it to a single line; ` +
+              'put detail in body.',
+          );
+        }
+        if (body.length === 0) {
+          throw new Error('body is empty — say what the decision is AND why (1 sentence min).');
+        }
+        if (body.length > NOTE_BODY_MAX) {
+          throw new Error(
+            `body too long (${body.length} > ${NOTE_BODY_MAX}). A note is a terse留言, not a doc; ` +
+              'summarise the rationale and link code via files[].',
+          );
+        }
+
+        const store = await getNotesStore();
+        const appendArgs: {
+          kind: typeof args.kind;
+          title: string;
+          body: string;
+          files?: string[];
+          source: 'agent';
+          supersedes?: string;
+        } = { kind: args.kind, title, body, source: 'agent' };
+        if (args.files !== undefined) appendArgs.files = args.files;
+        if (args.supersedes !== undefined) appendArgs.supersedes = args.supersedes;
+        const res = await store.appendNote(repoPath, appendArgs);
+
+        const verb = res.updated ? 'updated' : 'created';
+        const sup = res.superseded ? ` superseded=${res.superseded}` : '';
+        return {
+          content: [
+            { type: 'text', text: `lore_note ${verb} id=${res.id}${sup}` },
+          ],
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `lore_note error: ${msg}` }],
+        };
+      }
+    },
+  );
+
+  // ── lore_status ───────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    'lore_status',
+    {
+      description:
+        'CALL THIS FIRST to judge how much to trust lore here and what it covers. ' +
+        'Returns a compact snapshot: data freshness (generated date + stale flag), commit ' +
+        'coverage, sessions seen vs contributing, note counts bucketed by kind and by source ' +
+        '(agent / distilled / human), the last distill time, and the transcript window end. ' +
+        'If coverage is low or the data is stale, weight lore_ask / lore_why results accordingly.',
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const header = await freshnessHeader();
+        let notesFile: NotesFile | null = null;
+        try {
+          const store = await getNotesStore();
+          notesFile = await store.load(repoPath);
+        } catch {
+          notesFile = null;
+        }
+        const text = await renderStatusBlock(repoPath, header, notesFile);
+        return { content: [{ type: 'text', text }] };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `lore_status error: ${msg}` }],
+        };
+      }
+    },
+  );
+
   return server;
 }
 
@@ -456,5 +725,7 @@ export const __test__ = {
   renderWhyCompact,
   renderAskCompact,
   renderHistoryCompact,
+  renderStatusBlock,
   buildFreshnessHeader,
+  slimSession,
 };

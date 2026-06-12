@@ -158,6 +158,41 @@ function scoreDocument(
   return rawScore / Math.sqrt(docLength);
 }
 
+// ── File filter ─────────────────────────────────────────────────────────────
+
+/**
+ * Decide whether a note's `files[]` contains `target`, tolerating relative vs
+ * absolute path differences via suffix matching.
+ *
+ * Both sides are normalised (backslashes → slashes, leading "./" stripped). A
+ * note file matches when, segment-aligned, one path is a suffix of the other:
+ *   target "src/cli.ts"            ~ note file "/abs/repo/src/cli.ts"  ✓
+ *   target "/abs/repo/src/cli.ts"  ~ note file "src/cli.ts"           ✓
+ *   target "cli.ts"               ~ note file "src/cli.ts"           ✓ (basename-ish suffix)
+ *   target "src/cli.ts"           ~ note file "src/other.ts"         ✗
+ *
+ * Segment alignment (matching on "/"+suffix or full equality) prevents
+ * "li.ts" from matching "cli.ts".
+ */
+function normalizeForMatch(p: string): string {
+  let s = p.replace(/\\/g, '/').trim();
+  if (s.startsWith('./')) s = s.slice(2);
+  return s;
+}
+
+export function noteMatchesFile(noteFiles: string[], target: string): boolean {
+  const t = normalizeForMatch(target);
+  if (!t) return false;
+  for (const raw of noteFiles) {
+    const f = normalizeForMatch(raw);
+    if (!f) continue;
+    if (f === t) return true;
+    // Segment-aligned suffix match in either direction.
+    if (f.endsWith('/' + t) || t.endsWith('/' + f)) return true;
+  }
+  return false;
+}
+
 // ── Notes index ───────────────────────────────────────────────────────────────
 
 const WEIGHT_TITLE = 3;
@@ -362,11 +397,12 @@ class DeterministicAskEngine implements AskEngine {
   async ask(
     repoPath: string,
     question: string,
-    opts?: { topK?: number; includeSuperseded?: boolean },
+    opts?: { topK?: number; includeSuperseded?: boolean; file?: string },
   ): Promise<AskResult> {
     const repo = path.resolve(repoPath);
     const topK = opts?.topK ?? TOP_K_DEFAULT;
     const includeSuperseded = opts?.includeSuperseded ?? false;
+    const fileFilter = opts?.file && opts.file.trim() ? opts.file.trim() : null;
 
     // 1. Tokenise query.
     const queryTokens = tokenize(question);
@@ -388,10 +424,15 @@ class DeterministicAskEngine implements AskEngine {
       // notes.json absent or malformed — degrade to message search only.
     }
 
-    // 3. Filter notes by bi-temporal validity.
-    const filteredNotes = includeSuperseded
+    // 3. Filter notes by bi-temporal validity, then (optionally) by file scope.
+    //    fileFilter limits hits to notes whose files[] contains the target path
+    //    (suffix-tolerant). Notes with no files never match a file-scoped query.
+    let filteredNotes = includeSuperseded
       ? notes
       : notes.filter((n) => n.invalidAt === null);
+    if (fileFilter) {
+      filteredNotes = filteredNotes.filter((n) => noteMatchesFile(n.files, fileFilter));
+    }
 
     // 4. Score notes. Drop sub-threshold (MIN_SCORE) noise. Rank by a
     //    validity-weighted score (valid notes get a 1.5× boost) so a superseded
@@ -400,12 +441,21 @@ class DeterministicAskEngine implements AskEngine {
     const noteHits: { hit: AskHit; rankScore: number }[] = [];
     for (const note of filteredNotes) {
       const score = scoreNote(note, queryTerms);
-      if (score < MIN_SCORE) continue;
+      // file 过滤命中的笔记豁免 MIN_SCORE：文件归属本身就是相关性证据——
+      // "改 X 前查它的约束"场景里，问题词常常不出现在笔记正文。
+      if (score < MIN_SCORE && !fileFilter) continue;
       const rankScore = note.invalidAt === null ? score * VALID_NOTE_WEIGHT : score;
       noteHits.push({ hit: { score, note }, rankScore });
     }
     noteHits.sort((a, b) => b.rankScore - a.rankScore);
     const topNoteHits = noteHits.slice(0, topK).map((x) => x.hit);
+
+    // File-scoped queries skip the raw-message index entirely: messages have no
+    // reliable file attribution, so we cannot filter them by file without either
+    // dropping real hits or leaking off-file noise. Return notes-only.
+    if (fileFilter) {
+      return { question, hits: topNoteHits, messageHits: [] };
+    }
 
     // 5. Load report.json for sessionSourceMap.
     const reportPath = path.join(repo, '.lore', 'report.json');

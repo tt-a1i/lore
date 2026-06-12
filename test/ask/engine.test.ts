@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createAskEngine, tokenize } from '../../src/ask/engine.js';
+import { createAskEngine, tokenize, noteMatchesFile } from '../../src/ask/engine.js';
 import type { DistilledNote, NotesFile } from '../../src/distill/types.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -651,5 +651,133 @@ describe('AskEngine.ask', () => {
     expect(ids).toContain('note-superseded');
     // The valid note must rank first despite identical raw relevance.
     expect(result.hits[0]!.note.id).toBe('note-valid');
+  });
+});
+
+// ── noteMatchesFile unit tests ──────────────────────────────────────────────────
+
+describe('noteMatchesFile (suffix-tolerant path match)', () => {
+  it('exact relative match', () => {
+    expect(noteMatchesFile(['src/cli.ts'], 'src/cli.ts')).toBe(true);
+  });
+
+  it('note absolute, target relative → suffix match', () => {
+    expect(noteMatchesFile(['/abs/repo/src/cli.ts'], 'src/cli.ts')).toBe(true);
+  });
+
+  it('note relative, target absolute → suffix match', () => {
+    expect(noteMatchesFile(['src/cli.ts'], '/abs/repo/src/cli.ts')).toBe(true);
+  });
+
+  it('basename-ish suffix matches', () => {
+    expect(noteMatchesFile(['src/graph/json-store.ts'], 'graph/json-store.ts')).toBe(true);
+  });
+
+  it('strips leading ./ on both sides', () => {
+    expect(noteMatchesFile(['./src/cli.ts'], './src/cli.ts')).toBe(true);
+  });
+
+  it('different file in same dir does NOT match', () => {
+    expect(noteMatchesFile(['src/other.ts'], 'src/cli.ts')).toBe(false);
+  });
+
+  it('partial-segment is NOT a match (li.ts !~ cli.ts)', () => {
+    expect(noteMatchesFile(['src/cli.ts'], 'li.ts')).toBe(false);
+  });
+
+  it('empty inputs do not match', () => {
+    expect(noteMatchesFile([], 'src/cli.ts')).toBe(false);
+    expect(noteMatchesFile(['src/cli.ts'], '')).toBe(false);
+  });
+});
+
+// ── file-scoped ask (engine integration) ────────────────────────────────────────
+
+describe('AskEngine file filter', () => {
+  it('returns only notes whose files[] contains the target path', async () => {
+    const repo = makeRepo();
+    const notes: DistilledNote[] = [
+      makeNote({
+        id: 'note-cli',
+        title: 'CLI must keep --json output pure on stdout',
+        body: 'Progress lines go to stderr so --json stays machine-parseable.',
+        files: ['src/cli.ts'],
+      }),
+      makeNote({
+        id: 'note-graph',
+        title: 'Graph store must keep --json output pure',
+        body: 'Same pure --json output rule but for the graph layer.',
+        files: ['src/graph/kuzu-store.ts'],
+      }),
+    ];
+    writeNotesJson(repo, notes);
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'pure json output', { file: 'src/cli.ts' });
+
+    const ids = result.hits.map((h) => h.note.id);
+    expect(ids).toContain('note-cli');
+    expect(ids).not.toContain('note-graph');
+  });
+
+  it('tolerates absolute target path against relative note files', async () => {
+    const repo = makeRepo();
+    writeNotesJson(repo, [
+      makeNote({
+        id: 'note-cli',
+        title: 'CLI json purity',
+        body: 'Keep stdout clean for json mode.',
+        files: ['src/cli.ts'],
+      }),
+    ]);
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'json purity', {
+      file: `${repo}/src/cli.ts`,
+    });
+    expect(result.hits.map((h) => h.note.id)).toContain('note-cli');
+  });
+
+  it('skips raw message hits when a file is specified (notes-only)', async () => {
+    const repo = makeRepo();
+    writeNotesJson(repo, [
+      makeNote({
+        id: 'note-cli',
+        title: 'CLI json purity constraint',
+        body: 'Keep stdout clean for the parser command.',
+        files: ['src/cli.ts'],
+      }),
+    ]);
+    // A transcript whose user message would otherwise match "parser".
+    const sid = 'sess-msg';
+    const tp = writeTranscript(repo, sid, [
+      'please fix the parser command so the json output stays clean',
+    ]);
+    writeReportJson(repo, { [sid]: tp });
+
+    const engine = createAskEngine();
+    const scoped = await engine.ask(repo, 'parser json output', { file: 'src/cli.ts' });
+    expect(scoped.messageHits).toEqual([]);
+    expect(scoped.hits.map((h) => h.note.id)).toContain('note-cli');
+
+    // Without the file filter, the same query DOES surface the raw message.
+    const unscoped = await engine.ask(repo, 'parser json output');
+    expect(unscoped.messageHits.length).toBeGreaterThan(0);
+  });
+
+  it('notes with no files never match a file-scoped query', async () => {
+    const repo = makeRepo();
+    writeNotesJson(repo, [
+      makeNote({
+        id: 'note-nofiles',
+        title: 'A global decision about json purity',
+        body: 'Applies everywhere, attached to no specific file.',
+        files: [],
+      }),
+    ]);
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'json purity', { file: 'src/cli.ts' });
+    expect(result.hits).toEqual([]);
   });
 });

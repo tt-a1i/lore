@@ -128,9 +128,11 @@ describe('injectLoreSection', () => {
     expect(content).toContain('npx lore ask');
   });
 
-  it('section contains npx lore go usage hint', () => {
+  it('section contains session-start status trigger (v2 replaces bare lore go hint)', () => {
+    // v2 guidance rewrites the section with specific trigger moments;
+    // lore status --repo . is the session-start hint (step 4).
     const { content } = injectLoreSection('');
-    expect(content).toContain('npx lore go');
+    expect(content).toContain('npx lore status');
   });
 
   it('section contains the ## lore heading', () => {

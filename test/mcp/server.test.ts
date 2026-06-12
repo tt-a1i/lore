@@ -28,7 +28,7 @@ import type {
   CommitNodeData,
   EditedEdgeData,
 } from '../../src/graph/types.js';
-import type { DistilledNote } from '../../src/distill/types.js';
+import type { DistilledNote, NotesStore, NotesFile } from '../../src/distill/types.js';
 
 // ── Fixture builders ──────────────────────────────────────────────────────────
 
@@ -179,6 +179,28 @@ function mockGraphStore(
   };
 }
 
+/**
+ * Spy NotesStore: records appendNote calls and returns a canned result.
+ * load() returns a fixed NotesFile so lore_status can be exercised in-memory.
+ */
+function spyNotesStore(opts?: {
+  appendResult?: { id: string; updated: boolean; superseded: string | null } | Error;
+  loadResult?: NotesFile;
+}): NotesStore & { calls: Parameters<NotesStore['appendNote']>[1][] } {
+  const calls: Parameters<NotesStore['appendNote']>[1][] = [];
+  const store: NotesStore & { calls: typeof calls } = {
+    calls,
+    load: async () =>
+      opts?.loadResult ?? { schemaVersion: 1, distilledSessions: {}, notes: [] },
+    appendNote: async (_repo, note) => {
+      calls.push(note);
+      if (opts?.appendResult instanceof Error) throw opts.appendResult;
+      return opts?.appendResult ?? { id: 'agent-xyz-0001', updated: false, superseded: null };
+    },
+  };
+  return store;
+}
+
 // ── Test harness: wire McpServer ↔ Client via InMemoryTransport ───────────────
 
 async function makeClientServer(
@@ -186,6 +208,7 @@ async function makeClientServer(
     whyEngine?: WhyEngine;
     askEngine?: AskEngine;
     graphStore?: GraphStore;
+    notesStore?: NotesStore;
   },
   repoPath = '/fake/repo',
 ): Promise<{ client: Client; cleanup: () => Promise<void> }> {
@@ -393,7 +416,11 @@ describe('lore_ask', () => {
       });
 
       const text = (result.content as { type: string; text: string }[])[0]!.text;
-      expect(text).toContain('0.720');
+      // Raw message hits now render under the "RAW CONVERSATION (unvetted)" zone
+      // and show RANK, not a raw score (heuristic precision would mislead).
+      expect(text).toContain('RAW CONVERSATION (unvetted)');
+      expect(text).toContain('msg1 rank=1');
+      expect(text).not.toContain('0.720'); // raw message score is no longer surfaced
       expect(text).toContain('Please implement the config parser with YAML');
     } finally {
       await cleanup();
@@ -457,6 +484,61 @@ describe('lore_ask', () => {
       const text = (result.content as { type: string; text: string }[])[0]!.text;
       expect(text).toContain('lore_ask error');
       expect(text).toContain('notes.json not found');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('renders two trust zones with source markers', async () => {
+    const agentNote = makeNote('sess1#0');
+    agentNote.source = 'agent';
+    agentNote.title = 'Agent-recorded constraint';
+    const distilledNote = makeNote('sess1#1');
+    // no source → distilled
+    distilledNote.title = 'Distilled decision';
+    const result: AskResult = {
+      question: 'config approach',
+      hits: [
+        { score: 0.9, note: agentNote },
+        { score: 0.8, note: distilledNote },
+      ],
+      messageHits: [
+        { sessionId: 'session-abc123', seq: 7, text: 'raw chatter about config', score: 0.5 },
+      ],
+    };
+    const { client, cleanup } = await makeClientServer({ askEngine: mockAskEngine(result) });
+    try {
+      const r = await client.callTool({ name: 'lore_ask', arguments: { question: 'config approach' } });
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('DISTILLED KNOWLEDGE (vetted)');
+      expect(text).toContain('RAW CONVERSATION (unvetted)');
+      expect(text).toContain('[agent]');
+      expect(text).toContain('[distilled]');
+      // The agent note must appear before the distilled note (zone ordering preserved).
+      expect(text.indexOf('[agent]')).toBeLessThan(text.indexOf('[distilled]'));
+      // Raw message renders with rank, not score.
+      expect(text).toContain('rank=1');
+      expect(text).not.toContain('0.500');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('file parameter is passed through to the engine', async () => {
+    let capturedOpts: { file?: string } | undefined;
+    const spyEngine: AskEngine = {
+      ask: async (_repo, _q, opts) => {
+        capturedOpts = opts;
+        return makeAskResult();
+      },
+    };
+    const { client, cleanup } = await makeClientServer({ askEngine: spyEngine });
+    try {
+      await client.callTool({
+        name: 'lore_ask',
+        arguments: { question: 'constraints', file: 'src/cli.ts' },
+      });
+      expect(capturedOpts?.file).toBe('src/cli.ts');
     } finally {
       await cleanup();
     }
@@ -593,7 +675,7 @@ describe('lore_history', () => {
 // ── tool listing ──────────────────────────────────────────────────────────────
 
 describe('server tool listing', () => {
-  it('advertises exactly three tools', async () => {
+  it('advertises exactly five tools', async () => {
     const { client, cleanup } = await makeClientServer({
       whyEngine: mockWhyEngine(makeWhyResult()),
       askEngine: mockAskEngine(makeAskResult()),
@@ -602,7 +684,13 @@ describe('server tool listing', () => {
     try {
       const { tools } = await client.listTools();
       const names = tools.map((t) => t.name).sort();
-      expect(names).toEqual(['lore_ask', 'lore_history', 'lore_why']);
+      expect(names).toEqual([
+        'lore_ask',
+        'lore_history',
+        'lore_note',
+        'lore_status',
+        'lore_why',
+      ]);
     } finally {
       await cleanup();
     }
@@ -880,5 +968,228 @@ describe('freshnessHeader', () => {
     } finally {
       await cleanup();
     }
+  });
+});
+
+// ── lore_note tests ─────────────────────────────────────────────────────────────
+
+describe('lore_note', () => {
+  it('happy path: forwards to NotesStore with source="agent" and confirms id', async () => {
+    const store = spyNotesStore({ appendResult: { id: 'agent-abc-0001', updated: false, superseded: null } });
+    const { client, cleanup } = await makeClientServer({ notesStore: store });
+    try {
+      const r = await client.callTool({
+        name: 'lore_note',
+        arguments: {
+          kind: 'constraint',
+          title: 'Keep --json output pure on stdout',
+          body: 'Progress goes to stderr so machine consumers can parse --json.',
+          files: ['src/cli.ts'],
+        },
+      });
+      expect(r.isError).toBeFalsy();
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('lore_note created');
+      expect(text).toContain('agent-abc-0001');
+      // source is fixed to 'agent' regardless of input.
+      expect(store.calls).toHaveLength(1);
+      expect(store.calls[0]!.source).toBe('agent');
+      expect(store.calls[0]!.kind).toBe('constraint');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('reports updated + superseded id when the store says so', async () => {
+    const store = spyNotesStore({
+      appendResult: { id: 'agent-abc-0002', updated: true, superseded: 'sess1#3' },
+    });
+    const { client, cleanup } = await makeClientServer({ notesStore: store });
+    try {
+      const r = await client.callTool({
+        name: 'lore_note',
+        arguments: {
+          kind: 'decision',
+          title: 'Switch graph backend to JSON',
+          body: 'Kuzu native binding is fragile; JSON store is the new default.',
+          supersedes: 'sess1#3',
+        },
+      });
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('lore_note updated');
+      expect(text).toContain('superseded=sess1#3');
+      expect(store.calls[0]!.supersedes).toBe('sess1#3');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('rejects an over-long title with guidance (store not called)', async () => {
+    const store = spyNotesStore();
+    const { client, cleanup } = await makeClientServer({ notesStore: store });
+    try {
+      const r = await client.callTool({
+        name: 'lore_note',
+        arguments: {
+          kind: 'decision',
+          title: 'x'.repeat(121),
+          body: 'valid body',
+        },
+      });
+      expect(r.isError).toBe(true);
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('title too long');
+      expect(store.calls).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('rejects an over-long body with guidance (store not called)', async () => {
+    const store = spyNotesStore();
+    const { client, cleanup } = await makeClientServer({ notesStore: store });
+    try {
+      const r = await client.callTool({
+        name: 'lore_note',
+        arguments: {
+          kind: 'decision',
+          title: 'fine',
+          body: 'y'.repeat(2001),
+        },
+      });
+      expect(r.isError).toBe(true);
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('body too long');
+      expect(store.calls).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('error path: store throws → isError=true with message', async () => {
+    const store = spyNotesStore({ appendResult: new Error('disk full') });
+    const { client, cleanup } = await makeClientServer({ notesStore: store });
+    try {
+      const r = await client.callTool({
+        name: 'lore_note',
+        arguments: { kind: 'decision', title: 'ok', body: 'ok body' },
+      });
+      expect(r.isError).toBe(true);
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('lore_note error');
+      expect(text).toContain('disk full');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ── lore_status tests ───────────────────────────────────────────────────────────
+
+describe('lore_status', () => {
+  function statusNotesFile(): NotesFile {
+    return {
+      schemaVersion: 1,
+      distilledSessions: { 'sess-1': 'h' },
+      distilledAt: '2026-06-11T09:00:00.000Z',
+      notes: [
+        makeNote('sess-1#0'), // decision, no source → distilled
+        { ...makeNote('sess-1#1'), kind: 'constraint', source: 'agent' },
+        { ...makeNote('sess-1#2'), kind: 'decision', invalidAt: '2026-06-11T00:00:00.000Z' },
+      ],
+    };
+  }
+
+  it('renders coverage + sessions + note buckets + distilledAt + window.end', async () => {
+    const dir = makeRepoWithReport({
+      generatedAt: '2026-06-12T09:00:00.000Z',
+      commitsTotal: 24,
+      commitsMatchedStrong: 20,
+      commitsMatchedWeak: 0,
+      sessionsSeen: 218,
+      sessionsContributing: 2,
+      window: { start: '2026-06-10T06:33:22.201Z', end: '2026-06-12T10:31:12.604Z' },
+    });
+    const store = spyNotesStore({ loadResult: statusNotesFile() });
+    const { client, cleanup } = await makeClientServer({ notesStore: store }, dir);
+    try {
+      const r = await client.callTool({ name: 'lore_status', arguments: {} });
+      expect(r.isError).toBeFalsy();
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('coverage:20/24');
+      expect(text).toContain('generated:2026-06-12');
+      expect(text).toContain('sessions:seen=218 contributing=2');
+      expect(text).toContain('window.end:2026-06-12T10:31:12.604Z');
+      expect(text).toContain('notes:total=3 valid=2');
+      expect(text).toContain('decision=2');
+      expect(text).toContain('constraint=1');
+      expect(text).toContain('agent=1');
+      expect(text).toContain('distilled=2');
+      expect(text).toContain('distilledAt:2026-06-11T09:00:00.000Z');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('degrades gracefully when report.json is absent', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lore-mcp-nostatus-'));
+    headerTmpDirs.push(dir);
+    mkdirSync(join(dir, '.lore'), { recursive: true });
+    const store = spyNotesStore({ loadResult: { schemaVersion: 1, distilledSessions: {}, notes: [] } });
+    const { client, cleanup } = await makeClientServer({ notesStore: store }, dir);
+    try {
+      const r = await client.callTool({ name: 'lore_status', arguments: {} });
+      expect(r.isError).toBeFalsy();
+      const text = (r.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('notes:total=0 valid=0');
+      expect(text).toContain('distilledAt:never');
+      expect(text).toContain('window.end:unknown');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ── sourcePaths slimming ─────────────────────────────────────────────────────────
+
+describe('session sourcePaths slimming', () => {
+  it('slimSession returns count + basename of primary source', () => {
+    const slim = __test__.slimSession({
+      id: 's', agent: 'claude-code', startedAt: '', endedAt: null,
+      cwd: null, gitBranch: null,
+      sourcePaths: [
+        '/Users/dev/.claude/projects/repo/main-transcript.jsonl',
+        '/Users/dev/.claude/projects/repo/sub-agent.jsonl',
+      ],
+    });
+    expect(slim.sourceCount).toBe(2);
+    expect(slim.primarySource).toBe('main-transcript.jsonl');
+  });
+
+  it('empty sourcePaths → count 0, empty basename', () => {
+    const slim = __test__.slimSession({
+      id: 's', agent: 'claude-code', startedAt: '', endedAt: null,
+      cwd: null, gitBranch: null, sourcePaths: [],
+    });
+    expect(slim.sourceCount).toBe(0);
+    expect(slim.primarySource).toBe('');
+  });
+
+  it('renderWhyCompact surfaces src=count(basename), never the full absolute path', () => {
+    const text = __test__.renderWhyCompact(makeWhyResult());
+    // The full home path must not leak.
+    expect(text).not.toContain('/Users/dev/.claude/projects/repo/transcript.jsonl');
+    // The slim form must be present (1 source, basename transcript.jsonl).
+    expect(text).toContain('src=1(transcript.jsonl)');
+  });
+
+  it('renderWhyCompact is shorter than it would be with the full sourcePaths array', () => {
+    const slimText = __test__.renderWhyCompact(makeWhyResult());
+    // Reconstruct what the verbose form would have cost: the full path string.
+    const fullPath = '/Users/dev/.claude/projects/repo/transcript.jsonl';
+    const slimSeg = 'src=1(transcript.jsonl)';
+    // The slim segment is materially shorter than embedding the full path.
+    expect(slimSeg.length).toBeLessThan(fullPath.length);
+    expect(slimText).toContain(slimSeg);
   });
 });

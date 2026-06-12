@@ -35,7 +35,7 @@ import { renderReport } from './report/markdown.js';
 import type { GraphStore } from './graph/types.js';
 import type { WhyEngine, WhyOptions, WhyResult, WhyAttribution } from './why/types.js';
 import type { AskEngine, AskResult } from './ask/types.js';
-import type { Distiller } from './distill/types.js';
+import type { Distiller, NotesStore, NoteKind } from './distill/types.js';
 
 // ── Report file schema (extends RepoMatchReport with operational metadata) ───
 
@@ -104,6 +104,12 @@ async function loadDistiller(): Promise<Distiller> {
   const mod = await import('./distill/claude-cli.js');
   // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
   return mod.distiller as Distiller;
+}
+
+async function loadNotesStore(): Promise<NotesStore> {
+  const mod = await import('./notes/store.js');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+  return mod.notesStore as NotesStore;
 }
 
 async function loadDistillOrchestrate(): Promise<{
@@ -223,18 +229,33 @@ export function injectLoreSection(existing: string): { content: string; injected
     MARKER_START,
     '<!-- This block is managed by `lore init` — do not edit manually. -->',
     '',
-    'Before editing an unfamiliar file, run:',
-    '```',
-    'npx lore why <file>:<line> --repo .',
-    '```',
+    '**When to use lore (trigger moments):**',
     '',
-    'Before making a design decision, run:',
-    '```',
-    "npx lore ask \"<your question>\" --repo .",
-    '```',
+    '1. **Before editing a file changed by another session in the last 30 days** →',
+    '   ```',
+    '   npx lore why <file>:<line> --repo .',
+    '   ```',
+    '',
+    '2. **Before proposing a design decision** →',
+    '   ```',
+    '   npx lore ask "<your question>" --repo .',
+    '   # To check constraints on a specific file:',
+    '   npx lore ask "<question>" --repo . --file <path>',
+    '   ```',
+    '',
+    '3. **After making an important decision, discovering a hard constraint, or rejecting an approach** →',
+    '   ```',
+    '   npx lore note --repo . --kind decision --title "..." --body "..." --source agent',
+    '   npx lore note --repo . --kind constraint --title "..." --body "..." --source agent',
+    '   npx lore note --repo . --kind rejected-approach --title "..." --body "..." --source agent',
+    '   ```',
+    '',
+    '4. **At session start — check data freshness** →',
+    '   ```',
+    '   npx lore status --repo .',
+    '   ```',
     '',
     'Distilled constraints in `.lore/notes.json` encode prior decisions — respect them.',
-    'Run `npx lore go --repo .` to rebuild the graph and open the viewer.',
     '',
     MARKER_END,
   ].join('\n');
@@ -545,11 +566,18 @@ async function cmdScan(opts: {
   broad?: boolean;
   graph?: boolean;
   quiet?: boolean;
+  json?: boolean;
 }): Promise<ScanResult> {
   const repoPath = path.resolve(opts.repo);
   const t0 = now();
 
-  if (!opts.quiet) console.log(`\n${blue('▶')} lore scan: ${repoPath}\n`);
+  // When --json: all progress lines go to stderr so stdout stays pure JSON.
+  const progress = opts.json
+    ? (msg: string) => process.stderr.write(msg + '\n')
+    : (msg: string) => { if (!opts.quiet) console.log(msg); };
+  const progressWarn = (msg: string) => process.stderr.write(msg + '\n');
+
+  progress(`\n${blue('▶')} lore scan: ${repoPath}\n`);
 
   // 1. Discover transcripts — run all registered parsers
   const t1 = now();
@@ -568,7 +596,7 @@ async function cmdScan(opts: {
     parserCountParts.push(`${p.agent}=${paths.length}`);
   }
   const totalPaths = perParserPaths.reduce((s, ps) => s + ps.length, 0);
-  if (!opts.quiet) console.log(`${green('✓')} [discover] found ${totalPaths} transcripts  ${dim(parserCountParts.join(' '))}  ${dim(elapsed(t1))}`);
+  progress(`${green('✓')} [discover] found ${totalPaths} transcripts  ${dim(parserCountParts.join(' '))}  ${dim(elapsed(t1))}`);
 
   // 2. Parse concurrently across all parsers — warn and skip failures
   const t2 = now();
@@ -592,10 +620,10 @@ async function cmdScan(opts: {
     if (s.status === 'fulfilled') {
       parseResults.push(s.value);
     } else {
-      console.warn(`[parse] WARN: skipped ${parseJobs[i]!.path}: ${String(s.reason)}`);
+      progressWarn(`[parse] WARN: skipped ${parseJobs[i]!.path}: ${String(s.reason)}`);
     }
   }
-  if (!opts.quiet) console.log(`${green('✓')} [parse]    parsed ${parseResults.length}/${totalPaths} sessions  ${dim(elapsed(t2))}`);
+  progress(`${green('✓')} [parse]    parsed ${parseResults.length}/${totalPaths} sessions  ${dim(elapsed(t2))}`);
 
   // 3. Read git history
   const t3 = now();
@@ -606,14 +634,14 @@ async function cmdScan(opts: {
   };
   if (opts.maxCommits !== undefined) historyOpts.maxCommits = opts.maxCommits;
   const commits = await gitReader.readHistory(repoPath, historyOpts);
-  if (!opts.quiet) console.log(`${green('✓')} [git]      read ${commits.length} commits  ${dim(elapsed(t3))}`);
+  progress(`${green('✓')} [git]      read ${commits.length} commits  ${dim(elapsed(t3))}`);
 
   // 4. Run match engine
   const t4 = now();
   const engine = await loadMatchEngine();
   const sessions = parseResults.map((r) => r.session);
   const report: RepoMatchReport = engine.match(repoPath, commits, sessions);
-  if (!opts.quiet) console.log(`${green('✓')} [match]    produced ${report.matches.length} candidates  ${dim(elapsed(t4))}`);
+  progress(`${green('✓')} [match]    produced ${report.matches.length} candidates  ${dim(elapsed(t4))}`);
 
   // 5. Build extended report file
   const sessionSourceMap: Record<string, string> = {};
@@ -638,15 +666,16 @@ async function cmdScan(opts: {
   await writeLoreGitignore(loreDir);
   const reportPath = path.join(loreDir, 'report.json');
   await fs.writeFile(reportPath, JSON.stringify(loreReport, null, 2), 'utf8');
-  if (!opts.quiet) console.log(`\n${green('✓')} [write]    ${reportPath}  ${dim(elapsed(t0) + ' total')}\n`);
+  progress(`\n${green('✓')} [write]    ${reportPath}  ${dim(elapsed(t0) + ' total')}\n`);
 
-  // 7. Print human summary
-  if (!opts.quiet) console.log(renderReport(report));
+  // 7. Print human summary (skipped in --json mode)
+  if (!opts.json) progress(renderReport(report));
 
   // 8. Build graph (skipped with --no-graph)
   let nodeCount = 0;
   let edgeCount = 0;
   let graphBuilt = false;
+  let graphBackend: 'kuzu' | 'json' | null = null;
 
   if (opts.graph !== false) {
     const tg = now();
@@ -660,6 +689,7 @@ async function cmdScan(opts: {
       // createGraphStore 内部已 init。
       const store: GraphStore = await createStore(repoPath);
       await store.rebuild(graphData);
+      graphBackend = store.backend;
       await store.close();
 
       nodeCount =
@@ -672,12 +702,29 @@ async function cmdScan(opts: {
         graphData.edited.length;
       graphBuilt = true;
 
-      if (!opts.quiet) console.log(
+      progress(
         `${green('✓')} [graph]    nodes=${nodeCount} edges=${edgeCount} backend=${store.backend}  ${dim(elapsed(tg))}`,
       );
     } catch (e) {
-      console.error(`${yellow('⚠')} [graph]    graph build failed (${String(e)})`);
+      progressWarn(`${yellow('⚠')} [graph]    graph build failed (${String(e)})`);
     }
+  }
+
+  // 9. JSON output (stdout pure)
+  if (opts.json) {
+    const jsonOut = {
+      schemaVersion: 1,
+      generatedAt: report.generatedAt,
+      commitsTotal: report.commitsTotal,
+      strong: report.commitsMatchedStrong,
+      weak: report.commitsMatchedWeak,
+      window: report.window,
+      inWindow: report.commitsInWindow,
+      graph: graphBuilt
+        ? { nodes: nodeCount, edges: edgeCount, backend: graphBackend }
+        : null,
+    };
+    console.log(JSON.stringify(jsonOut, null, 2));
   }
 
   return { report, nodeCount, edgeCount, graphBuilt };
@@ -689,6 +736,7 @@ async function cmdSample(opts: {
   repo: string;
   n: string;
   tier?: string;
+  json?: boolean;
 }): Promise<void> {
   const repoPath = path.resolve(opts.repo);
   const n = parseInt(opts.n, 10);
@@ -722,7 +770,11 @@ async function cmdSample(opts: {
   }
 
   if (pool.length === 0) {
-    console.log(`No matches found${tier ? ` for tier "${tier}"` : ''}.`);
+    if (opts.json) {
+      console.log(JSON.stringify({ schemaVersion: 1, matches: [] }, null, 2));
+    } else {
+      console.log(`No matches found${tier ? ` for tier "${tier}"` : ''}.`);
+    }
     return;
   }
 
@@ -738,6 +790,52 @@ async function cmdSample(opts: {
     const arr = bySource.get(src) ?? [];
     arr.push(m);
     bySource.set(src, arr);
+  }
+
+  if (opts.json) {
+    // In JSON mode, collect structured results and emit once
+    const jsonMatches: object[] = [];
+    for (const [sourcePath, matches] of bySource) {
+      if (!sourcePath) continue;
+      let parseResult: ParseResult | null = null;
+      for (const p of parsers) {
+        try { parseResult = await p.parse(sourcePath); break; } catch { /* try next */ }
+      }
+      for (const match of matches) {
+        const excerpts: object[] = [];
+        if (parseResult) {
+          const { events } = parseResult.session;
+          const editSeqSet = new Set(match.editSeqs);
+          const editEvents = events.filter((e) => e.kind === 'file-edit' && editSeqSet.has(e.seq));
+          for (const editEvt of editEvents) {
+            const idx = events.findIndex((e) => e.seq === editEvt.seq);
+            if (idx === -1) continue;
+            for (let i = idx - 1; i >= 0; i--) {
+              const e = events[i];
+              if (!e) continue;
+              if (e.kind === 'user-message' || e.kind === 'assistant-message') {
+                excerpts.push({ seq: e.seq, role: e.kind === 'user-message' ? 'user' : 'assistant', text: truncate(e.text.trim(), 300) });
+                break;
+              }
+            }
+          }
+        }
+        jsonMatches.push({
+          commitHash: match.commitHash,
+          filePath: match.filePath,
+          sessionId: match.sessionId,
+          confidence: match.confidence,
+          tier: tierOf(match.confidence),
+          matchedVia: match.matchedVia,
+          matchedLines: match.matchedLines,
+          sourcePath,
+          evidence: match.evidence,
+          excerpts,
+        });
+      }
+    }
+    console.log(JSON.stringify({ schemaVersion: 1, matches: jsonMatches }, null, 2));
+    return;
   }
 
   console.log(`\n# lore sample — ${sampled.length} match(es) from ${repoPath}\n`);
@@ -925,7 +1023,32 @@ async function cmdWhy(
   const whyOpts: WhyOptions = {
     includeWeak: opts.includeWeak === true,
   };
-  const result = await whyEngine.why(repoPath, file, line, whyOpts);
+
+  let result: WhyResult;
+  try {
+    result = await whyEngine.why(repoPath, file, line, whyOpts);
+  } catch (e) {
+    const msg = String(e);
+    // Map common git-blame failures to actionable guidance messages.
+    if (/no such path/i.test(msg) || /does not exist/i.test(msg) || /unknown revision/i.test(msg)) {
+      console.error(
+        `${red('Error:')} file not found in HEAD — use a repo-relative path like src/x.ts\n` +
+        `  Received: ${file}`,
+      );
+    } else if (/bad line range/i.test(msg) || /invalid.*line/i.test(msg) || /out of range/i.test(msg)) {
+      // Try to extract file line count from error message for a better hint.
+      const countMatch = /(\d+)\s+lines?/i.exec(msg);
+      const hint = countMatch ? ` (file has ${countMatch[1]} lines)` : '';
+      console.error(
+        `${red('Error:')} line ${line} out of range${hint} — use a valid line number\n` +
+        `  File: ${file}`,
+      );
+    } else {
+      // msg 可能已带 "Error: " 前缀（如底层 execFile 错误），剥掉避免双前缀。
+      console.error(`${red('Error:')} ${msg.replace(/^Error:\s*/i, '')}`);
+    }
+    process.exit(1);
+  }
 
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -964,7 +1087,21 @@ async function cmdHistory(
   await store.init();
 
   try {
-    const history = await store.fileHistory(relPath);
+    let history: { commit: import('./graph/types.js').CommitNodeData; produced: import('./graph/types.js').ProducedInfo[] }[];
+    try {
+      history = await store.fileHistory(relPath);
+    } catch (e) {
+      const msg = String(e);
+      if (/no such path/i.test(msg) || /does not exist/i.test(msg) || /not found/i.test(msg)) {
+        console.error(
+          `${red('Error:')} file not found in HEAD — use a repo-relative path like src/x.ts\n` +
+          `  Received: ${relPath}`,
+        );
+      } else {
+        console.error(`${red('Error:')} ${msg}`);
+      }
+      process.exit(1);
+    }
 
     if (opts.json) {
       console.log(JSON.stringify(history, null, 2));
@@ -982,9 +1119,11 @@ async function cmdHistory(
 async function cmdDistill(opts: {
   repo: string;
   maxSessions?: number;
+  json?: boolean;
 }): Promise<void> {
   const repoPath = path.resolve(opts.repo);
-  console.log(`\nlore distill: ${repoPath}\n`);
+  if (!opts.json) console.log(`\nlore distill: ${repoPath}\n`);
+  else process.stderr.write(`lore distill: ${repoPath}\n`);
 
   const distiller = await loadDistiller();
   const available = await distiller.available();
@@ -1001,6 +1140,11 @@ async function cmdDistill(opts: {
   const distillOpts: { distiller: Distiller; maxSessions?: number } = { distiller };
   if (opts.maxSessions !== undefined) distillOpts.maxSessions = opts.maxSessions;
   const stats = await orchestrate.runDistill(repoPath, distillOpts);
+
+  if (opts.json) {
+    console.log(JSON.stringify({ schemaVersion: 1, ...stats }, null, 2));
+    return;
+  }
 
   console.log(`\ndistill complete:`);
   console.log(`  distilled:         ${stats.distilled}`);
@@ -1038,7 +1182,8 @@ export function renderAskResult(result: AskResult): string {
         ? `  [${n.anchors[0]!.sessionId.slice(0, 8)}+${n.anchors[0]!.seq}]`
         : '';
       lines.push('');
-      lines.push(`  [${i + 1}] ${n.kind}  score=${h.score.toFixed(3)}${anchor}`);
+      const src = n.source && n.source !== 'distilled' ? `  [${n.source}]` : '';
+      lines.push(`  [${i + 1}] ${n.kind}${src}  score=${h.score.toFixed(3)}${anchor}`);
       lines.push(`      ${n.title}`);
       lines.push(`      ${n.body}`);
       if (n.files.length > 0) {
@@ -1068,7 +1213,7 @@ export function renderAskResult(result: AskResult): string {
 
 async function cmdAsk(
   question: string,
-  opts: { repo: string; includeSuperseded?: boolean; json?: boolean },
+  opts: { repo: string; includeSuperseded?: boolean; json?: boolean; file?: string },
 ): Promise<void> {
   const repoPath = path.resolve(opts.repo);
 
@@ -1077,10 +1222,12 @@ async function cmdAsk(
 
   const askEngine = await loadAskEngine();
 
-  const result = await askEngine.ask(repoPath, question, {
+  const askOpts: { topK: number; includeSuperseded: boolean; file?: string } = {
     topK: 5,
     includeSuperseded: opts.includeSuperseded === true,
-  });
+  };
+  if (opts.file) askOpts.file = opts.file;
+  const result = await askEngine.ask(repoPath, question, askOpts);
 
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -1244,6 +1391,451 @@ async function cmdInit(opts: { repo: string }): Promise<void> {
   console.log('');
 }
 
+// ── lore note ────────────────────────────────────────────────────────────────
+
+async function cmdNote(opts: {
+  repo: string;
+  kind: string;
+  title: string;
+  body: string;
+  files?: string;
+  supersedes?: string;
+  source?: string;
+  json?: boolean;
+}): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+
+  // Validate kind
+  const validKinds: NoteKind[] = ['decision', 'constraint', 'rejected-approach'];
+  if (!validKinds.includes(opts.kind as NoteKind)) {
+    console.error(
+      `${red('Error:')} --kind must be one of: ${validKinds.join(', ')}\n  Got: ${opts.kind}`,
+    );
+    process.exit(1);
+  }
+  const kind = opts.kind as NoteKind;
+
+  // Validate source
+  const source: 'agent' | 'human' = opts.source === 'agent' ? 'agent' : 'human';
+
+  // Parse files list
+  const files = opts.files ? opts.files.split(',').map((f) => f.trim()).filter(Boolean) : [];
+
+  const store = await loadNotesStore();
+  const appendArgs: {
+    kind: NoteKind;
+    title: string;
+    body: string;
+    files: string[];
+    source: 'agent' | 'human';
+    supersedes?: string;
+  } = { kind, title: opts.title, body: opts.body, files, source };
+  if (opts.supersedes !== undefined) appendArgs.supersedes = opts.supersedes;
+  const result = await store.appendNote(repoPath, appendArgs);
+
+  if (opts.json) {
+    console.log(JSON.stringify({
+      schemaVersion: 1,
+      id: result.id,
+      updated: result.updated,
+      superseded: result.superseded,
+    }, null, 2));
+    return;
+  }
+
+  const action = result.updated ? 'updated' : 'added';
+  const superMsg = result.superseded ? `  supersedes: ${result.superseded}` : '';
+  console.log(`${green('✓')} note ${action}: ${result.id}  [${kind}]  source=${source}${superMsg}`);
+}
+
+// ── lore status ───────────────────────────────────────────────────────────────
+
+/**
+ * Render a status card for `lore status`.
+ * Pure function — exported for testing.
+ */
+export function renderStatusCard(opts: {
+  repoPath: string;
+  report: {
+    generatedAt: string;
+    commitsTotal: number;
+    commitsMatchedStrong: number;
+    commitsMatchedWeak: number;
+    commitsInWindow: number;
+    strongInWindow: number;
+    weakInWindow: number;
+    window: { start: string; end: string } | null;
+    sessionsSeen: number;
+  };
+  notesFile: {
+    notes: { kind: string; source?: string; invalidAt: string | null }[];
+    distilledAt?: string;
+  } | null;
+  headTime: string | null;
+  nowMs: number;
+}): string {
+  const { repoPath, report, notesFile, headTime, nowMs } = opts;
+  const lines: string[] = [];
+
+  const generatedMs = Date.parse(report.generatedAt);
+  const ageMs = nowMs - generatedMs;
+  const FOUR_H = 4 * 60 * 60 * 1000;
+  let freshnessLabel: string;
+  let isStale = false;
+
+  if (isNaN(generatedMs)) {
+    freshnessLabel = 'unknown';
+    isStale = true;
+  } else {
+    const headNewer = headTime ? Date.parse(headTime) > generatedMs : false;
+    isStale = ageMs > FOUR_H || headNewer;
+    if (isStale) {
+      freshnessLabel = `stale  (run: lore scan --repo ${repoPath})`;
+    } else {
+      const mins = Math.floor(ageMs / 60_000);
+      freshnessLabel = mins < 60
+        ? `fresh  (${mins}m ago)`
+        : `fresh  (${(ageMs / 3_600_000).toFixed(1)}h ago)`;
+    }
+  }
+
+  lines.push('');
+  lines.push(`lore status: ${repoPath}`);
+  lines.push('');
+  lines.push(`  generated   ${report.generatedAt.slice(0, 19).replace('T', ' ')}`);
+  lines.push(`  freshness   ${freshnessLabel}`);
+  if (headTime) {
+    lines.push(`  HEAD        ${headTime.slice(0, 19).replace('T', ' ')}`);
+  }
+  lines.push('');
+
+  // Coverage
+  const inWindowPct = report.commitsInWindow > 0
+    ? (((report.strongInWindow + report.weakInWindow) / report.commitsInWindow) * 100).toFixed(1)
+    : '0.0';
+  lines.push(`  coverage    ${inWindowPct}% in-window  (${report.strongInWindow} strong + ${report.weakInWindow} weak / ${report.commitsInWindow} commits)`);
+  lines.push(`  sessions    ${report.sessionsSeen} seen`);
+  lines.push(`  commits     ${report.commitsTotal} total  /  ${report.commitsMatchedStrong} strong  ${report.commitsMatchedWeak} weak`);
+  if (report.window) {
+    lines.push(`  window      ${report.window.start.slice(0, 10)} → ${report.window.end.slice(0, 10)}`);
+  }
+
+  // Notes breakdown
+  lines.push('');
+  if (!notesFile) {
+    lines.push(`  notes       0  (no notes.json — run: lore distill --repo ${repoPath})`);
+  } else {
+    const activeNotes = notesFile.notes.filter((n) => n.invalidAt === null);
+    const byKind = new Map<string, number>();
+    const bySource = new Map<string, number>();
+    for (const n of activeNotes) {
+      byKind.set(n.kind, (byKind.get(n.kind) ?? 0) + 1);
+      const src = n.source ?? 'distilled';
+      bySource.set(src, (bySource.get(src) ?? 0) + 1);
+    }
+    const kindStr = Array.from(byKind.entries()).map(([k, v]) => `${k}=${v}`).join(' ');
+    const srcStr = Array.from(bySource.entries()).map(([k, v]) => `${k}=${v}`).join(' ');
+    lines.push(`  notes       ${activeNotes.length} active (${notesFile.notes.length} total)`);
+    if (kindStr) lines.push(`              by kind:    ${kindStr}`);
+    if (srcStr) lines.push(`              by source:  ${srcStr}`);
+    if (notesFile.distilledAt) {
+      lines.push(`  distilledAt ${notesFile.distilledAt.slice(0, 19).replace('T', ' ')}`);
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n');
+}
+
+async function cmdStatus(opts: { repo: string; json?: boolean }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+
+  // Read report.json — if missing, give actionable guidance rather than a stack trace.
+  const reportPath = path.join(repoPath, '.lore', 'report.json');
+  let report: LoreReportFile;
+  try {
+    const raw = await fs.readFile(reportPath, 'utf8');
+    report = JSON.parse(raw) as LoreReportFile;
+  } catch {
+    if (opts.json) {
+      console.log(JSON.stringify({
+        schemaVersion: 1,
+        status: 'no-report',
+        message: `run-scan-first: lore scan --repo ${repoPath}`,
+      }, null, 2));
+    } else {
+      console.log(
+        `\n${yellow('⚠')}  No lore data found for: ${repoPath}\n\n` +
+        `  To get started, run:\n` +
+        `    ${bold(`lore scan --repo ${repoPath}`)}\n` +
+        `\n  Or for a one-step scan + viewer:\n` +
+        `    ${bold(`lore go --repo ${repoPath}`)}\n`,
+      );
+    }
+    return;
+  }
+
+  // Read notes.json — optional, absence is fine.
+  type NotesFileSummary = {
+    notes: { kind: string; source?: string; invalidAt: string | null }[];
+    distilledAt?: string;
+  };
+  const notesPath = path.join(repoPath, '.lore', 'notes.json');
+  let notesFile: NotesFileSummary | null = null;
+  try {
+    const raw = await fs.readFile(notesPath, 'utf8');
+    notesFile = JSON.parse(raw) as NotesFileSummary;
+  } catch {
+    // Missing notes.json is not an error — distill hasn't run yet.
+  }
+
+  // Read HEAD commit time — best effort.
+  let headTime: string | null = null;
+  try {
+    const { execFile: execFileCb } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFileCb);
+    const { stdout } = await execFileAsync('git', ['-C', repoPath, 'log', '-1', '--format=%cI'], { encoding: 'utf8' });
+    headTime = stdout.trim() || null;
+  } catch {
+    // git not available — skip.
+  }
+
+  if (opts.json) {
+    const generatedMs = Date.parse(report.generatedAt);
+    const FOUR_H = 4 * 60 * 60 * 1000;
+    const headNewer = headTime ? Date.parse(headTime) > generatedMs : false;
+    const isStale = isNaN(generatedMs) || Date.now() - generatedMs > FOUR_H || headNewer;
+
+    const activeNotes = notesFile?.notes.filter((n) => n.invalidAt === null) ?? [];
+    const byKind: Record<string, number> = {};
+    const bySource: Record<string, number> = {};
+    for (const n of activeNotes) {
+      byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
+      const src = n.source ?? 'distilled';
+      bySource[src] = (bySource[src] ?? 0) + 1;
+    }
+
+    console.log(JSON.stringify({
+      schemaVersion: 1,
+      status: isStale ? 'stale' : 'fresh',
+      generatedAt: report.generatedAt,
+      headCommitTime: headTime,
+      coverage: {
+        commitsTotal: report.commitsTotal,
+        strong: report.commitsMatchedStrong,
+        weak: report.commitsMatchedWeak,
+        inWindow: report.commitsInWindow,
+        strongInWindow: report.strongInWindow,
+        weakInWindow: report.weakInWindow,
+        window: report.window,
+      },
+      sessions: report.sessionsSeen,
+      notes: {
+        total: notesFile?.notes.length ?? 0,
+        active: activeNotes.length,
+        byKind,
+        bySource,
+        distilledAt: notesFile?.distilledAt ?? null,
+      },
+    }, null, 2));
+    return;
+  }
+
+  console.log(renderStatusCard({
+    repoPath,
+    report,
+    notesFile,
+    headTime,
+    nowMs: Date.now(),
+  }));
+}
+
+// ── lore hook install/uninstall ───────────────────────────────────────────────
+
+/**
+ * Read a Claude Code settings.json (tolerates missing file → returns {}).
+ * Returns { data, raw } where raw is the original file text (for diagnostics).
+ * Throws if the file exists but cannot be JSON-parsed.
+ */
+async function readSettingsJson(settingsPath: string): Promise<{
+  data: Record<string, unknown>;
+  existed: boolean;
+}> {
+  try {
+    const raw = await fs.readFile(settingsPath, 'utf8');
+    try {
+      return { data: JSON.parse(raw) as Record<string, unknown>, existed: true };
+    } catch {
+      throw new Error(`${settingsPath}: JSON parse failed — aborting to avoid corruption`);
+    }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { data: {}, existed: false };
+    }
+    throw e;
+  }
+}
+
+/** Atomic write: write to tmp then rename. */
+async function writeSettingsJson(settingsPath: string, data: unknown): Promise<void> {
+  const tmp = settingsPath + '.lore-tmp-' + Date.now().toString(36);
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  await fs.rename(tmp, settingsPath);
+}
+
+/** The command string injected into Stop hooks. */
+function hookCommand(repoPath: string): string {
+  return `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
+}
+
+interface HookEntry {
+  type: string;
+  command: string;
+}
+
+interface HookMatcher {
+  matcher: string;
+  hooks: HookEntry[];
+}
+
+async function cmdHookInstall(opts: { repo: string; global?: boolean }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const command = hookCommand(repoPath);
+
+  // Determine settings file path.
+  let settingsPath: string;
+  if (opts.global) {
+    const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
+    if (!homeDir) {
+      console.error(`${red('Error:')} cannot determine home directory for --global flag`);
+      process.exit(1);
+    }
+    settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  } else {
+    settingsPath = path.join(repoPath, '.claude', 'settings.json');
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    const result = await readSettingsJson(settingsPath);
+    data = result.data;
+  } catch (e) {
+    console.error(`${red('Error:')} ${String(e)}`);
+    process.exit(1);
+  }
+
+  // Navigate to hooks.Stop — create if absent, leave other keys intact.
+  if (typeof data['hooks'] !== 'object' || data['hooks'] === null) {
+    data['hooks'] = {};
+  }
+  const hooks = data['hooks'] as Record<string, unknown>;
+
+  if (!Array.isArray(hooks['Stop'])) {
+    hooks['Stop'] = [];
+  }
+  const stopHooks = hooks['Stop'] as HookMatcher[];
+
+  // Check if an identical command already exists anywhere in Stop hooks.
+  const alreadyExists = stopHooks.some(
+    (matcher) => Array.isArray(matcher.hooks) && matcher.hooks.some((h) => h.command === command),
+  );
+
+  if (alreadyExists) {
+    console.log(`${dim('–')} hook already installed in: ${settingsPath}`);
+    console.log(`  (same command found — no changes made)`);
+    return;
+  }
+
+  // Append a new matcher entry.
+  stopHooks.push({
+    matcher: '',
+    hooks: [{ type: 'command', command }],
+  });
+
+  // Ensure directory exists.
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  try {
+    await writeSettingsJson(settingsPath, data);
+  } catch (e) {
+    console.error(`${red('Error:')} failed to write ${settingsPath}: ${String(e)}`);
+    process.exit(1);
+  }
+
+  console.log(`${green('✓')} hook installed: ${settingsPath}`);
+  console.log(`  Every Claude Code session ending will now auto-refresh lore data for:`);
+  console.log(`  ${repoPath}`);
+}
+
+async function cmdHookUninstall(opts: { repo: string; global?: boolean }): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+  const command = hookCommand(repoPath);
+
+  let settingsPath: string;
+  if (opts.global) {
+    const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
+    if (!homeDir) {
+      console.error(`${red('Error:')} cannot determine home directory for --global flag`);
+      process.exit(1);
+    }
+    settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  } else {
+    settingsPath = path.join(repoPath, '.claude', 'settings.json');
+  }
+
+  let data: Record<string, unknown>;
+  let existed: boolean;
+  try {
+    const result = await readSettingsJson(settingsPath);
+    data = result.data;
+    existed = result.existed;
+  } catch (e) {
+    console.error(`${red('Error:')} ${String(e)}`);
+    process.exit(1);
+  }
+
+  if (!existed) {
+    console.log(`${dim('–')} settings file not found: ${settingsPath}  (nothing to remove)`);
+    return;
+  }
+
+  const hooksObj = data['hooks'];
+  if (typeof hooksObj !== 'object' || hooksObj === null || !Array.isArray((hooksObj as Record<string, unknown>)['Stop'])) {
+    console.log(`${dim('–')} no Stop hooks found in: ${settingsPath}  (nothing to remove)`);
+    return;
+  }
+
+  const stopHooks = (hooksObj as Record<string, unknown>)['Stop'] as HookMatcher[];
+  let removed = 0;
+
+  const filtered = stopHooks
+    .map((matcher) => {
+      if (!Array.isArray(matcher.hooks)) return matcher;
+      const filteredHooks = matcher.hooks.filter((h) => {
+        if (h.command === command) { removed++; return false; }
+        return true;
+      });
+      return { ...matcher, hooks: filteredHooks };
+    })
+    .filter((matcher) => matcher.hooks.length > 0);
+
+  if (removed === 0) {
+    console.log(`${dim('–')} hook not found in: ${settingsPath}  (nothing to remove)`);
+    return;
+  }
+
+  (data['hooks'] as Record<string, unknown>)['Stop'] = filtered;
+  try {
+    await writeSettingsJson(settingsPath, data);
+  } catch (e) {
+    console.error(`${red('Error:')} failed to write ${settingsPath}: ${String(e)}`);
+    process.exit(1);
+  }
+
+  console.log(`${green('✓')} hook removed from: ${settingsPath}`);
+  console.log(`  Auto-refresh for ${repoPath} is now disabled.`);
+}
+
 // ── Commander wiring ─────────────────────────────────────────────────────────
 
 program
@@ -1301,7 +1893,8 @@ program
   .option('--max-commits <n>', 'limit git history to N commits', (v) => parseInt(v, 10))
   .option('--broad', 'scan ALL local transcripts, not just this repo\'s project dir (catches worktree sessions)')
   .option('--no-graph', 'skip graph build after scan')
-  .action((opts: { repo: string; maxCommits?: number; broad?: boolean; graph?: boolean }) => {
+  .option('--json', 'output structured JSON to stdout (progress goes to stderr)')
+  .action((opts: { repo: string; maxCommits?: number; broad?: boolean; graph?: boolean; json?: boolean }) => {
     cmdScan(opts).then(
       // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
@@ -1319,7 +1912,8 @@ program
   .requiredOption('--repo <path>', 'path to the git repository')
   .requiredOption('-n <num>', 'number of matches to sample')
   .option('--tier <tier>', 'filter by tier: strong | weak')
-  .action((opts: { repo: string; n: string; tier?: string }) => {
+  .option('--json', 'output structured JSON (MatchCandidate[] + excerpts) to stdout')
+  .action((opts: { repo: string; n: string; tier?: string; json?: boolean }) => {
     cmdSample(opts).then(
       // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
@@ -1376,7 +1970,8 @@ program
   .description('Distil conversations into semantic notes (Decision/Constraint/RejectedApproach) using the claude CLI')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--max-sessions <n>', 'limit distillation to N sessions', (v) => parseInt(v, 10))
-  .action((opts: { repo: string; maxSessions?: number }) => {
+  .option('--json', 'output RunDistillStats as JSON to stdout')
+  .action((opts: { repo: string; maxSessions?: number; json?: boolean }) => {
     cmdDistill(opts).then(
       // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
@@ -1394,14 +1989,91 @@ program
   .argument('<question>', 'natural-language question about the codebase')
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--include-superseded', 'include invalidated/superseded notes in results')
+  .option('--file <path>', 'only return notes attached to this file (e.g. before editing it)')
   .option('--json', 'output raw AskResult as JSON instead of human-readable text')
-  .action((question: string, opts: { repo: string; includeSuperseded?: boolean; json?: boolean }) => {
+  .action((question: string, opts: { repo: string; includeSuperseded?: boolean; json?: boolean; file?: string }) => {
     cmdAsk(question, opts).then(
       // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
       // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
       () => process.exit(0),
       (e) => {
         console.error(red('ask failed:'), e);
+        process.exit(1);
+      },
+    );
+  });
+
+program
+  .command('note')
+  .description('Manually record a Decision, Constraint, or RejectedApproach note to .lore/notes.json')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .requiredOption('--kind <kind>', 'note kind: decision | constraint | rejected-approach')
+  .requiredOption('--title <text>', 'one-sentence title (≤80 chars)')
+  .requiredOption('--body <text>', '2-4 sentence body explaining the why')
+  .option('--files <paths>', 'comma-separated repo-relative file paths')
+  .option('--supersedes <id>', 'id of the note this supersedes')
+  .option('--source <source>', 'source: agent | human (default: human)', 'human')
+  .option('--json', 'output {schemaVersion, id, updated, superseded} as JSON')
+  .action((opts: {
+    repo: string; kind: string; title: string; body: string;
+    files?: string; supersedes?: string; source?: string; json?: boolean;
+  }) => {
+    cmdNote(opts).then(
+      () => process.exit(0),
+      (e) => {
+        console.error(red('note failed:'), e);
+        process.exit(1);
+      },
+    );
+  });
+
+program
+  .command('status')
+  .description('Show lore data freshness, coverage, and notes summary for a repo')
+  .option('--repo <path>', 'path to the git repository (default: cwd)', '.')
+  .option('--json', 'output structured status JSON')
+  .action((opts: { repo: string; json?: boolean }) => {
+    cmdStatus(opts).then(
+      () => process.exit(0),
+      (e) => {
+        console.error(red('status failed:'), e);
+        process.exit(1);
+      },
+    );
+  });
+
+const hookCmd = program
+  .command('hook')
+  .description('Manage Claude Code Stop hooks that auto-refresh lore data at session end');
+
+hookCmd
+  .command('install')
+  .description(
+    'Inject a Claude Code Stop hook into <repo>/.claude/settings.json ' +
+    '(or ~/.claude/settings.json with --global). Idempotent — safe to run multiple times.',
+  )
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--global', 'install into ~/.claude/settings.json instead of <repo>/.claude/settings.json')
+  .action((opts: { repo: string; global?: boolean }) => {
+    cmdHookInstall(opts).then(
+      () => process.exit(0),
+      (e) => {
+        console.error(red('hook install failed:'), e);
+        process.exit(1);
+      },
+    );
+  });
+
+hookCmd
+  .command('uninstall')
+  .description('Remove the lore Stop hook from settings.json (reverse of hook install)')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--global', 'remove from ~/.claude/settings.json instead of <repo>/.claude/settings.json')
+  .action((opts: { repo: string; global?: boolean }) => {
+    cmdHookUninstall(opts).then(
+      () => process.exit(0),
+      (e) => {
+        console.error(red('hook uninstall failed:'), e);
         process.exit(1);
       },
     );

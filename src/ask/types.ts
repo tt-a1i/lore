@@ -26,5 +26,18 @@ export interface AskResult {
 }
 
 export interface AskEngine {
-  ask(repoPath: string, question: string, opts?: { topK?: number; includeSuperseded?: boolean }): Promise<AskResult>;
+  ask(
+    repoPath: string,
+    question: string,
+    opts?: {
+      topK?: number;
+      includeSuperseded?: boolean;
+      /**
+       * 文件过滤（可选）。提供时：note 命中被限定为其 files[] 含该路径的笔记
+       * （后缀匹配，容忍相对/绝对路径差异）；原始 message 命中整体跳过
+       * （消息没有可靠的文件归属，无法过滤而不误伤）。用于「改某文件前查它的约束」。
+       */
+      file?: string;
+    },
+  ): Promise<AskResult>;
 }
