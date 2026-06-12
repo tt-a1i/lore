@@ -47,6 +47,16 @@ export function buildPage(): string {
   .node-decision polygon { fill: #d2a679; stroke: #f0b27a; stroke-width: 1.5; cursor: pointer; }
   .node-decision polygon:hover { fill: #f0b27a; }
 
+  /* 缩小视图时隐藏 commit/file 标签，只留 session 标签做地标 */
+  .zoom-layer.zoomed-out .node-commit .node-label,
+  .zoom-layer.zoomed-out .node-file .node-label { display: none; }
+  #legend {
+    position: absolute; left: 12px; bottom: 56px; z-index: 5;
+    background: #161b22cc; border: 1px solid #30363d; border-radius: 8px;
+    padding: 8px 12px; font-size: 11px; color: #8b949e; line-height: 20px;
+    backdrop-filter: blur(4px);
+  }
+  #legend .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
   .node-label {
     fill: #c9d1d9; font-size: 9px; pointer-events: none; user-select: none;
     text-shadow: 0 1px 2px #0008;
@@ -90,6 +100,12 @@ export function buildPage(): string {
   }
   #play-btn:hover { background: #30363d; }
 
+  #isolated-toggle {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  #isolated-toggle:hover { background: #30363d; }
+  #isolated-toggle.active { border-color: #388bfd; color: #388bfd; }
   #file-toggle {
     background: #21262d; border: 1px solid #30363d; border-radius: 4px;
     color: #8b949e; cursor: pointer; padding: 3px 10px; font-size: 11px;
@@ -117,6 +133,7 @@ export function buildPage(): string {
     <span class="tag" id="stats-tag"></span>
     <span style="flex:1"></span>
     <button id="file-toggle">Show all files</button>
+    <button id="isolated-toggle">Show unlinked commits</button>
   </div>
   <div id="main">
     <div id="graph-area">
@@ -126,6 +143,13 @@ export function buildPage(): string {
       </div>
       <div id="loading">Loading graph…</div>
       <svg id="graph"></svg>
+      <div id="legend">
+        <div><span class="sw" style="background:#58a6ff;border-radius:50%"></span>Session</div>
+        <div><span class="sw" style="background:#56d364;border-radius:2px"></span>Commit（颜色越深越早）</div>
+        <div><span class="sw" style="background:#8b949e;border-radius:50%;width:7px;height:7px"></span>File</div>
+        <div><span class="sw" style="background:#d29922;transform:rotate(45deg)"></span>Decision（半透明=已被推翻）</div>
+        <div><span class="sw" style="background:none;border-top:2px solid #58a6ff;height:0;vertical-align:3px"></span>PRODUCED（粗细∝置信度）</div>
+      </div>
     </div>
     <div id="detail" class="empty">Click a node to inspect it</div>
   </div>
@@ -200,6 +224,17 @@ function initGraph(payload) {
     });
   }
 
+  // ── Isolated-node toggle（默认隐藏无边孤点）───────────────────────────────────
+  let showIsolated = false;
+  const isolatedToggleBtn = document.getElementById('isolated-toggle');
+  isolatedToggleBtn.addEventListener('click', () => {
+    showIsolated = !showIsolated;
+    isolatedToggleBtn.classList.toggle('active', showIsolated);
+    isolatedToggleBtn.textContent = showIsolated ? 'Hide unlinked commits' : 'Show unlinked commits';
+    hasAutoFitted = false; // 重新自适应
+    rebuildGraph();
+  });
+
   // Attributed file paths (touched by a commit that has a PRODUCED edge)
   const attributedFileSet = new Set();
   const producedCommitSet = new Set(graph.produced.map(p => p.commitHash));
@@ -213,7 +248,31 @@ function initGraph(payload) {
   const height = svg.node().clientHeight || 600;
 
   const zoomG = svg.append('g').attr('class', 'zoom-layer');
-  svg.call(d3.zoom().scaleExtent([0.1, 5]).on('zoom', e => zoomG.attr('transform', e.transform)));
+  // 标签降噪：缩放级别低于阈值时隐藏 commit 标签（726 个 hash 全显是噪音）。
+  const zoomBehavior = d3.zoom().scaleExtent([0.05, 5]).on('zoom', e => {
+    zoomG.attr('transform', e.transform);
+    zoomG.classed('zoomed-out', e.transform.k <= 1.1);
+  });
+  svg.call(zoomBehavior);
+  zoomG.classed('zoomed-out', true);
+
+  /**
+   * 布局稳定后把图缩放平移到视口内。
+   * 用 5–95 分位边界而非 min/max：没有可见边的孤立节点会被斥力甩到极远处，
+   * min/max 会让主簇缩成一个点。
+   */
+  function zoomToFit(nodes) {
+    if (!nodes.length) return;
+    const xs = nodes.map(n => n.x).sort((a, b) => a - b);
+    const ys = nodes.map(n => n.y).sort((a, b) => a - b);
+    const q = (arr, p) => arr[Math.min(arr.length - 1, Math.max(0, Math.floor(p * arr.length)))];
+    const x0 = q(xs, 0.05), x1 = q(xs, 0.95), y0 = q(ys, 0.05), y1 = q(ys, 0.95);
+    const pad = 60;
+    const k = Math.min(2.5, 0.95 * Math.min(width / (x1 - x0 + pad * 2), height / (y1 - y0 + pad * 2)));
+    const tx = width / 2 - k * (x0 + x1) / 2;
+    const ty = height / 2 - k * (y0 + y1) / 2;
+    svg.transition().duration(450).call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
+  }
 
   const linkLayer = zoomG.append('g').attr('class', 'links');
   const nodeLayer = zoomG.append('g').attr('class', 'nodes');
@@ -354,8 +413,6 @@ function initGraph(payload) {
       nodeMap.set(n.id, n);
     }
 
-    const nodes = Array.from(nodeMap.values());
-
     // Build edge list
     const links = [];
 
@@ -394,6 +451,22 @@ function initGraph(payload) {
         links.push({ type: 'decision', source: src, target: tgt, data: note });
       }
     }
+
+    // 默认只看"有故事"的子图：无任何边的孤立节点（多为未归因 commit）
+    // 会被斥力推成星环噪音。showIsolated 开关收纳它们。
+    if (!showIsolated) {
+      const connected = new Set();
+      for (const l of links) { connected.add(l.source.id); connected.add(l.target.id); }
+      for (const [id, n] of nodeMap) {
+        if (!connected.has(id) && n.type !== 'session') nodeMap.delete(id);
+      }
+      for (let i = links.length - 1; i >= 0; i--) {
+        const l = links[i];
+        if (!nodeMap.has(l.source.id) || !nodeMap.has(l.target.id)) links.splice(i, 1);
+      }
+    }
+
+    const nodes = Array.from(nodeMap.values());
 
     // ── Commit color by time ───────────────────────────────────────────────────
     const dateExtent = d3.extent(
@@ -512,8 +585,15 @@ function initGraph(payload) {
           .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
           .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
         nodeSel.attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
+        // 力仿真冷却后再自适应视口（早了节点还在漂移，fit 完就跑偏）。一次性。
+        if (!hasAutoFitted && simulation.alpha() < 0.1) {
+          hasAutoFitted = true;
+          zoomToFit(nodes);
+        }
       });
   }
+
+  let hasAutoFitted = false;
 
   // ── Initial build ─────────────────────────────────────────────────────────────
   rebuildGraph();

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "lore-viewer",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "src/cli.ts", "serve", "--repo", "/Users/tushaokun/code/hive-private", "--port", "4017"],
+      "port": 4017
+    }
+  ]
+}
