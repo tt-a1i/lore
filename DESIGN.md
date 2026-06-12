@@ -5,13 +5,18 @@
 > 本里程碑只做地基：**transcript ↔ commit 匹配引擎，并在真实仓库上验证准确率**。
 > 匹配准确率不达标，上层一切（图谱、why、MCP）都不成立。
 
-## 愿景速览（后续里程碑）
+## 愿景速览（里程碑状态，2026-06-12 全部完成）
 
 1. ✅ M1：Claude Code parser + 匹配引擎 + 准确率报告（本文档）
-2. M2：骨架图谱（Session/Commit/File，Kuzu 嵌入式）+ `lore why <file>:<line>`
-3. M3：语义层蒸馏（Decision/Constraint/RejectedApproach，双时间模型）+ MCP server
-4. M4：Codex / OpenCode parser；D3 图谱 viewer + 时间轴回放
-5. 存储与 git-ai notes 标准兼容；脱敏后 refs 共享
+2. ✅ M2：骨架图谱（GraphStore 适配器：JSON 默认 / Kuzu 实验）+ `lore why` + `lore history`
+3. ✅ M3：语义层蒸馏（Decision/Constraint/RejectedApproach，双时间模型）+ `lore ask` + MCP server
+4. ✅ M4：Codex / OpenCode parser；D3 图谱 viewer + 时间轴回放（`lore serve`）
+5. Next：存储与 git-ai notes 标准兼容；脱敏后 refs 共享；embedding 检索后端；代码存活率加权
+
+> Kuzu 后端注记：kuzu 0.11.3 Node 绑定的 NAPI 终结器在父对象销毁后 GC 时
+> flaky SIGSEGV（已逐层规避：await close / UNWIND 批量 / 字面量注入消灭
+> PreparedStatement），但无法在 JS 侧根治，故默认 JSON 后端（同接口同语义），
+> `LORE_GRAPH_BACKEND=kuzu` 启用实验后端，`npm run test:kuzu` 独立进程跑行为测试。
 
 ## M1 模块划分
 
