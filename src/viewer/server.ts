@@ -251,7 +251,8 @@ export function createViewerServer(repoPath: string): ViewerServer {
     async start(port: number): Promise<number> {
       return new Promise((resolve, reject) => {
         const server = http.createServer(async (req, res) => {
-          const url = req.url ?? '/';
+          // 只按 pathname 路由——query string（如 ?intro=1 演示后门）不参与匹配。
+          const url = (req.url ?? '/').split('?')[0] ?? '/';
 
           try {
             if (url === '/' || url === '/index.html') {
