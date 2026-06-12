@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
-    "test": "vitest run",
+    "test": "vitest run && tsx scripts/test-kuzu-store.mts",
+    "test:kuzu": "tsx scripts/test-kuzu-store.mts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

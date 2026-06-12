@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * lore CLI — two commands:
+ * lore CLI — commands:
  *
- *   lore scan  --repo <path> [--max-commits N]
- *   lore sample --repo <path> -n <num> [--tier strong|weak]
+ *   lore scan    --repo <path> [--max-commits N] [--broad] [--no-graph]
+ *   lore sample  --repo <path> -n <num> [--tier strong|weak]
+ *   lore why     <target> --repo <path> [--json]
+ *   lore history <path>   --repo <path> [--json]
  */
 
 import { program } from 'commander';
-import { createRequire } from 'node:module';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ── type-only imports (contracts) ────────────────────────────────────────────
 import type { TranscriptParser, ParseResult } from './schema/events.js';
@@ -17,6 +19,8 @@ import type { GitHistoryReader } from './git/types.js';
 import type { MatchEngine, RepoMatchReport, MatchCandidate } from './match/types.js';
 import { tierOf } from './match/types.js';
 import { renderReport } from './report/markdown.js';
+import type { GraphStore } from './graph/types.js';
+import type { WhyEngine, WhyResult, WhyAttribution } from './why/types.js';
 
 // ── Report file schema (extends RepoMatchReport with operational metadata) ───
 
@@ -53,6 +57,29 @@ async function loadMatchEngine(): Promise<MatchEngine> {
   return mod.engine as MatchEngine;
 }
 
+async function loadGraphBuilder(): Promise<{
+  buildGraphData: (
+    repoPath: string,
+    commits: import('./git/types.js').CommitInfo[],
+    sessions: import('./schema/events.js').ParsedSession[],
+    report: RepoMatchReport,
+  ) => import('./graph/types.js').GraphData;
+}> {
+  return await import('./graph/build.js');
+}
+
+async function loadGraphFactory(): Promise<import('./graph/types.js').GraphStoreFactory> {
+  const mod = await import('./graph/factory.js');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+  return mod.createGraphStore as import('./graph/types.js').GraphStoreFactory;
+}
+
+async function loadWhyEngine(): Promise<WhyEngine> {
+  const mod = await import('./why/engine.js');
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+  return mod.engine as WhyEngine;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function now(): number {
@@ -79,9 +106,127 @@ function truncate(s: string, maxLen: number): string {
   return s.slice(0, maxLen - 1) + '…';
 }
 
+// ── Render helpers (pure functions — tested independently) ───────────────────
+
+/**
+ * Render a WhyResult as human-readable terminal output.
+ * Pure function: takes a WhyResult and repo path, returns a string.
+ */
+export function renderWhyResult(result: WhyResult, repoPath: string): string {
+  const lines: string[] = [];
+
+  lines.push('');
+  lines.push(`file:  ${result.file}:${result.line}`);
+  lines.push(`line:  ${result.lineContent}`);
+  lines.push('');
+  lines.push(`commit: ${result.commit.hash.slice(0, 8)}  ${result.commit.subject}`);
+  lines.push(`        author ${result.commit.authorDate.slice(0, 10)}  ` +
+    `committer ${result.commit.committerDate.slice(0, 10)}`);
+
+  if (result.attributions.length === 0) {
+    // Blind-spot path
+    lines.push('');
+    lines.push('attribution: none  (no conversation linked to this commit)');
+
+    if (result.editedBy.length > 0) {
+      lines.push('');
+      lines.push('sessions that edited this file (blind-spot hints):');
+      for (const eb of result.editedBy) {
+        lines.push(`  • session ${eb.sessionId.slice(0, 12)}…  agent=${eb.agent}  last=${eb.lastTs.slice(0, 16)}`);
+      }
+    }
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  for (let ai = 0; ai < result.attributions.length; ai++) {
+    const attr = result.attributions[ai] as WhyAttribution;
+    const p = attr.produced;
+    const tier = p.confidence >= 0.8 ? 'strong' : 'weak';
+    lines.push('');
+    lines.push(`attribution [${ai + 1}/${result.attributions.length}]`);
+    lines.push(`  confidence: ${p.confidence.toFixed(3)} (${tier})`);
+    lines.push(`  matchedVia: ${p.matchedVia}`);
+    lines.push(`  session:    ${p.sessionId.slice(0, 12)}…`);
+    lines.push(`  source:     ${path.basename(p.sourcePath)}`);
+    lines.push(`  lines:      ${p.matchedLines}  files: ${p.fileCount}`);
+
+    if (attr.editSeqs.length > 0) {
+      lines.push(`  editSeqs:   ${attr.editSeqs.slice(0, 8).join(', ')}${attr.editSeqs.length > 8 ? ' …' : ''}`);
+    }
+
+    if (attr.excerpts.length > 0) {
+      lines.push('');
+      lines.push('  conversation excerpts:');
+      for (const ex of attr.excerpts) {
+        const anchor = `[${ex.sessionId.slice(0, 8)}+${ex.seq}]`;
+        const roleLabel = ex.role === 'user' ? 'USER     ' : 'ASSISTANT';
+        lines.push(`    ${anchor} ${roleLabel}  ${ex.ts.slice(0, 16)}`);
+        const textLines = truncate(ex.text.trim(), 400).split('\n');
+        for (const tl of textLines) {
+          lines.push(`      ${tl}`);
+        }
+      }
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * Render a fileHistory result as human-readable terminal output.
+ * Pure function: takes history entries, returns a string.
+ */
+export function renderFileHistory(
+  filePath: string,
+  history: { commit: import('./graph/types.js').CommitNodeData; produced: import('./graph/types.js').ProducedInfo[] }[],
+): string {
+  const lines: string[] = [];
+
+  lines.push('');
+  lines.push(`file evolution: ${filePath}`);
+  lines.push(`commits: ${history.length}`);
+  lines.push('');
+
+  if (history.length === 0) {
+    lines.push('  (no commit history found in graph)');
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  for (const entry of history) {
+    const c = entry.commit;
+    const dateStr = c.authorDate.slice(0, 10);
+    lines.push(`  ${c.hash.slice(0, 8)}  ${dateStr}  ${c.subject}`);
+
+    if (entry.produced.length > 0) {
+      for (const p of entry.produced) {
+        const tier = p.confidence >= 0.8 ? 'strong' : 'weak';
+        lines.push(
+          `            ← session ${p.sessionId.slice(0, 12)}…  ` +
+          `conf=${p.confidence.toFixed(3)} (${tier})  ` +
+          `via=${p.matchedVia}  ` +
+          `src=${path.basename(p.sourcePath)}`
+        );
+      }
+    } else {
+      lines.push('            ← (no conversation attribution)');
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n');
+}
+
 // ── lore scan ────────────────────────────────────────────────────────────────
 
-async function cmdScan(opts: { repo: string; maxCommits?: number; broad?: boolean }): Promise<void> {
+async function cmdScan(opts: {
+  repo: string;
+  maxCommits?: number;
+  broad?: boolean;
+  graph?: boolean;
+}): Promise<void> {
   const repoPath = path.resolve(opts.repo);
   const t0 = now();
 
@@ -153,6 +298,38 @@ async function cmdScan(opts: { repo: string; maxCommits?: number; broad?: boolea
 
   // 7. Print human summary
   console.log(renderReport(report));
+
+  // 8. Build graph (skipped with --no-graph)
+  if (opts.graph !== false) {
+    const tg = now();
+    try {
+      const [builder, createStore] = await Promise.all([
+        loadGraphBuilder(),
+        loadGraphFactory(),
+      ]);
+
+      const graphData = builder.buildGraphData(repoPath, commits, sessions, report);
+      // createGraphStore 内部已 init。
+      const store: GraphStore = await createStore(repoPath);
+      await store.rebuild(graphData);
+      await store.close();
+
+      const nodeCount =
+        graphData.sessions.length +
+        graphData.commits.length +
+        graphData.files.length;
+      const edgeCount =
+        graphData.produced.length +
+        graphData.touches.length +
+        graphData.edited.length;
+
+      console.log(
+        `[graph]    nodes=${nodeCount} edges=${edgeCount} backend=${store.backend}  ${elapsed(tg)}`,
+      );
+    } catch (e) {
+      console.error(`[graph]    WARN: graph build failed (${String(e)})`);
+    }
+  }
 }
 
 // ── lore sample ──────────────────────────────────────────────────────────────
@@ -180,7 +357,7 @@ async function cmdSample(opts: {
   try {
     const raw = await fs.readFile(reportPath, 'utf8');
     loreReport = JSON.parse(raw) as LoreReportFile;
-  } catch (e) {
+  } catch {
     console.error(`Error: cannot read ${reportPath}. Run "lore scan" first.`);
     process.exit(1);
   }
@@ -344,6 +521,95 @@ async function renderSampleBlock(
   }
 }
 
+// ── lore why ─────────────────────────────────────────────────────────────────
+
+async function cmdWhy(
+  target: string,
+  opts: { repo: string; json?: boolean },
+): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+
+  // Parse target: accept "file:line" or absolute path containing a colon before line
+  let file: string;
+  let line: number;
+
+  // Split on last colon to support paths like /abs/path/src/a.ts:42
+  const colonIdx = target.lastIndexOf(':');
+  if (colonIdx === -1) {
+    console.error('Error: target must be in the form <file>:<line>, e.g. src/a.ts:42');
+    process.exit(1);
+  }
+
+  const rawFile = target.slice(0, colonIdx);
+  const rawLine = target.slice(colonIdx + 1);
+  line = parseInt(rawLine, 10);
+  if (isNaN(line) || line < 1) {
+    console.error(`Error: line number must be a positive integer, got: ${rawLine}`);
+    process.exit(1);
+  }
+
+  // Normalise to repo-relative path
+  if (path.isAbsolute(rawFile)) {
+    const rel = path.relative(repoPath, rawFile);
+    if (rel.startsWith('..')) {
+      console.error(`Error: path ${rawFile} is not inside repo ${repoPath}`);
+      process.exit(1);
+    }
+    file = rel;
+  } else {
+    file = rawFile;
+  }
+
+  const whyEngine = await loadWhyEngine();
+  const result = await whyEngine.why(repoPath, file, line);
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(renderWhyResult(result, repoPath));
+}
+
+// ── lore history ─────────────────────────────────────────────────────────────
+
+async function cmdHistory(
+  filePath: string,
+  opts: { repo: string; json?: boolean },
+): Promise<void> {
+  const repoPath = path.resolve(opts.repo);
+
+  // Normalise to repo-relative path
+  let relPath: string;
+  if (path.isAbsolute(filePath)) {
+    const rel = path.relative(repoPath, filePath);
+    if (rel.startsWith('..')) {
+      console.error(`Error: path ${filePath} is not inside repo ${repoPath}`);
+      process.exit(1);
+    }
+    relPath = rel;
+  } else {
+    relPath = filePath;
+  }
+
+  const createStore = await loadGraphFactory();
+  const store: GraphStore = await createStore(repoPath);
+  await store.init();
+
+  try {
+    const history = await store.fileHistory(relPath);
+
+    if (opts.json) {
+      console.log(JSON.stringify(history, null, 2));
+      return;
+    }
+
+    console.log(renderFileHistory(relPath, history));
+  } finally {
+    await store.close();
+  }
+}
+
 // ── Commander wiring ─────────────────────────────────────────────────────────
 
 program
@@ -357,11 +623,17 @@ program
   .requiredOption('--repo <path>', 'path to the git repository')
   .option('--max-commits <n>', 'limit git history to N commits', (v) => parseInt(v, 10))
   .option('--broad', 'scan ALL local transcripts, not just this repo\'s project dir (catches worktree sessions)')
-  .action((opts: { repo: string; maxCommits?: number; broad?: boolean }) => {
-    cmdScan(opts).catch((e) => {
-      console.error('scan failed:', e);
-      process.exit(1);
-    });
+  .option('--no-graph', 'skip graph build after scan')
+  .action((opts: { repo: string; maxCommits?: number; broad?: boolean; graph?: boolean }) => {
+    cmdScan(opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error('scan failed:', e);
+        process.exit(1);
+      },
+    );
   });
 
 program
@@ -371,10 +643,56 @@ program
   .requiredOption('-n <num>', 'number of matches to sample')
   .option('--tier <tier>', 'filter by tier: strong | weak')
   .action((opts: { repo: string; n: string; tier?: string }) => {
-    cmdSample(opts).catch((e) => {
-      console.error('sample failed:', e);
-      process.exit(1);
-    });
+    cmdSample(opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error('sample failed:', e);
+        process.exit(1);
+      },
+    );
   });
 
-program.parse();
+program
+  .command('why')
+  .description('Explain why a line of code was written — trace it back to the conversation')
+  .argument('<target>', 'file and line, e.g. src/a.ts:42 or /abs/path/to/file.ts:42')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--json', 'output raw WhyResult as JSON instead of human-readable text')
+  .action((target: string, opts: { repo: string; json?: boolean }) => {
+    cmdWhy(target, opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error('why failed:', e);
+        process.exit(1);
+      },
+    );
+  });
+
+program
+  .command('history')
+  .description('Show the evolution timeline of a file (commits + conversation attributions)')
+  .argument('<path>', 'repo-relative or absolute path to the file')
+  .requiredOption('--repo <path>', 'path to the git repository')
+  .option('--json', 'output raw history array as JSON')
+  .action((filePath: string, opts: { repo: string; json?: boolean }) => {
+    cmdHistory(filePath, opts).then(
+      // 显式 exit(0)：kuzu 0.11.3 PreparedStatement 终结器在自然退出时
+      // use-after-free（SIGSEGV 139）；process.exit 跳过终结器。
+      () => process.exit(0),
+      (e) => {
+        console.error('history failed:', e);
+        process.exit(1);
+      },
+    );
+  });
+
+// Only parse argv when this module is run directly (not when imported for testing).
+// ESM equivalent of `require.main === module`.
+const _thisFile = fileURLToPath(import.meta.url);
+if (process.argv[1] !== undefined && _thisFile === process.argv[1]) {
+  program.parse();
+}
