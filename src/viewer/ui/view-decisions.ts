@@ -22,7 +22,7 @@ export const CSS = `
 #dec-search {
   width: 100%;
   max-width: 480px;
-  background: rgba(240,246,252,0.05);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text);
@@ -35,7 +35,7 @@ export const CSS = `
 #dec-search::placeholder { color: var(--text-faint); }
 #dec-search:focus {
   border-color: var(--border-strong);
-  background: rgba(240,246,252,0.08);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
 }
 
 #dec-columns {
@@ -67,7 +67,7 @@ export const CSS = `
 }
 .dec-card:hover {
   border-color: var(--border-strong);
-  box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+  box-shadow: 0 12px 40px color-mix(in srgb, var(--text) 18%, transparent);
 }
 .dec-card.future {
   opacity: 0.07;
@@ -100,7 +100,7 @@ export const CSS = `
 /* flash highlight */
 @keyframes decFlash {
   0%   { box-shadow: 0 0 0 3px var(--green); }
-  50%  { box-shadow: 0 0 0 6px rgba(86,211,100,0.15); }
+  50%  { box-shadow: 0 0 0 6px color-mix(in srgb, var(--green) 15%, transparent); }
   100% { box-shadow: var(--shadow); }
 }
 .dec-card.flash { animation: decFlash 0.45s ease forwards; }
@@ -117,9 +117,9 @@ export const CSS = `
   margin-bottom: 8px;
   border: 1px solid transparent;
 }
-.dec-kind.decision   { color: var(--green); border-color: rgba(86,211,100,0.25); background: rgba(86,211,100,0.08); }
-.dec-kind.constraint { color: var(--blue);  border-color: rgba(88,166,255,0.25); background: rgba(88,166,255,0.08); }
-.dec-kind.rejected   { color: var(--danger); border-color: rgba(248,81,73,0.25); background: rgba(248,81,73,0.08); }
+.dec-kind.decision   { color: var(--green); border-color: color-mix(in srgb, var(--green) 25%, transparent); background: color-mix(in srgb, var(--green) 8%, transparent); }
+.dec-kind.constraint { color: var(--blue);  border-color: color-mix(in srgb, var(--blue) 25%, transparent); background: color-mix(in srgb, var(--blue) 8%, transparent); }
+.dec-kind.rejected   { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 25%, transparent); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .dec-kind-dot { width: 6px; height: 6px; border-radius: 50%; }
 .decision .dec-kind-dot  { background: var(--green); }
 .constraint .dec-kind-dot { background: var(--blue); }
@@ -131,7 +131,7 @@ export const CSS = `
   top: 10px; right: 10px;
   font-size: 10px;
   color: var(--text-faint);
-  background: rgba(240,246,252,0.06);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 1px 6px;
@@ -140,7 +140,8 @@ export const CSS = `
 
 /* title */
 .dec-title {
-  font-size: 14px;
+  font-family: var(--serif);
+  font-size: 15px;
   font-weight: 600;
   color: var(--text);
   margin-bottom: 6px;
@@ -169,7 +170,7 @@ export const CSS = `
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-faint);
-  background: rgba(240,246,252,0.04);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 1px 7px;
@@ -218,7 +219,7 @@ export const CSS = `
   font-family: var(--mono);
   font-size: 12px;
   color: var(--green);
-  background: rgba(86,211,100,0.08);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
   padding: 2px 8px;
   border-radius: 5px;
 }

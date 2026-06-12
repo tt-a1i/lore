@@ -39,7 +39,9 @@ export const CSS = `
   width: 80px;
   height: 8px;
   border-radius: 4px;
-  background: linear-gradient(90deg, rgba(110,122,135,0.3), rgba(86,211,100,0.65));
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--gray-node) 30%, transparent),
+    color-mix(in srgb, var(--green) 65%, transparent));
   flex-shrink: 0;
 }
 .map-legend-ticks {
@@ -140,19 +142,17 @@ export const JS = `
   var MIN_LABEL_AREA = 2400;     // px2 threshold to show filename
   var MIN_DIR_LABEL_AREA = 12000; // px2 threshold to show dir name
 
-  // interpolate coverage: 0 = near-transparent gray, 1 = --green at 60% alpha
+  // 覆盖度填色：0 = 近透明灰（--gray-node），1 = 较实的绿（--green）。
+  // 走 color-mix 阶梯（现代浏览器支持把 color-mix 字符串当 SVG fill），
+  // 因此自动跟随主题（token 切换无需重算）。
+  //   hue:   --gray-node → --green 按 frac 插值
+  //   alpha: 0.15 → 0.60 按 frac 插值（再与 transparent 混出整体不透明度）
   function covColor(frac) {
-    // frac in [0,1]
-    // low end: rgba(110,122,135,0.15)
-    // high end: rgba(86,211,100,0.60)
-    var r0=110,g0=122,b0=135,a0=0.15;
-    var r1=86, g1=211,b1=100,a1=0.60;
     var t = Math.max(0, Math.min(1, frac));
-    var r = Math.round(r0 + (r1-r0)*t);
-    var g = Math.round(g0 + (g1-g0)*t);
-    var b = Math.round(b0 + (b1-b0)*t);
-    var a = (a0 + (a1-a0)*t).toFixed(3);
-    return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+    var huePct = Math.round(t * 100);                 // 0..100 → green 占比
+    var alphaPct = Math.round((0.15 + (0.60 - 0.15) * t) * 100); // 15..60
+    var hue = 'color-mix(in srgb, var(--green) ' + huePct + '%, var(--gray-node))';
+    return 'color-mix(in srgb, ' + hue + ' ' + alphaPct + '%, transparent)';
   }
 
   function esc(s) {
@@ -311,6 +311,11 @@ export const JS = `
         '<span class="map-legend-tick">100%</span>' +
         '<span class="map-legend-label">' + legendLabel + '</span>';
       el.appendChild(legendEl);
+
+      // 主题切换：covColor 走 color-mix（跟随 token 自动重算），重绘一次以稳妥。
+      try {
+        window.addEventListener('lore:theme', function () { self._render(); });
+      } catch (e) {}
 
       self._render();
     },

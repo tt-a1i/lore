@@ -21,9 +21,10 @@
 export const SHELL_HTML = `
 <div id="app">
   <header id="topbar" class="glass">
-    <div class="brand">lore<span class="brand-dot">.</span></div>
+    <div class="brand display">lore<span class="brand-dot">.</span></div>
     <span class="chip" id="repo-chip"></span>
     <span class="chip" id="stats-chip"></span>
+    <button id="theme-toggle" class="btn" title="切换主题 / Toggle theme" aria-label="toggle theme">☾</button>
     <button id="intro-replay" class="btn" title="Replay intro" aria-label="replay intro">?</button>
     <nav id="view-switch" role="tablist"></nav>
   </header>
@@ -55,10 +56,10 @@ export const SHELL_CSS = `
   display: flex; align-items: center; gap: 10px;
   padding: 9px 16px;
 }
-.brand { font-size: 17px; font-weight: 700; letter-spacing: 0.02em; margin-right: 4px; }
+.brand { font-size: 18px; font-weight: 600; letter-spacing: 0.01em; margin-right: 4px; }
 .brand-dot { color: var(--green); }
 
-#intro-replay {
+#intro-replay, #theme-toggle {
   width: 24px; height: 24px; padding: 0; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 13px; line-height: 1; border-radius: 50%;
@@ -66,7 +67,7 @@ export const SHELL_CSS = `
 
 #view-subtitle {
   position: absolute; top: 74px; left: 30px; right: 30px; z-index: 28;
-  font-size: 12px; color: var(--text-dim);
+  font-family: var(--serif); font-style: italic; font-size: 13px; color: var(--text-dim);
   letter-spacing: 0.01em; pointer-events: none;
   opacity: 0; transform: translateY(-3px);
   transition: opacity var(--t-med), transform var(--t-med);
@@ -76,7 +77,7 @@ export const SHELL_CSS = `
 #view-switch {
   margin-left: auto;
   display: flex; gap: 2px;
-  background: rgba(240, 246, 252, 0.05);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
   border: 1px solid var(--border);
   border-radius: 9px; padding: 3px;
 }
@@ -89,8 +90,8 @@ export const SHELL_CSS = `
 #view-switch button:hover { color: var(--text); }
 #view-switch button.active {
   color: var(--text);
-  background: rgba(240, 246, 252, 0.1);
-  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  background: var(--panel-solid);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--text) 14%, transparent);
 }
 
 #stage { position: absolute; inset: 0; }
@@ -117,7 +118,7 @@ export const SHELL_CSS = `
 #drawer-body .sep { border-top: 1px solid var(--border); margin: 13px 0; }
 #drawer-body .quote {
   border-left: 2px solid var(--green-soft); padding: 6px 10px; margin: 8px 0;
-  color: var(--text-dim); font-size: 12px; background: rgba(86,211,100,0.04);
+  color: var(--text-dim); font-size: 12px; background: color-mix(in srgb, var(--green) 5%, transparent);
   border-radius: 0 6px 6px 0; white-space: pre-wrap;
 }
 
@@ -131,7 +132,7 @@ export const SHELL_CSS = `
 }
 #scrubber::before {
   content: ''; position: absolute; left: 0; right: 0; top: 10px; height: 3px;
-  background: rgba(240, 246, 252, 0.1); border-radius: 2px;
+  background: color-mix(in srgb, var(--text) 10%, transparent); border-radius: 2px;
 }
 #scrubber-fill {
   position: absolute; left: 0; top: 10px; height: 3px; width: 100%;
@@ -140,11 +141,11 @@ export const SHELL_CSS = `
 }
 #scrubber-knob {
   position: absolute; top: 4px; width: 15px; height: 15px; margin-left: -7px; left: 100%;
-  background: var(--text); border-radius: 50%;
-  box-shadow: 0 0 0 4px rgba(86, 211, 100, 0.25), 0 2px 6px rgba(0,0,0,0.5);
+  background: var(--panel-solid); border: 1px solid var(--border-strong); border-radius: 50%;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 25%, transparent), 0 2px 6px rgba(0,0,0,0.2);
   pointer-events: none; transition: box-shadow var(--t-fast);
 }
-#scrubber:hover #scrubber-knob { box-shadow: 0 0 0 6px rgba(86, 211, 100, 0.35), 0 2px 6px rgba(0,0,0,0.5); }
+#scrubber:hover #scrubber-knob { box-shadow: 0 0 0 6px color-mix(in srgb, var(--green) 35%, transparent), 0 2px 6px rgba(0,0,0,0.2); }
 #time-display { color: var(--text-dim); min-width: 118px; text-align: right; font-size: 11.5px; }
 
 #loading {
@@ -160,6 +161,43 @@ export const SHELL_CSS = `
 export const SHELL_JS = `
 // LORE_VIEWS 由组装器在视图脚本之前初始化（视图先注册、shell 后启动）。
 window.LORE_VIEWS = window.LORE_VIEWS || [];
+
+// ── 主题：boot 时按 localStorage('lore-theme') → 无则 prefers-color-scheme ──────
+// 立即执行（尽量早，避免浅/深闪烁）。data-theme='dark' 走深色，移除=纸面浅色。
+(function () {
+  function resolveTheme() {
+    try {
+      var saved = localStorage.getItem('lore-theme');
+      if (saved === 'dark' || saved === 'light') return saved;
+    } catch (e) {}
+    try {
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
+    } catch (e) {}
+    return 'light';
+  }
+  function applyTheme(theme) {
+    var root = document.documentElement;
+    if (theme === 'dark') root.setAttribute('data-theme', 'dark');
+    else root.removeAttribute('data-theme');
+    // 同步切换按钮字符（☾ 浅色态点深色 / ☀ 深色态点浅色）。
+    var btn = document.getElementById('theme-toggle');
+    if (btn) btn.textContent = theme === 'dark' ? '☀' : '☾';
+  }
+  window.LORE_THEME = {
+    get: resolveTheme,
+    current: function () {
+      return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    },
+    apply: applyTheme,
+    toggle: function () {
+      var next = (window.LORE_THEME.current() === 'dark') ? 'light' : 'dark';
+      applyTheme(next);
+      try { localStorage.setItem('lore-theme', next); } catch (e) {}
+      try { window.dispatchEvent(new CustomEvent('lore:theme', { detail: { theme: next } })); } catch (e) {}
+    },
+  };
+  applyTheme(resolveTheme());
+})();
 
 // ── i18n：shell 持字典，按 navigator.language 选 zh/en ─────────────────
 // 视图与 intro 通过 window.LORE_T(key) 取文案，且都做了 LORE_T 不存在的兜底。
@@ -484,6 +522,14 @@ async function bootShell() {
   const replayBtn = document.getElementById('intro-replay');
   if (replayBtn) replayBtn.addEventListener('click', () => { openIntro(); });
 
+  // topbar 主题切换：切 data-theme、存 localStorage、派发 lore:theme（各视图重读颜色）。
+  const themeBtn = document.getElementById('theme-toggle');
+  if (themeBtn && window.LORE_THEME) {
+    // 同步初始字符（boot 时按钮可能尚未在 DOM）。
+    themeBtn.textContent = window.LORE_THEME.current() === 'dark' ? '☀' : '☾';
+    themeBtn.addEventListener('click', () => { window.LORE_THEME.toggle(); });
+  }
+
   // ── 启动 ────────────────────────────────────────────────────────
   applyFrac(1, false);
   const initial = window.LORE_VIEWS.find(v => '#' + v.id === location.hash) || window.LORE_VIEWS[0];
@@ -491,10 +537,12 @@ async function bootShell() {
   document.getElementById('loading').classList.add('done');
 
   // loading 淡出后：未看过 intro 则显示，否则直进视图。
+  // ?intro=1 强制重看（演示/录屏后门）。
+  const forceIntro = /[?&]intro=1/.test(location.search);
   const introSeen = (window.LORE_INTRO && typeof window.LORE_INTRO.seen === 'function')
     ? window.LORE_INTRO.seen() : false;
   setTimeout(() => {
-    if (!introSeen) openIntro();
+    if (forceIntro || !introSeen) openIntro();
   }, 420);
 }
 

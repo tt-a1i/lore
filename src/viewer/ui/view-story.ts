@@ -28,12 +28,12 @@ export const CSS = `
   transition: opacity var(--t-fast);
 }
 .story-session rect.cap {
-  fill: rgba(88,166,255,0.12);
+  fill: color-mix(in srgb, var(--blue) 12%, transparent);
   stroke: var(--blue);
   stroke-width: 1;
   transition: fill var(--t-fast), stroke-width var(--t-fast);
 }
-.story-session:hover rect.cap { fill: rgba(88,166,255,0.22); stroke-width: 1.5; }
+.story-session:hover rect.cap { fill: color-mix(in srgb, var(--blue) 22%, transparent); stroke-width: 1.5; }
 .story-session text { fill: var(--blue); font-size: 10px; font-family: var(--mono); pointer-events: none; }
 
 .story-commit {
@@ -42,8 +42,9 @@ export const CSS = `
 }
 .story-commit rect {
   transition: filter var(--t-fast), stroke-width var(--t-fast);
-  stroke: rgba(0,0,0,0.35);
-  stroke-width: 0.5;
+  /* 纸面无辉光，commit 用更实的墨色描边补层次；深色下回落到淡边 */
+  stroke: var(--border-strong);
+  stroke-width: 0.75;
 }
 .story-commit:hover rect { stroke: var(--text); stroke-width: 1.5; }
 
@@ -55,12 +56,12 @@ export const CSS = `
 
 .story-decision { cursor: pointer; transition: opacity var(--t-fast); }
 .story-decision rect {
-  fill: rgba(227,179,65,0.16);
+  fill: color-mix(in srgb, var(--amber) 16%, transparent);
   stroke: var(--amber);
   stroke-width: 1;
   transition: fill var(--t-fast);
 }
-.story-decision:hover rect { fill: rgba(227,179,65,0.32); }
+.story-decision:hover rect { fill: color-mix(in srgb, var(--amber) 32%, transparent); }
 .story-supersede { stroke: var(--amber); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.4; fill: none; }
 
 .story-nowline line { stroke: var(--green); stroke-width: 1; shape-rendering: crispEdges; }
@@ -93,13 +94,13 @@ export const CSS = `
 .story-legend .lg { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); }
 .story-legend .sw { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
 
-.story-confbar { height: 5px; border-radius: 3px; background: rgba(240,246,252,0.08); overflow: hidden; margin-top: 3px; }
+.story-confbar { height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--text) 8%, transparent); overflow: hidden; margin-top: 3px; }
 .story-confbar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); border-radius: 3px; }
 .drawer-link { color: var(--blue); cursor: pointer; }
 .drawer-link:hover { text-decoration: underline; }
 .kind-badge {
   display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10.5px;
-  border: 1px solid var(--amber); color: var(--amber); background: rgba(227,179,65,0.1);
+  border: 1px solid var(--amber); color: var(--amber); background: color-mix(in srgb, var(--amber) 10%, transparent);
 }
 
 /* ── 抽屉内嵌对话摘录 ───────────────────────────────────────────────── */
@@ -111,7 +112,7 @@ export const CSS = `
 .excerpt {
   margin: 0 0 8px; padding: 9px 11px;
   border-left: 2px solid var(--border-strong); border-radius: 0 6px 6px 0;
-  background: rgba(240,246,252,0.03);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
 }
 .excerpt.role-user { border-left-color: var(--blue); }
 .excerpt.role-assistant { border-left-color: var(--green); }
@@ -120,8 +121,8 @@ export const CSS = `
   display: inline-block; padding: 1px 7px; border-radius: 999px;
   font-size: 9px; font-weight: 600; letter-spacing: 0.07em;
 }
-.role-pill.user { color: var(--blue); border: 1px solid var(--blue); background: rgba(88,166,255,0.1); }
-.role-pill.agent { color: var(--green); border: 1px solid var(--green); background: rgba(86,211,100,0.1); }
+.role-pill.user { color: var(--blue); border: 1px solid var(--blue); background: color-mix(in srgb, var(--blue) 10%, transparent); }
+.role-pill.agent { color: var(--green); border: 1px solid var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
 .excerpt-anchor { font-family: var(--mono); font-size: 10px; color: var(--text-faint); }
 .excerpt-ts { margin-left: auto; font-size: 10px; color: var(--text-faint); }
 .excerpt-text { font-size: 12.5px; line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
@@ -283,22 +284,16 @@ export const JS = `
       legend.innerHTML =
         '<div class="lg"><span class="sw" style="background:var(--blue)"></span>session</div>' +
         '<div class="lg"><span class="sw" style="background:var(--commit-new)"></span>commit</div>' +
-        '<div class="lg"><span class="sw" style="background:var(--green);box-shadow:0 0 6px var(--green)"></span>attributed</div>' +
+        '<div class="lg"><span class="sw" style="background:var(--green);box-shadow:0 0 6px color-mix(in srgb, var(--green) calc(100% * var(--glow-opacity)), transparent)"></span>attributed</div>' +
         '<div class="lg"><span class="sw" style="background:var(--amber);border-radius:2px;transform:rotate(45deg)"></span>decision</div>';
       el.appendChild(legend);
 
       var svg = d3.select(el).append('svg').attr('class', 'story-svg');
       this.svg = svg;
 
-      // defs：辉光滤镜 + 丝带渐变
-      var defs = svg.append('defs');
-      var glow = defs.append('filter').attr('id', 'story-glow').attr('x', '-60%').attr('y', '-60%').attr('width', '220%').attr('height', '220%');
-      glow.append('feDropShadow')
-        .attr('dx', 0).attr('dy', 0).attr('stdDeviation', 1.6)
-        .attr('flood-color', cssVar('--green', '#56d364')).attr('flood-opacity', 0.85);
-      var grad = defs.append('linearGradient').attr('id', 'story-ribbon-grad').attr('x1', '0').attr('y1', '0').attr('x2', '0').attr('y2', '1');
-      grad.append('stop').attr('offset', '0%').attr('stop-color', cssVar('--blue', '#58a6ff'));
-      grad.append('stop').attr('offset', '100%').attr('stop-color', cssVar('--green', '#56d364'));
+      // defs：辉光滤镜 + 丝带渐变。抽成方法以便主题切换后重建（重读 token）。
+      this.defs = svg.append('defs');
+      this.buildDefs();
 
       // 分层（绘制顺序 = 视觉层级）
       var gAxis = svg.append('g').attr('class', 'story-axis');
@@ -416,10 +411,12 @@ export const JS = `
         var hash = ev && ev.detail && ev.detail.commitHash;
         if (hash) view.runDemo(hash);
       };
+      this._onTheme = function () { view.onThemeChange(); };
       try {
         window.addEventListener('lore:play-start', this._onPlayStart);
         window.addEventListener('lore:play-end', this._onPlayEnd);
         window.addEventListener('lore:demo', this._onDemo);
+        window.addEventListener('lore:theme', this._onTheme);
       } catch (e) {}
 
       // 入场动画：首次渲染完成后触发一次（commit stagger + 丝带抽出）。
@@ -489,6 +486,31 @@ export const JS = `
       });
     },
 
+    // ── defs（辉光滤镜 + 丝带渐变）：重读 token 重建，供主题切换调用 ──────
+    buildDefs: function () {
+      if (!this.defs) return;
+      this.defs.selectAll('*').remove();
+      // flood-opacity 接 --glow-opacity（纸面=0 自动无辉光）。
+      var glowOp = parseFloat(cssVar('--glow-opacity', '0'));
+      if (isNaN(glowOp)) glowOp = 0;
+      var glow = this.defs.append('filter').attr('id', 'story-glow')
+        .attr('x', '-60%').attr('y', '-60%').attr('width', '220%').attr('height', '220%');
+      glow.append('feDropShadow')
+        .attr('dx', 0).attr('dy', 0).attr('stdDeviation', 1.6)
+        .attr('flood-color', cssVar('--green', '#1a7f37')).attr('flood-opacity', glowOp);
+      var grad = this.defs.append('linearGradient').attr('id', 'story-ribbon-grad')
+        .attr('x1', '0').attr('y1', '0').attr('x2', '0').attr('y2', '1');
+      grad.append('stop').attr('offset', '0%').attr('stop-color', cssVar('--blue', '#0a5bd3'));
+      grad.append('stop').attr('offset', '100%').attr('stop-color', cssVar('--green', '#1a7f37'));
+    },
+
+    // 主题切换：重建 defs（渐变/辉光重读 token）+ 整体重绘一次。
+    onThemeChange: function () {
+      if (!this.svg) return;
+      this.buildDefs();
+      try { this.render(true); } catch (e) {}
+    },
+
     // 计算当前尺寸并设定 range
     resize: function () {
       if (!this.el) return;
@@ -535,7 +557,7 @@ export const JS = `
       // 刻度上引一条极淡的网格线（往上到顶）
       this.gAxis.selectAll('.tick line')
         .attr('y1', 0).attr('y2', -(this.H - MARGIN_TOP - MARGIN_BOTTOM + 18))
-        .attr('stroke', cssVar('--border', 'rgba(240,246,252,0.09)')).attr('stroke-opacity', 0.5);
+        .attr('stroke', cssVar('--border', 'rgba(26,29,33,0.12)')).attr('stroke-opacity', 0.5);
 
       // ── commit 带（带同刻 jitter）─────────────────────────────────
       // 计算每个 commit 的纵向微抖：用 hash 派生稳定偏移

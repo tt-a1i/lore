@@ -864,6 +864,16 @@ export const JS = `
     _currentCutoff = ctx.cutoffMs;
     rebuildGraph();
 
+    // 主题切换：节点/边颜色在 build 时由 cssVar 读出并写进 SVG 属性，
+    // 故重读 token 需整体重建。防御式：仅在已 mount 时响应。
+    try {
+      window.addEventListener('lore:theme', function () {
+        if (!_svg) return;
+        _hasAutoFitted = false;
+        rebuildGraph();
+      });
+    } catch (e) {}
+
     // entry animation: whole view fades in once on first mount
     el.classList.add('vg-enter');
   }
