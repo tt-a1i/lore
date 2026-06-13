@@ -1308,6 +1308,8 @@ async function cmdAsk(
 async function cmdMcp(opts: { repo: string }): Promise<void> {
   const repoPath = path.resolve(opts.repo);
 
+  await requireReport(repoPath);
+
   // Log to stderr — stdout is reserved for JSON-RPC.
   process.stderr.write(`[lore-mcp] starting MCP server for ${repoPath}\n`);
 
@@ -1878,8 +1880,15 @@ async function writeSettingsJson(settingsPath: string, data: unknown): Promise<v
 }
 
 /** The command string injected into Stop hooks. */
+function shellQuote(value: string): string {
+  if (value.length === 0) return "''";
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+const HOOK_MARKER = 'LORE_HOOK=1';
+
 function hookCommand(repoPath: string): string {
-  return `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
+  return `${HOOK_MARKER} ${loreRunPrefix()} scan --repo ${shellQuote(repoPath)} --broad >/dev/null 2>&1 || true`;
 }
 
 /**
@@ -1887,7 +1896,7 @@ function hookCommand(repoPath: string): string {
  *
  * 性能要求：钩子在每次 session 启动 / 每次 Edit 前都跑，启动延迟敏感。
  * 优先用 `node <绝对 dist/cli.js>`（零 npx 解析延迟）；若当前进程不是从 dist 跑的
- * （如开发态 tsx），退回 `npx -y lore`（保证可用，牺牲启动速度）。
+ * （如开发态 tsx），退回 `npx -y @tt-a1i/lore`（保证可用，牺牲启动速度）。
  *
  * 解析逻辑：import.meta.url 指向正在执行的 cli 文件。生产态它是 .../dist/cli.js；
  * 开发态（tsx）是 .../src/cli.ts。仅当落在一个名为 dist 的目录且是 .js 时，才信任
@@ -1899,22 +1908,22 @@ function loreRunPrefix(): string {
     const real = _resolveReal(self);
     // 只有当真实路径是 dist 下的 .js 才用 node 直跑（最快）。
     if (real.endsWith('.js') && real.split(path.sep).includes('dist')) {
-      return `node ${real}`;
+      return `${shellQuote(process.execPath)} ${shellQuote(real)}`;
     }
   } catch {
     // 落到 npx 兜底。
   }
-  return 'npx -y lore';
+  return 'npx -y @tt-a1i/lore';
 }
 
 /** SessionStart 钩子命令：注入项目简报（hook-json 信封）。 */
 function sessionStartCommand(repoPath: string): string {
-  return `${loreRunPrefix()} brief --repo ${repoPath} --format hook-json 2>/dev/null || true`;
+  return `${HOOK_MARKER} ${loreRunPrefix()} brief --repo ${shellQuote(repoPath)} --format hook-json 2>/dev/null || true`;
 }
 
 /** PreToolUse 钩子命令：注入被编辑文件的相关约束（绝不 block）。 */
 function preToolUseCommand(repoPath: string): string {
-  return `${loreRunPrefix()} guard --hook --repo ${repoPath} 2>/dev/null || true`;
+  return `${HOOK_MARKER} ${loreRunPrefix()} guard --hook --repo ${shellQuote(repoPath)} 2>/dev/null || true`;
 }
 
 interface HookEntry {
@@ -1972,10 +1981,21 @@ function installHookSpec(
 
 /**
  * 从 settings.hooks 移除某 event 下属于本 repo 的 lore 钩子。
- * 宽松匹配：command 同时含 `lore` 关键字 + 该 repoPath，即视为本 repo 的 lore 钩子，
- * 不论前缀是 `node …/dist/cli.js` 还是 `npx -y lore`（容忍升级导致的路径漂移）。
+ * 宽松匹配：command 同时含 lore hook marker（或旧版 lore CLI 形态）+
+ * 该 repoPath（原文或 shell-quoted 形式）+ lore 子命令，即视为本 repo 的 lore 钩子，
+ * 不论前缀是 `node …/dist/cli.js` 还是 `npx -y @tt-a1i/lore`（容忍升级导致的路径漂移）。
  * 返回移除条数。
  */
+function commandLooksLikeLoreHook(cmd: string): boolean {
+  return (
+    cmd.includes(HOOK_MARKER) ||
+    cmd.includes('@tt-a1i/lore') ||
+    cmd.includes('npx -y lore') ||
+    cmd.includes('/dist/cli.js') ||
+    cmd.includes('\\dist\\cli.js')
+  );
+}
+
 function removeHookSpec(
   hooks: Record<string, unknown>,
   event: string,
@@ -1985,13 +2005,16 @@ function removeHookSpec(
   if (!Array.isArray(hooks[event])) return 0;
   const list = hooks[event] as HookMatcher[];
   let removed = 0;
+  const quotedRepoPath = shellQuote(repoPath);
   const filtered = list
     .map((m) => {
       if (!Array.isArray(m.hooks)) return m;
       const kept = m.hooks.filter((h) => {
         const cmd = h.command ?? '';
         const isLoreForRepo =
-          cmd.includes('lore') && cmd.includes(repoPath) && cmd.includes(subcommand);
+          commandLooksLikeLoreHook(cmd) &&
+          (cmd.includes(repoPath) || cmd.includes(quotedRepoPath)) &&
+          cmd.includes(subcommand);
         if (isLoreForRepo) { removed++; return false; }
         return true;
       });

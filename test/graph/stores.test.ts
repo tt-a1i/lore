@@ -104,6 +104,28 @@ describe.each(backends)('GraphStore backend=$label', ({ createStore }) => {
     expect(h0!.produced[0]!.confidence).toBeGreaterThan(h0!.produced[1]!.confidence);
   });
 
+  it('fileHistory filters produced attributions to sessions that matched the queried file', async () => {
+    const data = makeData();
+    data.produced = data.produced.map((p) => {
+      if (p.sessionId === 'ses-alpha' && p.commitHash === 'abc111') {
+        return { ...p, files: ['src/bar.ts', 'src/foo.ts'] };
+      }
+      if (p.sessionId === 'ses-beta' && p.commitHash === 'abc111') {
+        return { ...p, files: ['src/bar.ts'] };
+      }
+      return p;
+    });
+    await store.rebuild(data);
+
+    const fooHistory = await store.fileHistory('src/foo.ts');
+    const fooCommit = fooHistory.find((h) => h.commit.hash === 'abc111')!;
+    expect(fooCommit.produced.map((p) => p.sessionId)).toEqual(['ses-alpha']);
+
+    const barHistory = await store.fileHistory('src/bar.ts');
+    const barCommit = barHistory.find((h) => h.commit.hash === 'abc111')!;
+    expect(barCommit.produced.map((p) => p.sessionId)).toEqual(['ses-alpha', 'ses-beta']);
+  });
+
   it('fileHistory returns empty for unknown file', async () => {
     await store.rebuild(makeData());
     const history = await store.fileHistory('nonexistent.ts');

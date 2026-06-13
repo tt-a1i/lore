@@ -19,6 +19,7 @@ import {
   EXCERPT_MAX,
 } from '../../src/excerpts/compute.js';
 import { claudeCodeParser } from '../../src/parsers/claude-code.js';
+import { codexParser } from '../../src/parsers/codex.js';
 import type { ParsedSession, LoreEvent } from '../../src/schema/events.js';
 import type { MatchCandidate } from '../../src/match/types.js';
 
@@ -202,6 +203,57 @@ function writeTranscript(dir: string): string {
   return p;
 }
 
+function writeCodexTranscript(
+  dir: string,
+  opts: {
+    sessionId: string;
+    cwd: string;
+    relFile: string;
+    userText: string;
+    assistantText: string;
+    oldLine: string;
+    newLine: string;
+  },
+): string {
+  const diff = [
+    '@@ -1,1 +1,1 @@',
+    '-' + opts.oldLine,
+    '+' + opts.newLine,
+  ].join('\n');
+  const lines = [
+    {
+      timestamp: '2026-06-01T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: opts.sessionId, cwd: opts.cwd, cli_version: '0.139.0' },
+    },
+    {
+      timestamp: '2026-06-01T10:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: opts.userText },
+    },
+    {
+      timestamp: '2026-06-01T10:00:02.000Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', message: opts.assistantText },
+    },
+    {
+      timestamp: '2026-06-01T10:00:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'patch_apply_end',
+        call_id: 'call_codex_1',
+        success: true,
+        changes: {
+          [opts.relFile]: { type: 'update', unified_diff: diff },
+        },
+      },
+    },
+  ];
+  const p = join(dir, `${opts.sessionId}.jsonl`);
+  writeFileSync(p, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+  return p;
+}
+
 function writeReport(repo: string, matches: object[]): void {
   mkdirSync(join(repo, '.lore'), { recursive: true });
   writeFileSync(join(repo, '.lore', 'report.json'), JSON.stringify({ matches }), 'utf8');
@@ -228,6 +280,34 @@ describe('computeExcerpts — end to end', () => {
     expect(quotes.some((q) => q.text.includes('foo helper'))).toBe(true);
     expect(quotes[0]!.sessionId).toBe('ses-c');
     for (const q of quotes) expect(q.text.length).toBeLessThanOrEqual(EXCERPT_MAX);
+  });
+
+  it('extracts excerpts for a Codex strong candidate through the default parser registry', async () => {
+    const repo = makeRepo();
+    const transcript = writeCodexTranscript(repo, {
+      sessionId: 'codex-excerpt',
+      cwd: repo,
+      relFile: 'src/codex.ts',
+      userText: 'Please rename the Codex flag.',
+      assistantText: 'I will apply the Codex flag rename now.',
+      oldLine: 'export const flagName = "old";',
+      newLine: 'export const flagName = "new";',
+    });
+    const parsed = await codexParser.parse(transcript);
+    const editEvent = parsed.session.events.find((e) => e.kind === 'file-edit')!;
+
+    writeReport(repo, [
+      {
+        commitHash: 'codex111', filePath: 'src/codex.ts', sessionId: 'codex-excerpt',
+        editSeqs: [editEvent.seq], sourcePath: transcript, matchedVia: 'content',
+        matchedLines: 3, contentScore: 1, timeScore: 1, confidence: 0.93, evidence: [],
+      },
+    ]);
+
+    const out = await computeExcerpts(repo);
+    expect(Object.keys(out)).toEqual(['codex111']);
+    expect(out['codex111']!.some((q) => q.text.includes('Codex flag'))).toBe(true);
+    expect(out['codex111']!.some((q) => q.sessionId === 'codex-excerpt')).toBe(true);
   });
 
   it('returns {} when report.json is absent', async () => {

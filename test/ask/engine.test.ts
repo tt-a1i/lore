@@ -13,6 +13,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -87,6 +88,126 @@ function writeTranscript(
     'utf8',
   );
   return transcriptPath;
+}
+
+function writeCodexTranscript(
+  repoDir: string,
+  sessionId: string,
+  userMessages: string[],
+): string {
+  const lines: object[] = [
+    {
+      timestamp: '2026-06-01T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: repoDir, cli_version: '0.139.0' },
+    },
+  ];
+  let i = 1;
+  for (const text of userMessages) {
+    lines.push({
+      timestamp: new Date(Date.UTC(2026, 5, 1, 10, 0, i++)).toISOString(),
+      type: 'event_msg',
+      payload: { type: 'user_message', message: text },
+    });
+  }
+  const transcriptPath = join(repoDir, `${sessionId}.codex.jsonl`);
+  writeFileSync(
+    transcriptPath,
+    lines.map((l) => JSON.stringify(l)).join('\n') + '\n',
+    'utf8',
+  );
+  return transcriptPath;
+}
+
+function writeOpenCodeTranscriptDb(
+  repoDir: string,
+  sessionId: string,
+  userMessages: string[],
+): string {
+  const dbPath = join(repoDir, 'opencode.db');
+  const db = new DatabaseSync(dbPath);
+  const t0 = Date.UTC(2026, 5, 1, 10, 0, 0);
+  try {
+    db.exec(`
+      CREATE TABLE session (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        slug TEXT,
+        directory TEXT,
+        title TEXT,
+        version TEXT DEFAULT 'local',
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL,
+        model TEXT,
+        cost REAL DEFAULT 0,
+        tokens_input INTEGER DEFAULT 0,
+        tokens_output INTEGER DEFAULT 0,
+        summary_additions INTEGER DEFAULT 0,
+        summary_deletions INTEGER DEFAULT 0,
+        summary_files INTEGER DEFAULT 0,
+        summary_diffs TEXT DEFAULT '[]',
+        agent TEXT,
+        workspace_id TEXT,
+        path TEXT DEFAULT '',
+        metadata TEXT DEFAULT '{}'
+      );
+      CREATE TABLE message (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE TABLE part (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+    `);
+    db.prepare(`
+      INSERT INTO session (id, directory, path, title, time_created, time_updated, model)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      sessionId,
+      repoDir,
+      repoDir,
+      'Ask Test Session',
+      t0,
+      t0 + userMessages.length * 1000,
+      JSON.stringify({ id: 'test-model' }),
+    );
+    for (let i = 0; i < userMessages.length; i++) {
+      const msgId = `msg_${i}`;
+      const ts = t0 + (i + 1) * 1000;
+      db.prepare(`
+        INSERT INTO message (id, session_id, time_created, time_updated, data)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        msgId,
+        sessionId,
+        ts,
+        ts,
+        JSON.stringify({ role: 'user', time: { created: ts } }),
+      );
+      db.prepare(`
+        INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        `part_${i}`,
+        msgId,
+        sessionId,
+        ts,
+        ts,
+        JSON.stringify({ type: 'text', text: userMessages[i] }),
+      );
+    }
+  } finally {
+    db.close();
+  }
+  return `${dbPath}#${sessionId}`;
 }
 
 function makeNote(overrides: Partial<DistilledNote> & { id: string; title: string }): DistilledNote {
@@ -401,6 +522,38 @@ describe('AskEngine.ask', () => {
     expect(topMsg.sessionId).toBe('sess-abc');
     expect(topMsg.text).toContain('graph store');
     expect(topMsg.score).toBeGreaterThan(0);
+  });
+
+  it('extracts and scores normalized user messages from Codex transcripts', async () => {
+    const repo = makeRepo();
+    const transcriptPath = writeCodexTranscript(repo, 'sess-codex-ask', [
+      'Please document the codex parser fallback for raw message search.',
+      'Unrelated turn.',
+    ]);
+    writeReportJson(repo, { 'sess-codex-ask': transcriptPath });
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'codex parser fallback');
+
+    expect(result.messageHits.length).toBeGreaterThanOrEqual(1);
+    expect(result.messageHits[0]!.sessionId).toBe('sess-codex-ask');
+    expect(result.messageHits[0]!.text).toContain('codex parser fallback');
+  });
+
+  it('extracts and scores normalized user messages from OpenCode transcripts when parseable', async () => {
+    const repo = makeRepo();
+    const pseudoPath = writeOpenCodeTranscriptDb(repo, 'sess-opencode-ask', [
+      'Please index the opencode parser fallback in ask message search.',
+      'Unrelated turn.',
+    ]);
+    writeReportJson(repo, { 'sess-opencode-ask': pseudoPath });
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'opencode parser fallback');
+
+    expect(result.messageHits.length).toBeGreaterThanOrEqual(1);
+    expect(result.messageHits[0]!.sessionId).toBe('sess-opencode-ask');
+    expect(result.messageHits[0]!.text).toContain('opencode parser fallback');
   });
 
   it('truncates user messages to 600 chars for indexing', async () => {

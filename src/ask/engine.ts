@@ -20,6 +20,7 @@ import * as os from 'node:os';
 import { encodeProjectPath } from '../parsers/claude-code.js';
 import type { AskEngine, AskResult, AskHit } from './types.js';
 import type { DistilledNote, NotesFile } from '../distill/types.js';
+import type { ParsedSession, TranscriptParser } from '../schema/events.js';
 
 // ── Tokenisation ──────────────────────────────────────────────────────────────
 
@@ -285,6 +286,21 @@ function sourcePathBelongsToRepo(sourcePath: string, repoPath: string): boolean 
   return false;
 }
 
+function cwdBelongsToRepo(cwd: string | null, repoPath: string): boolean {
+  if (!cwd) return false;
+  const normCwd = cwd.replace(/\\/g, '/').replace(/\/$/, '');
+  const repo = repoPath.replace(/\\/g, '/').replace(/\/$/, '');
+  return normCwd === repo || normCwd.startsWith(repo + '/');
+}
+
+function parsedSessionBelongsToRepo(
+  session: ParsedSession,
+  sourcePath: string,
+  repoPath: string,
+): boolean {
+  return sourcePathBelongsToRepo(sourcePath, repoPath) || cwdBelongsToRepo(session.meta.cwd, repoPath);
+}
+
 /** Score a message entry against query terms. */
 function scoreMessage(
   entry: MessageIndexEntry,
@@ -303,76 +319,66 @@ interface LoreReportShape {
 
 // ── User-message extraction from transcript ───────────────────────────────────
 
-/**
- * Lightly parse a Claude Code transcript (jsonl) to extract user messages.
- * We intentionally do NOT import the full parser to keep the ask engine
- * free of that dependency — a line-by-line JSON parse is sufficient here.
- */
-async function extractUserMessages(
-  sourcePath: string,
-  sessionId: string,
-): Promise<MessageIndexEntry[]> {
-  let raw: string;
+async function loadTranscriptParsers(): Promise<TranscriptParser[]> {
   try {
-    raw = await fs.readFile(sourcePath, 'utf8');
+    const mod = await import('../parsers/registry.js');
+    return Array.isArray(mod.allParsers) ? mod.allParsers : [];
   } catch {
     return [];
   }
+}
 
-  const entries: MessageIndexEntry[] = [];
-  let lineSeq = 0;
+async function parseBestSession(
+  sourcePath: string,
+  expectedSessionId: string,
+  parsers: TranscriptParser[],
+): Promise<ParsedSession | null> {
+  let best: ParsedSession | null = null;
+  let bestScore = 0;
 
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    let obj: unknown;
+  for (const parser of parsers) {
+    let session: ParsedSession;
     try {
-      obj = JSON.parse(trimmed);
+      const parsed = await parser.parse(sourcePath);
+      session = parsed.session;
     } catch {
       continue;
     }
 
-    lineSeq++;
+    let score = 0;
+    if (session.meta.sessionId === expectedSessionId) score += 4;
+    const userMessageCount = session.events.filter((e) => e.kind === 'user-message').length;
+    if (userMessageCount > 0) score += 2;
+    if (session.events.length > 0) score += 1;
 
-    // We only care about non-meta user-role message lines.
-    if (
-      !obj ||
-      typeof obj !== 'object' ||
-      (obj as Record<string, unknown>)['type'] !== 'user'
-    ) {
-      continue;
+    if (score > bestScore) {
+      best = session;
+      bestScore = score;
     }
+  }
 
-    // Skip meta lines (tool-use results etc).
-    if ((obj as Record<string, unknown>)['isMeta'] === true) continue;
+  return bestScore > 0 ? best : null;
+}
 
-    const msgRaw = (obj as Record<string, unknown>)['message'];
-    if (!msgRaw || typeof msgRaw !== 'object') continue;
+/**
+ * Parse a transcript through the registered normalizing parsers and extract
+ * user messages from the shared LoreEvent schema. This keeps ask's raw-message
+ * fallback agent-neutral (Claude, Codex, OpenCode) while preserving graceful
+ * degradation: unreadable or unsupported transcripts simply add no messages.
+ */
+async function extractUserMessages(
+  sourcePath: string,
+  sessionId: string,
+  repoPath: string,
+  parsers: TranscriptParser[],
+): Promise<MessageIndexEntry[]> {
+  const session = await parseBestSession(sourcePath, sessionId, parsers);
+  if (!session || !parsedSessionBelongsToRepo(session, sourcePath, repoPath)) return [];
+  const entries: MessageIndexEntry[] = [];
 
-    const msgObj = msgRaw as Record<string, unknown>;
-    if (msgObj['role'] !== 'user') continue;
-
-    // Content can be a plain string or an array of blocks.
-    const content = msgObj['content'];
-    let text = '';
-    if (typeof content === 'string') {
-      text = content;
-    } else if (Array.isArray(content)) {
-      const textParts: string[] = [];
-      for (const block of content) {
-        if (
-          block &&
-          typeof block === 'object' &&
-          (block as Record<string, unknown>)['type'] === 'text' &&
-          typeof (block as Record<string, unknown>)['text'] === 'string'
-        ) {
-          textParts.push((block as Record<string, string>)['text']!);
-        }
-      }
-      text = textParts.join(' ');
-    }
-
+  for (const event of session.events) {
+    if (event.kind !== 'user-message') continue;
+    const text = event.text;
     if (!text.trim()) continue;
 
     // Content blacklist: skip lore's own pipeline artifacts (task-notifications,
@@ -380,8 +386,8 @@ async function extractUserMessages(
     if (isLorePipelineArtifact(text)) continue;
 
     entries.push({
-      sessionId,
-      seq: lineSeq,
+      sessionId: event.sessionId,
+      seq: event.seq,
       text: text.length > MSG_TRUNCATE ? text.slice(0, MSG_TRUNCATE) : text,
     });
   }
@@ -471,14 +477,14 @@ class DeterministicAskEngine implements AskEngine {
     }
 
     // 6. Build message index from transcripts (concurrent reads).
-    //    Session-source filter: only index sessions whose transcript belongs to
-    //    THIS repo's project dir (or the repo itself) — other repos' sessions in
-    //    the shared ~/.claude/projects tree must not leak into results.
-    const ownSessions = Object.entries(sessionSourceMap).filter(([, srcPath]) =>
-      sourcePathBelongsToRepo(srcPath, repo),
-    );
+    //    Parse first, then filter by normalized session metadata/source path so
+    //    non-Claude agents whose transcript paths live outside the repo
+    //    (Codex/OpenCode) can still contribute messages when cwd belongs here.
+    const parsers = await loadTranscriptParsers();
     const perSession = await Promise.all(
-      ownSessions.map(([sid, srcPath]) => extractUserMessages(srcPath, sid)),
+      Object.entries(sessionSourceMap).map(([sid, srcPath]) =>
+        extractUserMessages(srcPath, sid, repo, parsers),
+      ),
     );
     const allMessages: MessageIndexEntry[] = perSession.flat();
 

@@ -244,6 +244,7 @@ describe('PRODUCED edge aggregation', () => {
     expect(p.commitHash).toBe('h1');
     expect(p.confidence).toBe(0.95); // max
     expect(p.fileCount).toBe(2); // distinct files
+    expect(p.files).toEqual(['a.ts', 'b.ts']);
     expect(p.matchedLines).toBe(8); // summed
   });
 

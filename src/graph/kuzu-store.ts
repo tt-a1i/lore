@@ -126,7 +126,8 @@ const DDL_STATEMENTS = [
     matchedVia   STRING,
     sourcePath   STRING,
     matchedLines INT64,
-    fileCount    INT64
+    fileCount    INT64,
+    files        STRING[]
   )`,
   `CREATE REL TABLE TOUCHES(
     FROM CommitNode TO File,
@@ -259,12 +260,13 @@ export class KuzuGraphStore implements GraphStore {
         sourcePath: e.sourcePath,
         matchedLines: e.matchedLines,
         fileCount: e.fileCount,
+        files: e.files ?? [],
       })),
       `UNWIND $rows AS r
        MATCH (s:Session {id: r.sessionId}), (c:CommitNode {hash: r.commitHash})
        CREATE (s)-[:PRODUCED {
          confidence: CAST(r.confidence AS DOUBLE), matchedVia: r.matchedVia, sourcePath: r.sourcePath,
-         matchedLines: r.matchedLines, fileCount: r.fileCount
+         matchedLines: r.matchedLines, fileCount: r.fileCount, files: r.files
        }]->(c)`,
     );
 
@@ -321,7 +323,7 @@ export class KuzuGraphStore implements GraphStore {
     const result = await this.c.query(
       `MATCH (s:Session)-[e:PRODUCED]->(c:CommitNode {hash: ${cypherLit(hash)}})
        RETURN s.id, s.agent, s.startedAt, s.endedAt, s.cwd, s.gitBranch, s.sourcePaths,
-              e.confidence, e.matchedVia, e.sourcePath, e.matchedLines, e.fileCount
+              e.confidence, e.matchedVia, e.sourcePath, e.matchedLines, e.fileCount, e.files
        ORDER BY e.confidence DESC`,
     );
     const rows = await result.getAll();
@@ -342,6 +344,7 @@ export class KuzuGraphStore implements GraphStore {
       sourcePath: str(r['e.sourcePath']),
       matchedLines: num(r['e.matchedLines']),
       fileCount: num(r['e.fileCount']),
+      files: strArr(r['e.files']),
     } satisfies ProducedInfo));
   }
 
@@ -365,7 +368,9 @@ export class KuzuGraphStore implements GraphStore {
         committerDate: str(cr['c.committerDate']),
         isMerge: bool(cr['c.isMerge']),
       };
-      const produced = await this.whoProducedCommit(commit.hash);
+      const produced = (await this.whoProducedCommit(commit.hash)).filter(
+        (p) => !Array.isArray(p.files) || p.files.length === 0 || p.files.includes(filePath),
+      );
       items.push({ commit, produced });
     }
     return items;
@@ -407,7 +412,7 @@ export class KuzuGraphStore implements GraphStore {
         this.c.query('MATCH (n:Session) RETURN n.id, n.agent, n.startedAt, n.endedAt, n.cwd, n.gitBranch, n.sourcePaths').then((r) => r.getAll()),
         this.c.query('MATCH (n:CommitNode) RETURN n.hash, n.subject, n.authorDate, n.committerDate, n.isMerge').then((r) => r.getAll()),
         this.c.query('MATCH (n:File) RETURN n.path').then((r) => r.getAll()),
-        this.c.query('MATCH (s:Session)-[e:PRODUCED]->(c:CommitNode) RETURN s.id, c.hash, e.confidence, e.matchedVia, e.sourcePath, e.matchedLines, e.fileCount').then((r) => r.getAll()),
+        this.c.query('MATCH (s:Session)-[e:PRODUCED]->(c:CommitNode) RETURN s.id, c.hash, e.confidence, e.matchedVia, e.sourcePath, e.matchedLines, e.fileCount, e.files').then((r) => r.getAll()),
         this.c.query('MATCH (c:CommitNode)-[e:TOUCHES]->(f:File) RETURN c.hash, f.path, e.status, e.addedLines, e.removedLines').then((r) => r.getAll()),
         this.c.query('MATCH (s:Session)-[e:EDITED]->(f:File) RETURN s.id, f.path, e.sourcePath, e.editCount, e.firstTs, e.lastTs').then((r) => r.getAll()),
       ]);
@@ -440,6 +445,7 @@ export class KuzuGraphStore implements GraphStore {
         sourcePath: str(r['e.sourcePath']),
         matchedLines: num(r['e.matchedLines']),
         fileCount: num(r['e.fileCount']),
+        files: strArr(r['e.files']),
       })),
       touches: touchesRows.map((r) => ({
         commitHash: str(r['c.hash']),

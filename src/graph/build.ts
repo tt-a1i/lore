@@ -233,7 +233,7 @@ function buildProduced(matches: MatchCandidate[]): ProducedEdgeData[] {
   const byKey = new Map<string, ProducedAccum>();
 
   for (const m of matches) {
-    const key = m.sessionId + ' ' + m.commitHash;
+    const key = m.sessionId + '\0' + m.commitHash;
     let acc = byKey.get(key);
     if (!acc) {
       acc = {
@@ -277,6 +277,7 @@ function buildProduced(matches: MatchCandidate[]): ProducedEdgeData[] {
       sourcePath: bestSource,
       matchedLines: acc.matchedLines,
       fileCount: acc.files.size,
+      files: [...acc.files].sort(),
     });
   }
   out.sort(
@@ -328,7 +329,7 @@ function buildEdited(
       if (rel === null || rel === '') continue;
 
       // EDITED 是"transcript 事实"，按 sessionId 聚合（PRODUCED 的证据指针才细到解析单元）。
-      const key = session.meta.sessionId + ' ' + rel;
+      const key = session.meta.sessionId + '\0' + rel;
       let acc = byKey.get(key);
       if (!acc) {
         acc = {

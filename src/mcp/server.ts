@@ -15,8 +15,8 @@
  * judge how trustworthy / current the index is:
  *   coverage:<attributed>/<total> · generated:<ISO date> [· stale:<bool>]
  * where attributed = commits with ≥1 match, total = commits scanned, generated =
- * report.json generatedAt, stale = report predates the current git HEAD commit.
- * The header is computed once per server (cached) — git/report reads are not free.
+ * report.json generatedAt, stale = report predates the current git HEAD commit
+ * or is older than the CLI freshness window.
  */
 
 import { execFile } from 'node:child_process';
@@ -264,13 +264,13 @@ interface ReportHeaderShape {
  * - coverage: commits with ≥1 match (strong+weak) over total commits scanned.
  * - generated: report.json generatedAt date (YYYY-MM-DD).
  * - stale: true when report.generatedAt is older than the current git HEAD commit
- *   time (the report no longer reflects the latest commit). When the git lookup
- *   fails (not a repo, detached, etc.) the stale field is omitted entirely.
+ *   time or older than four hours. When the git lookup fails, the age check still
+ *   runs so MCP stays consistent with CLI/status freshness.
  *
  * Returns null when report.json is missing/unreadable — callers then render
  * without a header (degrade gracefully, never throw).
  */
-async function buildFreshnessHeader(repoPath: string): Promise<string | null> {
+async function buildFreshnessHeader(repoPath: string, nowMs = Date.now()): Promise<string | null> {
   let report: ReportHeaderShape;
   try {
     const raw = await fs.readFile(path.join(repoPath, '.lore', 'report.json'), 'utf8');
@@ -288,16 +288,25 @@ async function buildFreshnessHeader(repoPath: string): Promise<string | null> {
 
   const segs = [`coverage:${attributed}/${total}`, `generated:${generatedDate}`];
 
-  // stale: compare report.generatedAt against HEAD commit time. Omit on any failure.
+  // stale: keep the same core contract as CLI/status: old by age OR behind HEAD.
   if (generatedAt) {
+    let stale = false;
+    let parsed = false;
+    const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+    const genMs = Date.parse(generatedAt);
+    if (!Number.isNaN(genMs)) {
+      parsed = true;
+      stale = nowMs - genMs > FOUR_HOURS_MS;
+    }
     const headTime = await headCommitISO(repoPath);
     if (headTime !== null) {
-      const genMs = Date.parse(generatedAt);
       const headMs = Date.parse(headTime);
       if (!Number.isNaN(genMs) && !Number.isNaN(headMs)) {
-        segs.push(`stale:${genMs < headMs}`);
+        parsed = true;
+        stale = stale || genMs < headMs;
       }
     }
+    if (parsed) segs.push(`stale:${stale}`);
   }
 
   return segs.join(' · ');
@@ -410,8 +419,9 @@ function assertLoreIndexed(root: string): void {
  *   1. Explicit `repo` param — must contain .lore/report.json, else hard error.
  *   2. Absolute `file` path — infer root via `git -C <dir> rev-parse --show-toplevel`
  *      (result cached per directory); root must also have .lore/report.json.
- *   3. Default — the startup repoPath the server was created with (always trusted;
- *      it was already validated at startup).
+ *   3. Default — the startup repoPath the server was created with; it must also
+ *      contain .lore/report.json so tools never turn "not indexed" into
+ *      "results:none".
  *
  * The function NEVER silently falls back to the startup repo when an explicit
  * target is given — that would attribute answers to the wrong project.
@@ -462,7 +472,9 @@ async function resolveRepo(
     return root;
   }
 
-  // 3. Default: startup root (already validated).
+  // 3. Default: startup root. Validate here too because tests and embedders can
+  // construct the server directly without going through `lore mcp`.
+  assertLoreIndexed(startupRoot);
   return startupRoot;
 }
 
@@ -503,14 +515,8 @@ export function createLoreMcpServer(
     version: '0.0.1',
   });
 
-  // Per-root freshness header cache: root → cached header string (or null).
-  const _headerCache = new Map<string, string | null>();
-
   async function freshnessHeaderFor(root: string): Promise<string | undefined> {
-    if (!_headerCache.has(root)) {
-      _headerCache.set(root, await buildFreshnessHeader(root));
-    }
-    return _headerCache.get(root) ?? undefined;
+    return (await buildFreshnessHeader(root)) ?? undefined;
   }
 
   // Convenience: freshness header for the startup root (kept for backward compat
@@ -601,7 +607,7 @@ export function createLoreMcpServer(
         'engineering knowledge extracted from the conversation — prefer these. ' +
         'A "msg" hit = a RAW, unvetted conversation snippet (low-trust, may be noisy or ' +
         'speculative) shown only as a fallback when notes do not cover the query. ' +
-        'Superseded (overturned) notes are hidden unless include_weak / includeSuperseded is set.\n' +
+        'Superseded (overturned) notes are hidden unless includeSuperseded is set.\n' +
         'CROSS-REPO: pass repo="/abs/path/to/other-repo" to query a different repository. ' +
         'The target repo must have been indexed by `lore scan`; otherwise lore tells you ' +
         'what to run rather than silently using the startup repo.',

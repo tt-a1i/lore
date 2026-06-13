@@ -136,7 +136,9 @@ export class JsonGraphStore implements GraphStore {
     for (const hash of hashes) {
       const commit = this.commitByHash.get(hash);
       if (!commit) continue;
-      const produced = this.producedByCommit.get(hash) ?? [];
+      const produced = (this.producedByCommit.get(hash) ?? []).filter(
+        (p) => !Array.isArray(p.files) || p.files.length === 0 || p.files.includes(filePath),
+      );
       result.push({ commit, produced });
     }
     return result;

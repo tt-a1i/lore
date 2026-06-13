@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { opencodeParser } from '../../src/parsers/opencode.js';
 import type {
@@ -361,6 +362,59 @@ describe('parse() — message extraction', () => {
     const { session, skipped } = await opencodeParser.parse(ctx.pseudoPath(SESSION_ID));
     expect(eventsOfKind(session.events, 'assistant-message')).toHaveLength(1);
     expect(skipped.count).toBe(0);
+  });
+});
+
+describe('parse() — published ESM runtime', () => {
+  it('imports the compiled ESM parser and opens node:sqlite through createRequire', async () => {
+    const SESSION_ID = 'ses_esm_runtime';
+    const T0 = 1781064349000;
+
+    insertSession(ctx, { id: SESSION_ID, directory: '/repo/esm', timeCreated: T0, timeUpdated: T0 });
+    insertMessage(ctx, {
+      id: 'msg_user_esm',
+      sessionId: SESSION_ID,
+      role: 'user',
+      timeCreated: T0,
+      parts: [{ id: 'prt_user_esm', type: 'text', text: 'ESM should parse this.' }],
+    });
+    ctx.db.close();
+
+    const distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lore-opencode-dist-'));
+    try {
+      fs.writeFileSync(path.join(distDir, 'package.json'), '{"type":"module"}\n', 'utf8');
+      const tscBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsc');
+      execFileSync(
+        tscBin,
+        ['-p', 'tsconfig.json', '--outDir', distDir, '--declaration', 'false', '--sourceMap', 'false'],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+
+      const script = `
+        import { pathToFileURL } from 'node:url';
+        const modUrl = pathToFileURL(process.argv[1] + '/parsers/opencode.js').href;
+        const { opencodeParser } = await import(modUrl);
+        const result = await opencodeParser.parse(process.argv[2]);
+        console.log(JSON.stringify({
+          agent: result.session.meta.agent,
+          events: result.session.events.length,
+          text: result.session.events[0]?.text ?? null,
+          samples: result.skipped.samples,
+        }));
+      `;
+      const out = execFileSync(
+        process.execPath,
+        ['--input-type=module', '-e', script, distDir, ctx.pseudoPath(SESSION_ID)],
+        { encoding: 'utf8' },
+      );
+      const parsed = JSON.parse(out.trim()) as { agent: string; events: number; text: string | null; samples: string[] };
+      expect(parsed.agent).toBe('opencode');
+      expect(parsed.events).toBe(1);
+      expect(parsed.text).toBe('ESM should parse this.');
+      expect(parsed.samples.join(' ')).not.toContain('node:sqlite unavailable');
+    } finally {
+      fs.rmSync(distDir, { recursive: true, force: true });
+    }
   });
 });
 

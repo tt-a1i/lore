@@ -50,6 +50,8 @@ export interface ProducedEdgeData {
   matchedLines: number;
   /** 该归因覆盖的文件数（来自 MatchCandidate 聚合）。 */
   fileCount: number;
+  /** 该归因覆盖的 repo 相对路径；旧 graph 可能缺失，查询方需兼容。 */
+  files?: string[];
 }
 
 export interface TouchesEdgeData {

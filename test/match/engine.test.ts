@@ -246,6 +246,82 @@ describe('write (whole-file) matching', () => {
     const m = report.matches.find((x) => x.filePath === 'new.ts')!;
     expect(m.contentScore).toBe(1);
   });
+
+  it('matches a deletion-only commit using removed lines from oldText', () => {
+    const removed = [
+      'obsolete branch alpha',
+      'obsolete branch beta',
+      'obsolete branch gamma',
+    ];
+    const commits = [
+      commit('c4del', [
+        {
+          path: 'old.ts',
+          status: 'D',
+          hunks: [hunk([], { oldLines: removed.length, newLines: 0, removedLines: removed })],
+        },
+      ]),
+    ];
+    const s = session('S', [
+      fileEdit(REPO + '/old.ts', '', {
+        op: 'write',
+        oldText: removed.join('\n'),
+        ts: '2026-06-01T11:59:00.000Z',
+        seq: 1,
+      }),
+    ]);
+
+    const report = engine.match(REPO, commits, [s]);
+    const m = report.matches.find((x) => x.filePath === 'old.ts')!;
+    expect(m).toBeDefined();
+    expect(m.contentScore).toBe(1);
+    expect(m.matchedLines).toBe(3);
+    expect(tierOf(m.confidence)).toBe('strong');
+    expect(m.editSeqs).toEqual([1]);
+  });
+
+  it('does not charge removed lines to a write/newText-only bucket denominator', () => {
+    const added = [
+      'replacement branch alpha',
+      'replacement branch beta',
+      'replacement branch gamma',
+    ];
+    const removed = [
+      'legacy branch alpha',
+      'legacy branch beta',
+      'legacy branch gamma',
+    ];
+    const commits = [
+      commit('c4mixed', [
+        {
+          path: 'mixed.ts',
+          status: 'M',
+          hunks: [
+            hunk(added, {
+              oldLines: removed.length,
+              newLines: added.length,
+              removedLines: removed,
+            }),
+          ],
+        },
+      ]),
+    ];
+    const s = session('S', [
+      fileEdit(REPO + '/mixed.ts', added.join('\n'), {
+        op: 'write',
+        oldText: null,
+        ts: '2026-06-01T11:59:00.000Z',
+        seq: 1,
+      }),
+    ]);
+
+    const report = engine.match(REPO, commits, [s]);
+    const m = report.matches.find((x) => x.filePath === 'mixed.ts')!;
+    expect(m).toBeDefined();
+    expect(m.contentScore).toBe(1);
+    expect(m.matchedLines).toBe(3);
+    expect(tierOf(m.confidence)).toBe('strong');
+  });
 });
 
 describe('failed edit exclusion', () => {

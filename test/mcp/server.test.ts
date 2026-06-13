@@ -212,7 +212,15 @@ async function makeClientServer(
   },
   repoPath = '/fake/repo',
 ): Promise<{ client: Client; cleanup: () => Promise<void> }> {
-  const server = createLoreMcpServer(repoPath, engines);
+  const root = repoPath === '/fake/repo'
+    ? makeRepoWithReport({
+        generatedAt: new Date().toISOString(),
+        commitsTotal: 1,
+        commitsMatchedStrong: 1,
+        commitsMatchedWeak: 0,
+      })
+    : repoPath;
+  const server = createLoreMcpServer(root, engines);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
   const client = new Client({ name: 'test-client', version: '0.0.1' });
@@ -750,6 +758,8 @@ describe('server tool listing', () => {
       expect(d).toContain('rejected-approach');
       expect(d.toLowerCase()).toContain('distilled'); // note = distilled high-trust
       expect(d.toLowerCase()).toMatch(/raw|unvetted/); // msg = raw low-trust
+      expect(d).toContain('includeSuperseded');
+      expect(d).not.toContain('include_weak');
     } finally {
       await cleanup();
     }
@@ -901,18 +911,18 @@ describe('freshnessHeader', () => {
     expect(await __test__.buildFreshnessHeader(dir)).toBeNull();
   });
 
-  it('builds coverage + generated without stale when not a git repo', async () => {
+  it('builds coverage + generated and still reports age staleness when not a git repo', async () => {
     const dir = makeRepoWithReport({
       generatedAt: '2026-06-12T09:00:00.000Z',
       commitsTotal: 100,
       commitsMatchedStrong: 40,
       commitsMatchedWeak: 10,
     });
-    const header = await __test__.buildFreshnessHeader(dir);
+    const header = await __test__.buildFreshnessHeader(dir, Date.parse('2026-06-20T01:00:00.000Z'));
     expect(header).toContain('coverage:50/100');
     expect(header).toContain('generated:2026-06-12');
-    // No git repo → stale omitted.
-    expect(header).not.toContain('stale:');
+    // No git repo means HEAD comparison is skipped, but age staleness still applies.
+    expect(header).toContain('stale:true');
   });
 
   it('marks stale:true when report predates HEAD commit', async () => {
@@ -945,6 +955,21 @@ describe('freshnessHeader', () => {
     expect(header).toContain('stale:false');
   });
 
+  it('marks stale:true when report is older than the freshness window even if HEAD is older', async () => {
+    const dir = makeRepoWithReport(
+      {
+        generatedAt: '2025-01-01T00:00:00.000Z',
+        commitsTotal: 10,
+        commitsMatchedStrong: 5,
+        commitsMatchedWeak: 0,
+      },
+      { initGit: true, commitDate: '2024-01-01T12:00:00 +0000' },
+    );
+    const header = await __test__.buildFreshnessHeader(dir);
+    expect(header).toContain('coverage:5/10');
+    expect(header).toContain('stale:true');
+  });
+
   it('tool output first line carries the freshness header', async () => {
     const dir = makeRepoWithReport({
       generatedAt: '2026-06-12T09:00:00.000Z',
@@ -965,6 +990,69 @@ describe('freshnessHeader', () => {
       const firstLine = text.split('\n')[0]!;
       expect(firstLine).toContain('coverage:50/100');
       expect(firstLine).toContain('generated:2026-06-12');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('tool output freshness header reflects report.json changes between calls', async () => {
+    const dir = makeRepoWithReport({
+      generatedAt: '2026-06-12T09:00:00.000Z',
+      commitsTotal: 1,
+      commitsMatchedStrong: 0,
+      commitsMatchedWeak: 0,
+    });
+    const { client, cleanup } = await makeClientServer(
+      { askEngine: mockAskEngine(makeAskResult()) },
+      dir,
+    );
+    try {
+      const first = await client.callTool({
+        name: 'lore_ask',
+        arguments: { question: 'why YAML?' },
+      });
+      const firstLine = ((first.content as { type: string; text: string }[])[0]!.text).split('\n')[0]!;
+      expect(firstLine).toContain('coverage:0/1');
+
+      writeFileSync(
+        join(dir, '.lore', 'report.json'),
+        JSON.stringify({
+          generatedAt: '2026-06-13T09:00:00.000Z',
+          commitsTotal: 99,
+          commitsMatchedStrong: 70,
+          commitsMatchedWeak: 10,
+        }),
+        'utf8',
+      );
+
+      const second = await client.callTool({
+        name: 'lore_ask',
+        arguments: { question: 'why YAML?' },
+      });
+      const secondLine = ((second.content as { type: string; text: string }[])[0]!.text).split('\n')[0]!;
+      expect(secondLine).toContain('coverage:80/99');
+      expect(secondLine).toContain('generated:2026-06-13');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('default unindexed repo returns an error instead of results:none', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lore-mcp-unindexed-'));
+    headerTmpDirs.push(dir);
+    const { client, cleanup } = await makeClientServer(
+      { askEngine: mockAskEngine(makeAskResult()) },
+      dir,
+    );
+    try {
+      const result = await client.callTool({
+        name: 'lore_ask',
+        arguments: { question: 'why YAML?' },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as { type: string; text: string }[])[0]!.text;
+      expect(text).toContain('has not been indexed');
+      expect(text).toContain('lore scan');
     } finally {
       await cleanup();
     }
@@ -1131,7 +1219,7 @@ describe('lore_status', () => {
     }
   });
 
-  it('degrades gracefully when report.json is absent', async () => {
+  it('errors clearly when the startup repo is not indexed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'lore-mcp-nostatus-'));
     headerTmpDirs.push(dir);
     mkdirSync(join(dir, '.lore'), { recursive: true });
@@ -1139,11 +1227,10 @@ describe('lore_status', () => {
     const { client, cleanup } = await makeClientServer({ notesStore: store }, dir);
     try {
       const r = await client.callTool({ name: 'lore_status', arguments: {} });
-      expect(r.isError).toBeFalsy();
+      expect(r.isError).toBe(true);
       const text = (r.content as { type: string; text: string }[])[0]!.text;
-      expect(text).toContain('notes:total=0 valid=0');
-      expect(text).toContain('distilledAt:never');
-      expect(text).toContain('window.end:unknown');
+      expect(text).toContain('has not been indexed');
+      expect(text).toContain('lore scan');
     } finally {
       await cleanup();
     }

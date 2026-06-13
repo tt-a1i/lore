@@ -4,7 +4,7 @@
  * 背景：.lore/report.json 的 matches 里，每个 (commit, file) 一条 MatchCandidate。
  * 我们为每个 commit 取 confidence 最高的那条 candidate（仅 strong，≥0.8），重 parse 它的
  * sourcePath transcript，按 editSeqs 找贡献编辑前后最近的 user/assistant 消息，取 ≤2 条
- * （user 优先），每条 ≤320 字符。同一 transcript 只 parse 一次（内存缓存）。
+ * （user 优先），每条 ≤320 字符。同一 transcript/parser 组合只 parse 一次（内存缓存）。
  *
  * 容错铁律：任何一步失败该 commit 无摘录即可，绝不抛——无论被 server 还是 scan 调用，
  * 都不能让上层挂掉。
@@ -115,13 +115,13 @@ export function topStrongCandidateByCommit(
   return topByCommit;
 }
 
-/** 懒加载 claudeCodeParser；失败返回 null（调用方据此放弃摘录、不抛）。 */
-async function loadParser(): Promise<TranscriptParser | null> {
+/** 懒加载全部 parser；失败返回空数组（调用方据此放弃摘录、不抛）。 */
+async function loadParsers(): Promise<TranscriptParser[]> {
   try {
-    const mod = await import('../parsers/claude-code.js');
-    return mod.claudeCodeParser;
+    const mod = await import('../parsers/registry.js');
+    return Array.isArray(mod.allParsers) ? mod.allParsers : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -134,7 +134,7 @@ async function loadParser(): Promise<TranscriptParser | null> {
  */
 export async function computeExcerpts(
   repoPath: string,
-  injectedParser?: TranscriptParser,
+  injectedParser?: TranscriptParser | TranscriptParser[],
 ): Promise<Record<string, ViewerExcerpt[]>> {
   const result: Record<string, ViewerExcerpt[]> = {};
 
@@ -151,28 +151,64 @@ export async function computeExcerpts(
   const topByCommit = topStrongCandidateByCommit(matches);
   if (topByCommit.size === 0) return result;
 
-  const parser = injectedParser ?? (await loadParser());
-  if (!parser) return result; // parser 不可用：全体无摘录（不抛）。
+  const parsers = injectedParser
+    ? (Array.isArray(injectedParser) ? injectedParser : [injectedParser])
+    : await loadParsers();
+  if (parsers.length === 0) return result; // parser 不可用：全体无摘录（不抛）。
 
-  // 同一 sourcePath 只 parse 一次（内存缓存，含失败的 null）。
+  // 同一 sourcePath/parser 只 parse 一次（内存缓存，含失败的 null）。
   const parseCache = new Map<string, ParsedSession | null>();
-  async function parseOnce(sourcePath: string): Promise<ParsedSession | null> {
-    if (parseCache.has(sourcePath)) return parseCache.get(sourcePath) ?? null;
+  async function parseWith(
+    parser: TranscriptParser,
+    sourcePath: string,
+    parserIdx: number,
+  ): Promise<ParsedSession | null> {
+    const key = parserIdx + '\0' + sourcePath;
+    if (parseCache.has(key)) return parseCache.get(key) ?? null;
     let session: ParsedSession | null = null;
     try {
-      const parsed = await parser!.parse(sourcePath);
+      const parsed = await parser.parse(sourcePath);
       session = parsed.session;
     } catch {
       session = null;
     }
-    parseCache.set(sourcePath, session);
+    parseCache.set(key, session);
     return session;
+  }
+
+  async function parseBestSession(cand: MatchCandidate): Promise<ParsedSession | null> {
+    let best: ParsedSession | null = null;
+    let bestScore = 0;
+    const editSeqSet = new Set(cand.editSeqs ?? []);
+
+    for (let i = 0; i < parsers.length; i++) {
+      const parser = parsers[i]!;
+      const session = await parseWith(parser, cand.sourcePath!, i);
+      if (!session) continue;
+
+      let score = 0;
+      if (session.meta.sessionId === cand.sessionId) score += 4;
+      if (
+        editSeqSet.size > 0 &&
+        session.events.some((e) => e.kind === 'file-edit' && editSeqSet.has(e.seq))
+      ) {
+        score += 4;
+      }
+      if (session.events.length > 0) score += 1;
+
+      if (score > bestScore) {
+        best = session;
+        bestScore = score;
+      }
+    }
+
+    return bestScore > 0 ? best : null;
   }
 
   for (const [commitHash, cand] of topByCommit) {
     try {
       if (!cand.sourcePath) continue;
-      const session = await parseOnce(cand.sourcePath);
+      const session = await parseBestSession(cand);
       if (!session) continue;
       const excerpts = excerptsForCandidate(session, cand.editSeqs ?? []);
       if (excerpts.length) result[commitHash] = excerpts;

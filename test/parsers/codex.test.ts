@@ -136,6 +136,54 @@ describe('apply_patch envelope fallback', () => {
     expect(e.newText).toBe('export const x = 1;\nexport const y = 2;');
     expect(e.toolUseId).toBe('call_FB1');
   });
+
+  it('does not turn a failed patch_apply_end into a succeeded fallback edit', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lore-codex-failed-patch-'));
+    try {
+      const transcript = path.join(dir, 'failed.jsonl');
+      const patch = [
+        '*** Begin Patch',
+        '*** Add File: src/failed.ts',
+        '+export const shouldNotExist = true;',
+        '*** End Patch',
+      ].join('\n');
+      const lines = [
+        {
+          timestamp: '2026-06-10T06:35:22.201Z',
+          type: 'session_meta',
+          payload: { id: 'sess-failed-patch', cwd: '/Users/x/code/myproject', cli_version: '0.139.0' },
+        },
+        {
+          timestamp: '2026-06-10T06:35:23.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'apply_patch',
+            call_id: 'call_FAILED',
+            input: patch,
+          },
+        },
+        {
+          timestamp: '2026-06-10T06:35:24.000Z',
+          type: 'event_msg',
+          payload: {
+            type: 'patch_apply_end',
+            call_id: 'call_FAILED',
+            success: false,
+            changes: {
+              'src/failed.ts': { type: 'add', content: 'export const shouldNotExist = true;\n' },
+            },
+          },
+        },
+      ];
+      fs.writeFileSync(transcript, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+      const { session } = await codexParser.parse(transcript);
+      expect(eventsOfKind(session.events, 'file-edit')).toHaveLength(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

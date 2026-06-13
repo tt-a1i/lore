@@ -6,7 +6,7 @@
  *      hash 全 0 = 未提交（working tree / staged），报清晰错误。
  *   2. 读 <repo>/.lore/report.json，取该 (commitHash, filePath) 的 MatchCandidate
  *      列表（按 confidence 降序，取前 3）作为归因。
- *   3. 每个归因：parse 其 candidate.sourcePath（claudeCodeParser），按 editSeqs 定位
+ *   3. 每个归因：parse 其 candidate.sourcePath（注册 parser 中选最佳匹配），按 editSeqs 定位
  *      file-edit 事件，向前找最近 user/assistant、向后找最近各一条，
  *      截 400 字符做 ConversationExcerpt（锚点 = sessionId + seq）。
  *   4. commit 元数据优先取 GraphStore.whoProducedCommit（图谱已吸收 squash/分支形态）；
@@ -197,10 +197,14 @@ function buildExcerpts(session: ParsedSession, editSeqs: number[]): Conversation
 }
 
 export class DeterministicWhyEngine implements WhyEngine {
+  private readonly parsers: TranscriptParser[];
+
   constructor(
     private readonly store: GraphStore,
-    private readonly parser: TranscriptParser,
-  ) {}
+    parser: TranscriptParser | TranscriptParser[],
+  ) {
+    this.parsers = Array.isArray(parser) ? parser : [parser];
+  }
 
   async why(repoPath: string, file: string, line: number, opts?: WhyOptions): Promise<WhyResult> {
     const repo = path.resolve(repoPath);
@@ -308,12 +312,7 @@ export class DeterministicWhyEngine implements WhyEngine {
   ): Promise<WhyAttribution | null> {
     let session: ParsedSession | null = null;
     if (cand.sourcePath) {
-      try {
-        const result = await this.parser.parse(cand.sourcePath);
-        session = result.session;
-      } catch {
-        session = null;
-      }
+      session = await this.parseBestSession(cand.sourcePath, cand.sessionId, cand.editSeqs);
     }
 
     let excerpts: ConversationExcerpt[] = session ? buildExcerpts(session, cand.editSeqs) : [];
@@ -346,6 +345,48 @@ export class DeterministicWhyEngine implements WhyEngine {
     return attribution;
   }
 
+  /**
+   * Try all available transcript parsers and keep the result that actually
+   * matches the candidate. Some parsers can "parse" another agent's JSONL into
+   * an empty session without throwing, so first-success is not safe here.
+   */
+  private async parseBestSession(
+    sourcePath: string,
+    expectedSessionId: string,
+    editSeqs: number[],
+  ): Promise<ParsedSession | null> {
+    let best: ParsedSession | null = null;
+    let bestScore = 0;
+    const editSeqSet = new Set(editSeqs);
+
+    for (const parser of this.parsers) {
+      let session: ParsedSession;
+      try {
+        const result = await parser.parse(sourcePath);
+        session = result.session;
+      } catch {
+        continue;
+      }
+
+      let score = 0;
+      if (session.meta.sessionId === expectedSessionId) score += 4;
+      if (
+        editSeqSet.size > 0 &&
+        session.events.some((e) => e.kind === 'file-edit' && editSeqSet.has(e.seq))
+      ) {
+        score += 4;
+      }
+      if (session.events.length > 0) score += 1;
+
+      if (score > bestScore) {
+        best = session;
+        bestScore = score;
+      }
+    }
+
+    return bestScore > 0 ? best : null;
+  }
+
   /** session 节点：优先从图谱拿，否则从重新 parse 的 meta 合成（兜底）。 */
   private async sessionNodeFor(
     sessionId: string,
@@ -373,7 +414,7 @@ export class DeterministicWhyEngine implements WhyEngine {
     }
     return {
       id: sessionId,
-      agent: 'claude-code',
+      agent: 'unknown',
       startedAt: '',
       endedAt: null,
       cwd: null,
@@ -424,13 +465,16 @@ function filePathMatch(reportPath: string, queried: string): boolean {
 }
 
 /** 工厂：注入 GraphStore + parser。单测与显式装配走这条。 */
-export function createWhyEngine(store: GraphStore, parser: TranscriptParser): WhyEngine {
+export function createWhyEngine(
+  store: GraphStore,
+  parser: TranscriptParser | TranscriptParser[],
+): WhyEngine {
   return new DeterministicWhyEngine(store, parser);
 }
 
 /**
  * 自装配引擎：cli.ts 通过 `mod.engine` 直接拿到一个可用 WhyEngine，
- * 内部按 repoPath 懒加载 GraphStore（graph/factory）与 claudeCodeParser。
+ * 内部按 repoPath 懒加载 GraphStore（graph/factory）与 parser registry。
  * 这样 cli 无需关心依赖装配，引擎本体仍可注入式单测。
  *
  * 注意：每次 why() 都新建 store 并在结束后 close——why 是一次性查询命令，
@@ -442,16 +486,16 @@ class SelfWiringWhyEngine implements WhyEngine {
     // factory.js 由存储层另行落地；用计算 specifier 做运行时导入，避免
     // 在它就位前阻塞本模块的 typecheck。
     const factorySpec = '../graph/factory.js';
-    const [factoryMod, { claudeCodeParser }] = await Promise.all([
+    const [factoryMod, parserRegistry] = await Promise.all([
       import(factorySpec) as Promise<{
         createGraphStore: (p: string) => Promise<GraphStore>;
       }>,
-      import('../parsers/claude-code.js') as Promise<{ claudeCodeParser: TranscriptParser }>,
+      import('../parsers/registry.js') as Promise<{ allParsers: TranscriptParser[] }>,
     ]);
     const store = await factoryMod.createGraphStore(repo);
     await store.init();
     try {
-      const inner = new DeterministicWhyEngine(store, claudeCodeParser);
+      const inner = new DeterministicWhyEngine(store, parserRegistry.allParsers);
       return await inner.why(repo, file, line, opts);
     } finally {
       await store.close();

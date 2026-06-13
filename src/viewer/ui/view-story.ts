@@ -252,12 +252,12 @@ export const JS = `
       var produced = g.produced || [];
       var touches = g.touches || [];
 
-      // 空态（保留旧文案）。
+      // 空态。
       if (!commits.length) {
         el.innerHTML =
           '<div class="story-empty">' +
           '<div class="big">No commits to tell a story yet</div>' +
-          '<div class="small">Run <span class="mono">lore build</span> on a repo with history to populate the timeline.</div>' +
+          '<div class="small">Run <span class="mono">lore scan --repo &lt;path&gt;</span> on a repo with history to populate the timeline.</div>' +
           '</div>';
         return;
       }

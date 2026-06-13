@@ -330,6 +330,7 @@ describe('hook install/uninstall (subprocess)', () => {
   };
   const cmdsOf = (data: ThreeHookSettings, event: keyof ThreeHookSettings['hooks']): string[] =>
     (data.hooks[event] ?? []).flatMap((m) => (m.hooks ?? []).map((h) => h.command));
+  const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 
   it('installs all three hooks (SessionStart + PreToolUse + Stop) into settings.json', async () => {
     const repoPath = tmpDir;
@@ -339,19 +340,27 @@ describe('hook install/uninstall (subprocess)', () => {
     const settingsPath = path.join(repoPath, '.claude', 'settings.json');
     const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
 
-    // Stop = scan refresh (unchanged from P1).
-    const stopExpected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    expect(cmdsOf(data, 'Stop')).toContain(stopExpected);
+    // Stop = scan refresh, including graph rebuild.
+    const stop = cmdsOf(data, 'Stop');
+    expect(stop.length).toBe(1);
+    expect(stop[0]).toContain('LORE_HOOK=1');
+    expect(stop[0]).toContain(`scan --repo ${shellQuote(repoPath)} --broad`);
+    expect(stop[0]).not.toContain('--no-graph');
+    expect(stop[0]).not.toContain('npx -y lore');
 
     // SessionStart = brief; PreToolUse = guard. Command prefix is `node …dist/cli.js`
-    // in built mode or `npx -y lore` in tsx mode — assert on the subcommand + flags.
+    // in built mode or `npx -y @tt-a1i/lore` in tsx mode — assert on the subcommand + flags.
     const ss = cmdsOf(data, 'SessionStart');
     expect(ss.length).toBe(1);
-    expect(ss[0]).toContain(`brief --repo ${repoPath} --format hook-json`);
+    expect(ss[0]).toContain('LORE_HOOK=1');
+    expect(ss[0]).toContain(`brief --repo ${shellQuote(repoPath)} --format hook-json`);
+    expect(ss[0]).not.toContain('npx -y lore');
 
     const pre = cmdsOf(data, 'PreToolUse');
     expect(pre.length).toBe(1);
-    expect(pre[0]).toContain(`guard --hook --repo ${repoPath}`);
+    expect(pre[0]).toContain('LORE_HOOK=1');
+    expect(pre[0]).toContain(`guard --hook --repo ${shellQuote(repoPath)}`);
+    expect(pre[0]).not.toContain('npx -y lore');
 
     // PreToolUse matcher must scope to write tools.
     expect(data.hooks.PreToolUse?.[0]?.matcher).toBe('Edit|Write|MultiEdit');
@@ -420,16 +429,64 @@ describe('hook install/uninstall (subprocess)', () => {
     expect(cmdsOf(data, 'PreToolUse').some((c) => c.includes('guard --hook'))).toBe(false);
   }, 30_000);
 
+  it('uninstall preserves unrelated hooks that mention the same repo and subcommand words', async () => {
+    const repoPath = tmpDir;
+    const claudeDir = path.join(repoPath, '.claude');
+    await fs.mkdir(claudeDir, { recursive: true });
+    const unrelatedStop = `node /tmp/custom-scan.js --repo ${repoPath} scan`;
+    await fs.writeFile(
+      path.join(claudeDir, 'settings.json'),
+      JSON.stringify({
+        hooks: {
+          Stop: [{ matcher: '', hooks: [{ type: 'command', command: unrelatedStop }] }],
+        },
+      }, null, 2),
+      'utf8',
+    );
+
+    await runInstall(repoPath);
+    await runUninstall(repoPath);
+
+    const data = await readSettingsAt(path.join(claudeDir, 'settings.json')) as ThreeHookSettings;
+    expect(cmdsOf(data, 'Stop')).toContain(unrelatedStop);
+    expect(cmdsOf(data, 'Stop').some((c) => c.includes('LORE_HOOK=1'))).toBe(false);
+  }, 30_000);
+
   it('global flag installs all three into $HOME/.claude/settings.json', async () => {
     const repoPath = tmpDir;
     await runInstall(repoPath, { global: true });
 
     const settingsPath = path.join(tmpDir, '.claude', 'settings.json');
     const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
-    const stopExpected = `npx -y lore scan --repo ${repoPath} --broad --no-graph >/dev/null 2>&1 || true`;
-    expect(cmdsOf(data, 'Stop')).toContain(stopExpected);
+    const stop = cmdsOf(data, 'Stop');
+    expect(stop.length).toBe(1);
+    expect(stop[0]).toContain('LORE_HOOK=1');
+    expect(stop[0]).toContain(`scan --repo ${shellQuote(repoPath)} --broad`);
+    expect(stop[0]).not.toContain('--no-graph');
     expect(cmdsOf(data, 'SessionStart').some((c) => c.includes('brief --repo'))).toBe(true);
     expect(cmdsOf(data, 'PreToolUse').some((c) => c.includes('guard --hook'))).toBe(true);
+  }, 30_000);
+
+  it('shell-quotes repo paths in hook commands', async () => {
+    const repoPath = path.join(tmpDir, "repo with space and 'quote'");
+    await fs.mkdir(repoPath, { recursive: true });
+    await runInstall(repoPath);
+
+    const settingsPath = path.join(repoPath, '.claude', 'settings.json');
+    const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
+    const quoted = shellQuote(repoPath);
+    for (const ev of ['SessionStart', 'PreToolUse', 'Stop'] as const) {
+      const [cmd] = cmdsOf(data, ev);
+      expect(cmd).toContain(`--repo ${quoted}`);
+      expect(cmd).not.toContain(`--repo ${repoPath}`);
+    }
+
+    const out = await runUninstall(repoPath);
+    expect(out).toContain('hooks removed');
+    const after = await readSettingsAt(settingsPath) as ThreeHookSettings;
+    for (const ev of ['SessionStart', 'PreToolUse', 'Stop'] as const) {
+      expect(cmdsOf(after, ev).filter((c) => c.includes('lore'))).toHaveLength(0);
+    }
   }, 30_000);
 });
 

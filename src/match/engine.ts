@@ -73,32 +73,48 @@ function normalizePath(rawPath: string, repoPath: string, cwd: string | null): s
   return null;
 }
 
-/** 取一个 FileEditEvent 贡献的归一化行集（patch +行优先，退 newText）。
+interface EditContentLines {
+  added: string[];
+  removed: string[];
+}
+
+/** 取一个 FileEditEvent 贡献的归一化行集（patch +/- 行优先，退 newText/oldText）。
  *
- * 注意：write op 整文件覆盖，应与 commit 全文件内容比对，用 newText。
- * edit/multi-edit/notebook-edit 才走 patch（仅 +行）。
- * patch 为 null 时统一退 newText。
+ * 注意：write op 整文件覆盖，应与 commit 全文件内容比对，用 newText；
+ * 若 oldText 存在，也可用于 delete-only 归因。
+ * edit/multi-edit/notebook-edit 才走 patch（+/- 行分通道）。
+ * patch 为 null 时统一退 newText/oldText。
  */
-function editAddedLines(edit: FileEditEvent): string[] {
+function editContentLines(edit: FileEditEvent): EditContentLines {
   // write 整文件覆盖：使用 newText 全文比对，不走 patch（patch 只含变更行，会严重低估重叠率）。
   if (edit.op === 'write') {
-    return normalizeLines(edit.newText.split('\n'));
+    return {
+      added: normalizeLines(edit.newText.split('\n')),
+      removed: edit.oldText === null ? [] : normalizeLines(edit.oldText.split('\n')),
+    };
   }
   if (edit.patch && edit.patch.length > 0) {
     const plus: string[] = [];
+    const minus: string[] = [];
     for (const hunk of edit.patch) {
       for (const line of hunk.lines) {
         // structuredPatch 行带 +/-/空格 前缀。
         if (line.startsWith('+')) {
           const n = normalizeLine(line.slice(1));
           if (n !== null) plus.push(n);
+        } else if (line.startsWith('-')) {
+          const n = normalizeLine(line.slice(1));
+          if (n !== null) minus.push(n);
         }
       }
     }
-    return plus;
+    return { added: plus, removed: minus };
   }
   // 无 patch 的 edit/multi-edit：退回 newText 行集。
-  return normalizeLines(edit.newText.split('\n'));
+  return {
+    added: normalizeLines(edit.newText.split('\n')),
+    removed: edit.oldText === null ? [] : normalizeLines(edit.oldText.split('\n')),
+  };
 }
 
 interface EditRecord {
@@ -117,8 +133,10 @@ interface SessionFileBucket {
   sessionId: string;
   /** 解析单元（transcript 文件）——父 session 与各子 agent 必须分桶，证据才可复核。 */
   sourcePath: string;
-  /** 归一化行 → 出现次数（多重集）。 */
+  /** 新增归一化行 → 出现次数（多重集）。 */
   lineCounts: Map<string, number>;
+  /** 删除归一化行 → 出现次数（多重集）。 */
+  removedLineCounts: Map<string, number>;
   /** 贡献了内容的 edit seq（去重、升序）。 */
   seqs: Set<number>;
   /** 该 session 该文件最早/最晚编辑时间，及每个 edit 的 (seq,ts)。 */
@@ -250,23 +268,34 @@ export class ContentTimeMatchEngine implements MatchEngine {
         const sessionBuckets = index.byPath.get(relPath);
         if (!sessionBuckets || sessionBuckets.size === 0) continue;
 
-        // commit 该文件的目标行集（addedLines 归一化）。
-        const targetLines = normalizeLines(this.collectAddedLines(cf));
-        const targetTotal = targetLines.length;
+        // commit 该文件的目标行集（新增/删除分通道归一化）。
+        const targetLines = this.collectContentLines(cf);
         // 目标行多重集计数，便于交集。
-        const targetCounts = new Map<string, number>();
-        for (const l of targetLines) targetCounts.set(l, (targetCounts.get(l) ?? 0) + 1);
+        const targetAddedCounts = new Map<string, number>();
+        for (const l of targetLines.added) targetAddedCounts.set(l, (targetAddedCounts.get(l) ?? 0) + 1);
+        const targetRemovedCounts = new Map<string, number>();
+        for (const l of targetLines.removed) targetRemovedCounts.set(l, (targetRemovedCounts.get(l) ?? 0) + 1);
 
         const prevCommitTime = prevCommitTimeByPath.get(relPath)?.get(commit.hash) ?? null;
 
         for (const bucket of sessionBuckets.values()) {
-          // contentScore: 命中行数 / 总有效行数（commit 侧总有效行数为分母）。
+          // contentScore: 命中行数 / 可由该 bucket 证明的 commit 侧有效行数。
+          // newText-only bucket 没有 removed evidence 时，不把 commit removedLines 计入分母。
           let hits = 0;
+          const hasRemovedEvidence = bucket.removedLineCounts.size > 0;
+          const targetTotal =
+            targetLines.added.length + (hasRemovedEvidence ? targetLines.removed.length : 0);
           if (targetTotal > 0) {
             // 多重集交集：min(目标计数, edit 侧计数) 求和。
-            for (const [line, tcount] of targetCounts) {
+            for (const [line, tcount] of targetAddedCounts) {
               const ecount = bucket.lineCounts.get(line);
               if (ecount !== undefined) hits += Math.min(tcount, ecount);
+            }
+            if (hasRemovedEvidence) {
+              for (const [line, tcount] of targetRemovedCounts) {
+                const ecount = bucket.removedLineCounts.get(line);
+                if (ecount !== undefined) hits += Math.min(tcount, ecount);
+              }
             }
           }
           const contentScore = targetTotal > 0 ? hits / targetTotal : 0;
@@ -400,7 +429,7 @@ export class ContentTimeMatchEngine implements MatchEngine {
         }
         if (rel === null || rel === '') continue;
 
-        const lines = editAddedLines(edit);
+        const lines = editContentLines(edit);
         // 即便行集为空（极端 write），仍登记 edit 时间用于 anchor/time，但内容无贡献。
         let sessMap = byPath.get(rel);
         if (!sessMap) {
@@ -409,22 +438,26 @@ export class ContentTimeMatchEngine implements MatchEngine {
         }
         // 桶按解析单元（sessionId + sourcePath）分，不按 sessionId 合并——
         // 否则父 session 与子 agent 的编辑混在一起，证据无法指向真正的出处。
-        const bucketKey = session.meta.sessionId + ' ' + sourcePath;
+        const bucketKey = session.meta.sessionId + '\0' + sourcePath;
         let bucket = sessMap.get(bucketKey);
         if (!bucket) {
           bucket = {
             sessionId: session.meta.sessionId,
             sourcePath,
             lineCounts: new Map(),
+            removedLineCounts: new Map(),
             seqs: new Set(),
             edits: [],
           };
           sessMap.set(bucketKey, bucket);
         }
-        for (const l of lines) {
+        for (const l of lines.added) {
           bucket.lineCounts.set(l, (bucket.lineCounts.get(l) ?? 0) + 1);
         }
-        if (lines.length > 0) bucket.seqs.add(edit.seq);
+        for (const l of lines.removed) {
+          bucket.removedLineCounts.set(l, (bucket.removedLineCounts.get(l) ?? 0) + 1);
+        }
+        if (lines.added.length > 0 || lines.removed.length > 0) bucket.seqs.add(edit.seq);
         bucket.edits.push({ seq: edit.seq, ts: parseTs(edit.ts) });
       }
     }
@@ -534,13 +567,15 @@ export class ContentTimeMatchEngine implements MatchEngine {
     return score > 0 ? score : 0;
   }
 
-  /** 收集一个 CommitFile 全部 hunk 的 addedLines（未归一化）。 */
-  private collectAddedLines(cf: CommitFile): string[] {
-    const out: string[] = [];
+  /** 收集一个 CommitFile 全部 hunk 的 addedLines/removedLines（未归一化）。 */
+  private collectContentLines(cf: CommitFile): { added: string[]; removed: string[] } {
+    const added: string[] = [];
+    const removed: string[] = [];
     for (const h of cf.hunks) {
-      for (const l of h.addedLines) out.push(l);
+      for (const l of h.addedLines) added.push(l);
+      for (const l of h.removedLines) removed.push(l);
     }
-    return out;
+    return { added: normalizeLines(added), removed: normalizeLines(removed) };
   }
 }
 

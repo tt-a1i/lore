@@ -24,6 +24,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
+import { createRequire } from 'node:module';
 import {
   SCHEMA_VERSION,
   type AgentKind,
@@ -51,6 +52,7 @@ const OPENCODE_DB_PATH = path.join(
 );
 
 const PSEUDO_PATH_SEP = '#';
+const require = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // SQLite row shapes (permissive — extra columns ignored)

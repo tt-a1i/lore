@@ -349,6 +349,7 @@ async function parseFile(transcriptPath: string): Promise<ParseResult> {
   ): void {
     const filePath = resolvePath(rawPath, cwd);
     const op = changeTypeToOp(change.type);
+    let oldText: string | null = null;
     let newText = '';
     let patch: PatchHunk[] | null = null;
     if (change.type === 'update' && typeof change.unified_diff === 'string') {
@@ -356,6 +357,7 @@ async function parseFile(transcriptPath: string): Promise<ParseResult> {
       newText = newTextFromUnifiedDiff(change.unified_diff);
     } else if (typeof change.content === 'string') {
       // add / delete carry full content
+      if (change.type === 'delete') oldText = change.content;
       newText = change.type === 'delete' ? '' : change.content;
     }
     const ev: FileEditEvent = {
@@ -366,7 +368,7 @@ async function parseFile(transcriptPath: string): Promise<ParseResult> {
       toolUseId: callId,
       op,
       filePath,
-      oldText: null,
+      oldText,
       newText,
       patch,
       userModified: null,
@@ -414,12 +416,15 @@ async function parseFile(transcriptPath: string): Promise<ParseResult> {
       }
       case 'patch_apply_end': {
         const pe = payload as PatchApplyEndPayload;
+        const callId = typeof pe.call_id === 'string' ? pe.call_id : null;
+        // A companion patch_apply_end, successful or failed, means the custom
+        // tool call was observed. Failed applies must suppress the deferred
+        // envelope fallback, otherwise attempted patches become succeeded edits.
+        if (callId) emittedPatchCallIds.add(callId);
         // Only count successful applies (success defaults to true when absent).
         if (pe.success === false) return;
-        const callId = typeof pe.call_id === 'string' ? pe.call_id : null;
         const changes = pe.changes;
         if (changes && typeof changes === 'object') {
-          if (callId) emittedPatchCallIds.add(callId);
           for (const [rawPath, change] of Object.entries(changes)) {
             if (change && typeof change === 'object') {
               emitFileEditFromChange(ts, callId, rawPath, change);

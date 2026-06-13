@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 
 import { createWhyEngine } from '../../src/why/engine.js';
 import { claudeCodeParser } from '../../src/parsers/claude-code.js';
+import { codexParser } from '../../src/parsers/codex.js';
 import type { GraphStore, GraphData, ProducedInfo, CommitNodeData } from '../../src/graph/types.js';
 import type { SessionNodeData, EditedEdgeData } from '../../src/graph/types.js';
 import type { LoreReportFileShape } from './helpers.js';
@@ -177,6 +178,55 @@ function writeTranscript(
   return transcriptPath;
 }
 
+function writeCodexTranscript(
+  dir: string,
+  sessionId: string,
+  cwd: string,
+  relFile: string,
+  userMsg: string,
+  assistantMsg: string,
+  oldLine: string,
+  newLine: string,
+): string {
+  const diff = [
+    '@@ -1,1 +1,1 @@',
+    '-' + oldLine,
+    '+' + newLine,
+  ].join('\n');
+  const lines = [
+    {
+      timestamp: '2026-06-01T11:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd, cli_version: '0.139.0' },
+    },
+    {
+      timestamp: '2026-06-01T11:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: userMsg },
+    },
+    {
+      timestamp: '2026-06-01T11:00:02.000Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', message: assistantMsg },
+    },
+    {
+      timestamp: '2026-06-01T11:00:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'patch_apply_end',
+        call_id: 'call_codex_why',
+        success: true,
+        changes: {
+          [relFile]: { type: 'update', unified_diff: diff },
+        },
+      },
+    },
+  ];
+  const transcriptPath = join(dir, `${sessionId}.jsonl`);
+  writeFileSync(transcriptPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+  return transcriptPath;
+}
+
 function writeReport(repoDir: string, report: LoreReportFileShape): void {
   const loreDir = join(repoDir, '.lore');
   mkdirSync(loreDir, { recursive: true });
@@ -285,6 +335,53 @@ describe('WhyEngine.why — full pipeline', () => {
     // anchors carry sessionId + seq
     expect(userExcerpt?.sessionId).toBe('sess-edit');
     expect(typeof userExcerpt?.seq).toBe('number');
+  });
+
+  it('traces a Codex candidate back to conversation excerpts when multiple parsers are available', async () => {
+    const repo = makeRepo();
+    const newLine = 'export const codexFlag = "new";';
+
+    writeRepoFile(repo, 'src/codex.ts', `${newLine}\n`);
+    const fullHash = commitAll(repo, 'feat: rename codex flag');
+
+    const transcript = writeCodexTranscript(
+      repo,
+      'sess-codex-why',
+      repo,
+      'src/codex.ts',
+      'Rename the Codex flag to the new value.',
+      'I will update the Codex flag now.',
+      'export const codexFlag = "old";',
+      newLine,
+    );
+    const parsed = await codexParser.parse(transcript);
+    const editEvent = parsed.session.events.find((e) => e.kind === 'file-edit')!;
+
+    writeReport(repo, {
+      matches: [
+        {
+          commitHash: fullHash,
+          filePath: 'src/codex.ts',
+          sessionId: 'sess-codex-why',
+          editSeqs: [editEvent.seq],
+          sourcePath: transcript,
+          matchedVia: 'content',
+          matchedLines: 3,
+          contentScore: 1,
+          timeScore: 1,
+          confidence: 0.94,
+          evidence: [],
+        },
+      ],
+    });
+
+    const engine = createWhyEngine(fakeStore({}), [claudeCodeParser, codexParser]);
+    const result = await engine.why(repo, 'src/codex.ts', 1);
+    expect(result.attributions).toHaveLength(1);
+    const attr = result.attributions[0]!;
+    expect(attr.produced.session.agent).toBe('codex');
+    expect(attr.excerpts.some((e) => e.text.includes('Codex flag'))).toBe(true);
+    expect(attr.excerpts.some((e) => e.sessionId === 'sess-codex-why')).toBe(true);
   });
 
   it('truncates excerpts to 400 characters', async () => {
