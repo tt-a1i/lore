@@ -14,6 +14,7 @@ import type { ParsedSession, FileEditEvent } from '../schema/events.js';
 import type { MatchEngine, MatchCandidate, RepoMatchReport } from './types.js';
 import { tierOf } from './types.js';
 import { SCHEMA_VERSION } from '../schema/events.js';
+import { prefixMatch } from '../util/text.js';
 
 /** 时钟容差：commit 时间之后仍允许编辑落入窗口（2 分钟）。 */
 const CLOCK_TOLERANCE_MS = 2 * 60 * 1000;
@@ -469,6 +470,11 @@ export class ContentTimeMatchEngine implements MatchEngine {
    * Tier-0 锚点：扫描每个 session 的 git-commit 事件，sha 前缀匹配 commits.hash。
    * 返回 commitHash -> (sessionId -> anchorTs[commit 事件时间])。
    * 同一 commit 被多 session 锚定时全部保留。
+   *
+   * 性能（之前是 O(sessions × events × commits) 三层循环）：
+   * 按 commit.hash 前 7 位建前缀桶（git 短 hash 默认 7 位，远小于 sha 抬升碰撞）。
+   * 一条 git-commit 事件只查 sha 前 7 位对应的桶——平均桶大小 = 总 commit 数 / 16⁷ ≈ 0
+   * （任何现实仓库），最坏情况下退化为短 hash 同前缀的极少数 commit。整体 O(events + commits)。
    */
   private computeAnchors(
     commits: CommitInfo[],
@@ -476,25 +482,44 @@ export class ContentTimeMatchEngine implements MatchEngine {
   ): { byCommit: Map<string, Map<string, { ts: number; sourcePath: string }>> } {
     const byCommit = new Map<string, Map<string, { ts: number; sourcePath: string }>>();
 
+    // 前缀桶：hash 前 7 字符 → 该前缀对应的全 hash 列表。
+    // 选 7 是因为 git 短 hash 默认 7；session 里 sha 不太可能比 7 短。
+    // sha 长度 < 7 的退化情形（极罕见）走兜底全扫——保正确性。
+    const PREFIX_LEN = 7;
+    const buckets = new Map<string, CommitInfo[]>();
+    for (const c of commits) {
+      const key = c.hash.slice(0, PREFIX_LEN).toLowerCase();
+      const arr = buckets.get(key);
+      if (arr) arr.push(c);
+      else buckets.set(key, [c]);
+    }
+
     for (const session of sessions) {
       for (const ev of session.events) {
         if (ev.kind !== 'git-commit') continue;
         const sha = ev.sha;
-        // 前缀匹配：commit.hash.startsWith(sha) 或 sha.startsWith(commit.hash)，
-        // 取较长者为准；通常 sha 是短 hash，commit.hash 是全 hash。
-        for (const commit of commits) {
-          if (prefixMatch(commit.hash, sha)) {
-            let m = byCommit.get(commit.hash);
-            if (!m) {
-              m = new Map();
-              byCommit.set(commit.hash, m);
-            }
-            const ts = parseTs(ev.ts);
-            const existing = m.get(session.meta.sessionId);
-            // 同 session 多个 commit 事件命中同一 commit：取最早的事件时间。
-            if (existing === undefined || ts < existing.ts) {
-              m.set(session.meta.sessionId, { ts, sourcePath: session.meta.sourcePath });
-            }
+        if (!sha) continue;
+
+        // 候选 commit 集：
+        //   sha 长度 ≥ 7 → 取 sha 前 7 位的桶（大概率桶里只有 1 个候选）。
+        //   sha 长度 < 7 → 退化全扫（极罕见——transcript 一般给 7+ 位）。
+        const candidates =
+          sha.length >= PREFIX_LEN
+            ? (buckets.get(sha.slice(0, PREFIX_LEN).toLowerCase()) ?? [])
+            : commits;
+
+        for (const commit of candidates) {
+          if (!prefixMatch(commit.hash, sha)) continue;
+          let m = byCommit.get(commit.hash);
+          if (!m) {
+            m = new Map();
+            byCommit.set(commit.hash, m);
+          }
+          const ts = parseTs(ev.ts);
+          const existing = m.get(session.meta.sessionId);
+          // 同 session 多个 commit 事件命中同一 commit：取最早的事件时间。
+          if (existing === undefined || ts < existing.ts) {
+            m.set(session.meta.sessionId, { ts, sourcePath: session.meta.sourcePath });
           }
         }
       }
@@ -577,14 +602,6 @@ export class ContentTimeMatchEngine implements MatchEngine {
     }
     return { added: normalizeLines(added), removed: normalizeLines(removed) };
   }
-}
-
-function prefixMatch(fullHash: string, sha: string): boolean {
-  if (!fullHash || !sha) return false;
-  const f = fullHash.toLowerCase();
-  const s = sha.toLowerCase();
-  // 任一为另一者前缀即视为命中（防御短/全 hash 双向）。
-  return f.startsWith(s) || s.startsWith(f);
 }
 
 function firstLine(message: string): string {

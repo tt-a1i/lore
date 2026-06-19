@@ -9,6 +9,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { BriefNote } from './types.js';
+import { execFileAsync } from '../util/exec.js';
 
 /**
  * 读 .lore/report.json 的 generatedAt（只取这一个字段）。
@@ -77,9 +78,6 @@ export async function readActiveNotes(repoPath: string): Promise<BriefNote[]> {
  */
 export async function readHeadTime(repoPath: string): Promise<string | null> {
   try {
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
-    const execFileAsync = promisify(execFile);
     const { stdout } = await execFileAsync(
       'git',
       ['-C', repoPath, 'log', '-1', '--format=%cI'],

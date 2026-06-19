@@ -488,6 +488,44 @@ describe('hook install/uninstall (subprocess)', () => {
       expect(cmdsOf(after, ev).filter((c) => c.includes('lore'))).toHaveLength(0);
     }
   }, 30_000);
+
+  it('built hook commands invoke the main dist/cli.js entry', async () => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const run = promisify(execFile);
+    const buildRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'lore-hook-built-'));
+    const distDir = path.join(buildRoot, 'dist');
+
+    try {
+      await fs.mkdir(distDir, { recursive: true });
+      await fs.writeFile(path.join(buildRoot, 'package.json'), '{"type":"module","version":"0.0.0"}\n', 'utf8');
+      await fs.symlink(path.join(process.cwd(), 'node_modules'), path.join(buildRoot, 'node_modules'), 'dir');
+
+      const tscBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsc');
+      await run(
+        tscBin,
+        ['-p', 'tsconfig.json', '--outDir', distDir, '--declaration', 'false', '--sourceMap', 'false'],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+
+      const repoPath = tmpDir;
+      await run(
+        process.execPath,
+        [path.join(distDir, 'cli.js'), 'hook', 'install', '--repo', repoPath],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+
+      const settingsPath = path.join(repoPath, '.claude', 'settings.json');
+      const data = await readSettingsAt(settingsPath) as ThreeHookSettings;
+      for (const ev of ['SessionStart', 'PreToolUse', 'Stop'] as const) {
+        const [cmd] = cmdsOf(data, ev);
+        expect(cmd).toContain('/dist/cli.js');
+        expect(cmd).not.toContain('/dist/cli/commands/memory.js');
+      }
+    } finally {
+      await fs.rm(buildRoot, { recursive: true, force: true });
+    }
+  }, 45_000);
 });
 
 // ── lore note --json output shape ─────────────────────────────────────────────
@@ -617,6 +655,53 @@ describe('lore status --json output shape', () => {
     expect(notes).toHaveProperty('active', 0);
     expect(notes).toHaveProperty('byKind');
     expect(notes).toHaveProperty('bySource');
+  }, 30_000);
+});
+
+// ── lore sample --json output shape ───────────────────────────────────────────
+
+describe('lore sample --json output shape', () => {
+  it('outputs an empty matches array when no report matches exist', async () => {
+    const repoPath = tmpDir;
+    const loreDir = path.join(repoPath, '.lore');
+    await fs.mkdir(loreDir, { recursive: true });
+    await fs.writeFile(
+      path.join(loreDir, 'report.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: new Date().toISOString(),
+        repoPath,
+        commitsTotal: 0,
+        commitsMatchedStrong: 0,
+        commitsMatchedWeak: 0,
+        commitsInWindow: 0,
+        strongInWindow: 0,
+        weakInWindow: 0,
+        sessionsSeen: 0,
+        matches: [],
+        sessionSourceMap: {},
+        skippedBySession: {},
+      }),
+      'utf8',
+    );
+
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const run = promisify(execFile);
+    const { stdout } = await run('npx', [
+      'tsx', 'src/cli.ts', 'sample',
+      '--repo', repoPath,
+      '-n', '1',
+      '--json',
+    ], {
+      cwd: '/Users/tushaokun/code/deltaDb',
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+
+    const parsed = JSON.parse(stdout) as { schemaVersion?: number; matches?: unknown[] };
+    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed.matches).toEqual([]);
   }, 30_000);
 });
 

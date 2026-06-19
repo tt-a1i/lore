@@ -308,6 +308,68 @@ describe('NotesStore.appendNote', () => {
     expect(titles).toEqual(['Concurrent note', 'Writer A note', 'Writer B note']);
   });
 
+  it('in-process concurrent appends: 50 parallel writes never lose a note', async () => {
+    // 回归 P0-1：之前 read-modify-write 之间没串行，并发 Promise.all 会丢笔记。
+    // 修复后进程内 mutex 应保证 N 次 append 全部落盘。
+    const repo = makeRepo();
+    const store = createNotesStore();
+    const N = 50;
+
+    const tasks: Promise<unknown>[] = [];
+    for (let i = 0; i < N; i++) {
+      tasks.push(
+        store.appendNote(repo, {
+          kind: 'decision',
+          title: `concurrent note ${i}`, // 每个唯一 title — 不会触发 dedup
+          body: `body ${i}`,
+          source: 'human', // human 来源不做 title 防重，所以全部都应是新 note
+        }),
+      );
+    }
+    const results = await Promise.all(tasks);
+    expect(results).toHaveLength(N);
+
+    const final = readNotes(repo);
+    expect(final.notes).toHaveLength(N);
+    const titles = new Set(final.notes.map((n) => n.title));
+    for (let i = 0; i < N; i++) {
+      expect(titles.has(`concurrent note ${i}`)).toBe(true);
+    }
+    // 所有 id 唯一（crypto 随机不该碰撞）
+    const ids = new Set(final.notes.map((n) => n.id));
+    expect(ids.size).toBe(N);
+  });
+
+  it('in-process concurrent agent dedup: same title only ever yields one note', async () => {
+    // agent 来源的 title 防重在并发下也必须成立——50 次并发同 title append
+    // 应该恰好落 1 条 note（其余都走 update-in-place）。
+    const repo = makeRepo();
+    const store = createNotesStore();
+    const N = 50;
+
+    const tasks: Promise<{ id: string; updated: boolean }>[] = [];
+    for (let i = 0; i < N; i++) {
+      tasks.push(
+        store.appendNote(repo, {
+          kind: 'decision',
+          title: 'singleton',
+          body: `body ${i}`,
+          source: 'agent',
+        }) as Promise<{ id: string; updated: boolean }>,
+      );
+    }
+    const results = await Promise.all(tasks);
+    // 第一个是新增，其余是 update。
+    const created = results.filter((r) => !r.updated);
+    const updated = results.filter((r) => r.updated);
+    expect(created).toHaveLength(1);
+    expect(updated).toHaveLength(N - 1);
+
+    const final = readNotes(repo);
+    expect(final.notes).toHaveLength(1);
+    expect(final.notes[0]!.title).toBe('singleton');
+  });
+
   it('preserves distilledSessions / distilledAt across an agent append', async () => {
     const repo = makeRepo();
     writeFileSync(

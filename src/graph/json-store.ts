@@ -152,7 +152,7 @@ export class JsonGraphStore implements GraphStore {
 
   async exportAll(): Promise<GraphData> {
     // Return a deep clone so callers can't mutate internal state
-    return JSON.parse(JSON.stringify(this.data)) as GraphData;
+    return structuredClone(this.data);
   }
 
   async close(): Promise<void> {

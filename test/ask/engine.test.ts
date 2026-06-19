@@ -56,10 +56,23 @@ function writeNotesJson(repoDir: string, notes: DistilledNote[]): void {
 function writeReportJson(
   repoDir: string,
   sessionSourceMap: Record<string, string>,
+  generatedAt = '2026-06-01T10:00:00.000Z',
 ): void {
   writeFileSync(
     join(repoDir, '.lore', 'report.json'),
-    JSON.stringify({ matches: [], sessionSourceMap }, null, 2),
+    JSON.stringify({ generatedAt, matches: [], sessionSourceMap }, null, 2),
+    'utf8',
+  );
+}
+
+function writeMessagesIndex(
+  repoDir: string,
+  entries: { sessionId: string; seq: number; text: string }[],
+  generatedAt = '2026-06-01T10:00:00.000Z',
+): void {
+  writeFileSync(
+    join(repoDir, '.lore', 'messages.json'),
+    JSON.stringify({ schemaVersion: 1, generatedAt, entries }, null, 2),
     'utf8',
   );
 }
@@ -522,6 +535,50 @@ describe('AskEngine.ask', () => {
     expect(topMsg.sessionId).toBe('sess-abc');
     expect(topMsg.text).toContain('graph store');
     expect(topMsg.score).toBeGreaterThan(0);
+  });
+
+  it('ignores a stale persisted messages index and falls back to current report transcripts', async () => {
+    const repo = makeRepo();
+    const transcriptPath = writeTranscript(repo, 'sess-current', [
+      'newtopic currenttranscript should be found from the live transcript.',
+    ]);
+    writeReportJson(
+      repo,
+      { 'sess-current': transcriptPath },
+      '2026-06-02T10:00:00.000Z',
+    );
+    writeMessagesIndex(
+      repo,
+      [{ sessionId: 'sess-old', seq: 1, text: 'oldtopic staleindex only' }],
+      '2026-06-01T10:00:00.000Z',
+    );
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'newtopic currenttranscript');
+
+    expect(result.messageHits.length).toBeGreaterThanOrEqual(1);
+    expect(result.messageHits[0]!.sessionId).toBe('sess-current');
+    expect(result.messageHits[0]!.text).toContain('newtopic currenttranscript');
+  });
+
+  it('uses a fresh persisted messages index without reparsing transcripts', async () => {
+    const repo = makeRepo();
+    writeReportJson(
+      repo,
+      { 'sess-ghost': '/nonexistent/path/to/transcript.jsonl' },
+      '2026-06-02T10:00:00.000Z',
+    );
+    writeMessagesIndex(
+      repo,
+      [{ sessionId: 'sess-index', seq: 1, text: 'freshindex persisted message' }],
+      '2026-06-02T10:00:01.000Z',
+    );
+
+    const engine = createAskEngine();
+    const result = await engine.ask(repo, 'freshindex persisted');
+
+    expect(result.messageHits.length).toBeGreaterThanOrEqual(1);
+    expect(result.messageHits[0]!.sessionId).toBe('sess-index');
   });
 
   it('extracts and scores normalized user messages from Codex transcripts', async () => {

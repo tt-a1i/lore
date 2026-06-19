@@ -34,6 +34,7 @@ import type {
   FileEditEvent,
   TranscriptParser,
 } from '../schema/events.js';
+import { truncate } from '../util/text.js';
 
 const NOTES_SCHEMA_VERSION = 1;
 
@@ -75,11 +76,7 @@ const DECISION_HINTS = [
   'note that',
 ];
 
-function truncate(s: string, max: number): string {
-  const t = s.trim();
-  if (t.length <= max) return t;
-  return t.slice(0, max - 1) + '…';
-}
+// truncate 已抽到 src/util/text.ts，本文件 import 使用以避免重复实现。
 
 /** 朴素前缀剥离（与 graph/build 的 normalizePath 同思路，无 cwd≠repo 的二级处理）。 */
 function normalizePath(rawPath: string, repoPath: string, cwd: string | null): string | null {

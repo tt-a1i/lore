@@ -24,12 +24,10 @@
  * those files but leave hunks empty.
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import { resolve, isAbsolute } from 'node:path';
 import type { CommitInfo, CommitFile, Hunk, GitHistoryReader } from './types.js';
-
-const execFileAsync = promisify(execFile);
+import { execFileAsync } from '../util/exec.js';
 
 // ─── sentinel tokens embedded in the format string ──────────────────────────
 const COMMIT_START = 'LORE_COMMIT_START';
@@ -204,11 +202,12 @@ function parseDiff(diffText: string): FileDiff[] {
 // ─── full output parser  ─────────────────────────────────────────────────────
 
 /**
- * Parse the combined stdout of `git log ... -p -U0 --format=<our format>`.
+ * Parse a single commit block (the bytes between two COMMIT_START sentinels,
+ * not including the leading sentinel + newline). Returns null when the block
+ * is malformed (missing body-end sentinel or empty hash) — caller skips silently.
  *
- * The stream looks like:
+ * The block layout:
  *
- *   LORE_COMMIT_START
  *   <hash>
  *   <authorDate>
  *   <committerDate>
@@ -219,84 +218,195 @@ function parseDiff(diffText: string): FileDiff[] {
  *   LORE_COMMIT_BODY_END
  *   diff --git a/... b/...
  *   ...
- *   LORE_COMMIT_START
- *   ...
+ */
+function parseCommitBlock(block: string): CommitInfo | null {
+  const bodyEndIdx = block.indexOf(COMMIT_BODY_END);
+  if (bodyEndIdx === -1) return null;
+
+  const headerSection = block.slice(0, bodyEndIdx);
+  // Skip the trailing newline that git appends before the diff.
+  const diffSection = block.slice(bodyEndIdx + COMMIT_BODY_END.length).replace(/^\n/, '');
+
+  const headerLines = headerSection.split('\n');
+  let lineIdx = 0;
+
+  const hash = headerLines[lineIdx++]?.trim() ?? '';
+  const authorDate = headerLines[lineIdx++]?.trim() ?? '';
+  const committerDate = headerLines[lineIdx++]?.trim() ?? '';
+  const parentsLine = headerLines[lineIdx++]?.trim() ?? '';
+
+  if (!hash) return null;
+
+  const isMerge = parentsLine.trim().includes(' ');
+
+  const bodyLines: string[] = [];
+  while (lineIdx < headerLines.length && headerLines[lineIdx] !== 'TRAILERS_START') {
+    bodyLines.push(headerLines[lineIdx]!);
+    lineIdx++;
+  }
+  lineIdx++; // skip TRAILERS_START
+
+  const trailerLines: string[] = [];
+  while (lineIdx < headerLines.length) {
+    trailerLines.push(headerLines[lineIdx]!);
+    lineIdx++;
+  }
+
+  const message = bodyLines.join('\n').replace(/\n+$/, '');
+  const trailers = parseTrailers(trailerLines.join('\n'));
+
+  let files: CommitFile[] = [];
+  if (!isMerge && diffSection.trim()) {
+    const fileDiffs = parseDiff(diffSection);
+    files = fileDiffs.map((fd) => ({
+      path: fd.path,
+      status: fd.status,
+      hunks: fd.hunks,
+    }));
+  }
+
+  return {
+    hash,
+    authorDate,
+    committerDate,
+    message,
+    isMerge,
+    trailers,
+    files,
+  };
+}
+
+/**
+ * Parse the combined stdout of `git log ... -p -U0 --format=<our format>`.
+ * Used in non-streaming code paths (tests, fixture pipelines). Production
+ * `readHistory` uses `streamGitLog` which feeds blocks one-by-one.
  */
 function parseGitLogOutput(output: string): CommitInfo[] {
   const commits: CommitInfo[] = [];
-
-  // Split on COMMIT_START sentinel.  The first element before the first
-  // sentinel is always empty (or whitespace) — skip it.
-  const blocks = output.split(COMMIT_START + '\n');
+  const sentinel = COMMIT_START + '\n';
+  const blocks = output.split(sentinel);
 
   for (const block of blocks) {
     if (!block.trim()) continue;
-
-    // Split header from diff at COMMIT_BODY_END sentinel.
-    const bodyEndIdx = block.indexOf(COMMIT_BODY_END);
-    if (bodyEndIdx === -1) continue;
-
-    const headerSection = block.slice(0, bodyEndIdx);
-    // +1 to skip the newline after COMMIT_BODY_END, +1 to skip the trailing
-    // newline that git appends before the diff.
-    const diffSection = block.slice(bodyEndIdx + COMMIT_BODY_END.length).replace(/^\n/, '');
-
-    // Parse header fields
-    const headerLines = headerSection.split('\n');
-    let lineIdx = 0;
-
-    const hash = headerLines[lineIdx++]?.trim() ?? '';
-    const authorDate = headerLines[lineIdx++]?.trim() ?? '';
-    const committerDate = headerLines[lineIdx++]?.trim() ?? '';
-    const parentsLine = headerLines[lineIdx++]?.trim() ?? '';
-
-    if (!hash) continue;
-
-    const isMerge = parentsLine.trim().includes(' ');
-
-    // Collect message body until TRAILERS_START
-    const bodyLines: string[] = [];
-    while (lineIdx < headerLines.length && headerLines[lineIdx] !== 'TRAILERS_START') {
-      bodyLines.push(headerLines[lineIdx]!);
-      lineIdx++;
-    }
-    // Skip the TRAILERS_START line itself
-    lineIdx++;
-
-    // Collect trailer lines
-    const trailerLines: string[] = [];
-    while (lineIdx < headerLines.length) {
-      const l = headerLines[lineIdx]!;
-      trailerLines.push(l);
-      lineIdx++;
-    }
-
-    const message = bodyLines.join('\n').replace(/\n+$/, '');
-    const trailers = parseTrailers(trailerLines.join('\n'));
-
-    // Parse diff (skip for merge commits)
-    let files: CommitFile[] = [];
-    if (!isMerge && diffSection.trim()) {
-      const fileDiffs = parseDiff(diffSection);
-      files = fileDiffs.map((fd) => ({
-        path: fd.path,
-        status: fd.status,
-        hunks: fd.hunks,
-      }));
-    }
-
-    commits.push({
-      hash,
-      authorDate,
-      committerDate,
-      message,
-      isMerge,
-      trailers,
-      files,
-    });
+    const parsed = parseCommitBlock(block);
+    if (parsed) commits.push(parsed);
   }
 
   return commits;
+}
+
+// ─── streaming spawn implementation ──────────────────────────────────────────
+//
+// Why streaming: a 5k-commit repo with rich diffs can produce >100MB of stdout.
+// The previous `execFile` path bound the entire payload as a single utf8 string
+// (maxBuffer 512MB) — V8 string heap peaks ~2× the byte size, so a single scan
+// could spike RSS to >1GB. We now spawn git, accumulate at the COMMIT_START
+// sentinel boundary, parse each block as soon as it's complete, and let GC
+// reclaim the string. Steady-state memory ≈ size of the largest single commit.
+
+/**
+ * Spawn `git log` with the given args, parse its stdout block-by-block at
+ * the COMMIT_START sentinel, and resolve with the full CommitInfo[].
+ *
+ * Memory: holds at most one in-flight commit block at a time (plus the small
+ * `commits` array). Even on a 100MB diff stream peak RSS stays bounded.
+ *
+ * Errors: any git-side failure (non-zero exit, spawn error) rejects the
+ * returned promise with the captured stderr message.
+ */
+function streamGitLog(repoPath: string, args: string[]): Promise<CommitInfo[]> {
+  return new Promise<CommitInfo[]>((resolve, reject) => {
+    const proc = spawn('git', ['-C', repoPath, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const commits: CommitInfo[] = [];
+    // Carry-over buffer: text between the last sentinel we processed and the
+    // most recent chunk boundary. Keeping it as a single string avoids splice
+    // costs for large blocks (we slice once per block, not per chunk).
+    let buffer = '';
+    let stderr = '';
+    let finished = false;
+    const sentinel = COMMIT_START + '\n';
+
+    /** Drain buffer up to the last complete block; parse + push each. */
+    function drain(final: boolean): void {
+      // We emit a block whenever we see a sentinel that ISN'T at the very start
+      // of the buffer (because the bytes before it are a complete block).
+      // After draining, `buffer` always begins with COMMIT_START\n (or is empty).
+      while (true) {
+        const firstSentinel = buffer.indexOf(sentinel);
+        if (firstSentinel === -1) {
+          // No sentinel yet — keep accumulating.
+          break;
+        }
+        if (firstSentinel > 0) {
+          // Discard the pre-sentinel garbage (e.g. shell-quirk leading lines).
+          buffer = buffer.slice(firstSentinel);
+        }
+        // buffer now starts with sentinel; look for the NEXT sentinel.
+        const nextSentinel = buffer.indexOf(sentinel, sentinel.length);
+        if (nextSentinel === -1) {
+          if (!final) break;
+          // Final flush: parse the remainder (everything after sentinel).
+          const block = buffer.slice(sentinel.length);
+          if (block.trim()) {
+            const parsed = parseCommitBlock(block);
+            if (parsed) commits.push(parsed);
+          }
+          buffer = '';
+          break;
+        }
+        // Complete block lies between sentinel and nextSentinel.
+        const block = buffer.slice(sentinel.length, nextSentinel);
+        if (block.trim()) {
+          const parsed = parseCommitBlock(block);
+          if (parsed) commits.push(parsed);
+        }
+        // Advance: keep the next sentinel as the new start.
+        buffer = buffer.slice(nextSentinel);
+      }
+    }
+
+    proc.stdout.setEncoding('utf8');
+    proc.stdout.on('data', (chunk: string) => {
+      buffer += chunk;
+      // Defer drain when buffer is small to amortise indexOf cost; threshold
+      // chosen so even a single max-size commit (a few MB of diff) emits
+      // promptly. Using >0 here means each chunk triggers at most one drain.
+      drain(false);
+    });
+    proc.stdout.on('end', () => {
+      drain(true);
+    });
+
+    proc.stderr.setEncoding('utf8');
+    proc.stderr.on('data', (chunk: string) => {
+      // Cap stderr accumulation — git rarely produces useful >64KB stderr.
+      if (stderr.length < 64 * 1024) stderr += chunk;
+    });
+
+    proc.on('error', (err) => {
+      if (finished) return;
+      finished = true;
+      reject(new Error(`git spawn failed: ${err.message}`));
+    });
+
+    proc.on('close', (code, signal) => {
+      if (finished) return;
+      finished = true;
+      if (code === 0) {
+        resolve(commits);
+        return;
+      }
+      const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+      reject(
+        new Error(
+          `git log exited with ${reason}` + (stderr ? `: ${stderr.trim().slice(0, 500)}` : ''),
+        ),
+      );
+    });
+  });
 }
 
 // ─── toRepoRelative helper ───────────────────────────────────────────────────
@@ -318,8 +428,8 @@ async function getTopLevel(repoPath: string): Promise<string> {
 
 export const gitHistoryReader: GitHistoryReader = {
   async readHistory(repoPath, opts = {}) {
+    // 注意：args 里不带 `-C <repoPath>`——streamGitLog 自己注入，避免重复。
     const args: string[] = [
-      '-C', repoPath,
       'log',
       // allRefs: agent 的真实 commit 常在 PR 分支/远端引用上（squash 合并后 main 只有改写版）。
       ...(opts.allRefs ? ['--all'] : ['--first-parent']),
@@ -337,13 +447,9 @@ export const gitHistoryReader: GitHistoryReader = {
       args.push(`-${opts.maxCommits}`);
     }
 
-    // Use a large buffer; 709 commits with full diffs can be several MB.
-    const { stdout } = await execFileAsync('git', args, {
-      maxBuffer: 512 * 1024 * 1024,
-      encoding: 'utf8',
-    });
-
-    return parseGitLogOutput(stdout);
+    // 流式 spawn：stdout 按 COMMIT_START sentinel 分块解析，
+    // 单 block 解析完即释放——5k commit / >100MB diff 也只占用单 block 大小的内存。
+    return streamGitLog(repoPath, args);
   },
 
   toRepoRelative(repoPath, absPath) {

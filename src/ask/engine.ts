@@ -21,6 +21,7 @@ import { encodeProjectPath } from '../parsers/claude-code.js';
 import type { AskEngine, AskResult, AskHit } from './types.js';
 import type { DistilledNote, NotesFile } from '../distill/types.js';
 import type { ParsedSession, TranscriptParser } from '../schema/events.js';
+import { loadMessagesIndex } from '../messages/index.js';
 
 // ── Tokenisation ──────────────────────────────────────────────────────────────
 
@@ -314,7 +315,16 @@ function scoreMessage(
 
 /** Minimal shape we need from .lore/report.json. */
 interface LoreReportShape {
+  generatedAt?: string;
   sessionSourceMap?: Record<string, string>;
+}
+
+function indexFreshEnough(indexGeneratedAt: string, reportGeneratedAt: string | null): boolean {
+  if (!reportGeneratedAt) return true;
+  const indexMs = Date.parse(indexGeneratedAt);
+  const reportMs = Date.parse(reportGeneratedAt);
+  if (Number.isNaN(indexMs) || Number.isNaN(reportMs)) return false;
+  return indexMs >= reportMs;
 }
 
 // ── User-message extraction from transcript ───────────────────────────────────
@@ -463,30 +473,41 @@ class DeterministicAskEngine implements AskEngine {
       return { question, hits: topNoteHits, messageHits: [] };
     }
 
-    // 5. Load report.json for sessionSourceMap.
+    // 5. Load report.json once for fallback and freshness validation.
+    //    A valid but stale .lore/messages.json must NOT shadow newer transcripts.
     const reportPath = path.join(repo, '.lore', 'report.json');
     let sessionSourceMap: Record<string, string> = {};
+    let reportGeneratedAt: string | null = null;
     try {
       const raw = await fs.readFile(reportPath, 'utf8');
       const report = JSON.parse(raw) as LoreReportShape;
       if (report.sessionSourceMap && typeof report.sessionSourceMap === 'object') {
         sessionSourceMap = report.sessionSourceMap;
       }
+      if (typeof report.generatedAt === 'string') {
+        reportGeneratedAt = report.generatedAt;
+      }
     } catch {
-      // report.json absent — no message index.
+      // report.json absent — no live fallback; persisted index may still be useful.
     }
 
-    // 6. Build message index from transcripts (concurrent reads).
-    //    Parse first, then filter by normalized session metadata/source path so
-    //    non-Claude agents whose transcript paths live outside the repo
-    //    (Codex/OpenCode) can still contribute messages when cwd belongs here.
-    const parsers = await loadTranscriptParsers();
-    const perSession = await Promise.all(
-      Object.entries(sessionSourceMap).map(([sid, srcPath]) =>
-        extractUserMessages(srcPath, sid, repo, parsers),
-      ),
-    );
-    const allMessages: MessageIndexEntry[] = perSession.flat();
+    // 6. Build message index. 优先用 scan 时物化的 .lore/messages.json
+    //    （单文件 read + 单次 JSON.parse），避免每次 ask 都重 parse 全部 transcript。
+    //    缺失 / 旧版 schema → 降级为实时 re-parse（保正确性，慢但能跑）。
+    let allMessages: MessageIndexEntry[];
+    const persistedIndex = await loadMessagesIndex(repo);
+    if (persistedIndex && indexFreshEnough(persistedIndex.generatedAt, reportGeneratedAt)) {
+      allMessages = persistedIndex.entries;
+    } else {
+      // Fallback: 老的实时 re-parse 路径（scan 没生成索引，或是个老仓库）。
+      const parsers = await loadTranscriptParsers();
+      const perSession = await Promise.all(
+        Object.entries(sessionSourceMap).map(([sid, srcPath]) =>
+          extractUserMessages(srcPath, sid, repo, parsers),
+        ),
+      );
+      allMessages = perSession.flat();
+    }
 
     // 7. Score messages. Drop sub-threshold (MIN_SCORE) noise so an unrelated
     //    query returns nothing rather than near-zero-score garbage.

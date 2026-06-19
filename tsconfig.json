@@ -9,7 +9,7 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "declaration": true,
-    "sourceMap": true,
+    "sourceMap": false,
     "skipLibCheck": true
   },
   "include": ["src/**/*"]

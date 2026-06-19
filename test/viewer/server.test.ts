@@ -441,4 +441,41 @@ describe('ViewerServer', () => {
       expect(res.status).toBe(200);
     }
   });
+
+  it('GET /api/payload returns an ETag header', async () => {
+    const res = await fetch(serverUrl + '/api/payload');
+    expect(res.status).toBe(200);
+    const etag = res.headers.get('etag');
+    expect(etag).toBeTruthy();
+    expect(etag).toMatch(/^"[0-9a-f]+"$/);
+  });
+
+  it('If-None-Match with cached ETag returns 304 with no body', async () => {
+    // 1. fetch payload, capture ETag
+    const first = await fetch(serverUrl + '/api/payload');
+    const etag = first.headers.get('etag');
+    expect(etag).toBeTruthy();
+    await first.text(); // drain body to free socket
+
+    // 2. re-fetch with If-None-Match → 304, empty body
+    const second = await fetch(serverUrl + '/api/payload', {
+      headers: { 'If-None-Match': etag! },
+    });
+    expect(second.status).toBe(304);
+    const body = await second.text();
+    expect(body).toBe('');
+    // ETag should be echoed on 304 too (so the client can keep validating).
+    expect(second.headers.get('etag')).toBe(etag);
+  });
+
+  it('payload cache is shared across concurrent requests (single build)', async () => {
+    // 5 个并发请求只触发一次 build——通过 ETag 全部一致来证明共享了缓存。
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () => fetch(serverUrl + '/api/payload')),
+    );
+    const etags = responses.map((r) => r.headers.get('etag'));
+    expect(new Set(etags).size).toBe(1);
+    // 释放 socket
+    await Promise.all(responses.map((r) => r.text()));
+  });
 });

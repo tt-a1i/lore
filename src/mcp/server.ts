@@ -19,8 +19,6 @@
  * or is older than the CLI freshness window.
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { existsSync } from 'node:fs';
@@ -32,8 +30,8 @@ import type { WhyEngine, WhyResult } from '../why/types.js';
 import type { AskEngine, AskResult } from '../ask/types.js';
 import type { GraphStore, SessionNodeData } from '../graph/types.js';
 import type { NotesStore, NotesFile, DistilledNote } from '../distill/types.js';
-
-const execFileAsync = promisify(execFile);
+import { execFileAsync } from '../util/exec.js';
+import { truncate } from '../util/text.js';
 
 /** Strong-tier floor: attributions at or above this confidence are "trustworthy". */
 const STRONG_FLOOR = 0.8;
@@ -62,12 +60,6 @@ function slimSession(session: SessionNodeData): {
 }
 
 // ── compact renderers (token-friendly, no ANSI, deterministic) ────────────────
-
-function truncate(s: string, max: number): string {
-  const t = s.trim();
-  if (t.length <= max) return t;
-  return t.slice(0, max - 1) + '…';
-}
 
 /** Collapse a multi-line excerpt body to a single line (newlines → spaces). */
 function foldLine(s: string): string {

@@ -20,8 +20,6 @@
  *   - GraphStore 经构造函数注入（不 import 具体实现），引擎可单测且不耦合存储后端。
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
@@ -37,8 +35,8 @@ import type {
 import type { MatchCandidate, RepoMatchReport } from '../match/types.js';
 import type { TranscriptParser, ParsedSession, LoreEvent } from '../schema/events.js';
 import { loadSnapshot, excerptsForCommit, type ExcerptsSnapshot } from '../excerpts/snapshot.js';
-
-const execFileAsync = promisify(execFile);
+import { execFileAsync } from '../util/exec.js';
+import { truncate, prefixMatch } from '../util/text.js';
 
 const EXCERPT_MAX = 400;
 const TOP_ATTRIBUTIONS = 3;
@@ -46,12 +44,6 @@ const TOP_ATTRIBUTIONS = 3;
 /** .lore/report.json 的形态（与 cli.ts 的 LoreReportFile 同构，仅取我们用到的字段）。 */
 interface LoreReportFile extends RepoMatchReport {
   sessionSourceMap?: Record<string, string>;
-}
-
-function truncate(s: string, max: number): string {
-  const t = s.trim();
-  if (t.length <= max) return t;
-  return t.slice(0, max - 1) + '…';
 }
 
 /** blame --porcelain 的首行：`<hash> <origLine> <finalLine> [<numLines>]`。 */
@@ -446,14 +438,6 @@ function normalizeRelFile(file: string): string {
   let f = file;
   if (f.startsWith('./')) f = f.slice(2);
   return f;
-}
-
-/** 双向前缀匹配（短 hash vs 全 hash）。 */
-function prefixMatch(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const x = a.toLowerCase();
-  const y = b.toLowerCase();
-  return x.startsWith(y) || y.startsWith(x);
 }
 
 /** 文件路径匹配：相等或一方是另一方的路径后缀（容忍 worktree 子目录差异）。 */

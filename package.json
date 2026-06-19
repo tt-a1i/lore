@@ -39,7 +39,7 @@
     "lore": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "test:kuzu": "tsx scripts/test-kuzu-store.mts",

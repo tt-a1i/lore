@@ -27,6 +27,7 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { randomBytes } from 'node:crypto';
 
 import type {
   NotesFile,
@@ -113,12 +114,16 @@ async function loadFile(repoPath: string): Promise<NotesFile> {
   }
 }
 
-/** 生成 agent/human 笔记的 id：`agent-<base36 时间戳>-<4位随机>`。 */
+/**
+ * 生成 agent/human 笔记的 id：`agent-<base36 时间戳>-<6位随机>`。
+ * 用 crypto.randomBytes 而非 Math.random：高并发下 Math.random 同毫秒 4 位随机
+ * 仍有 36⁻⁴≈6e-7 碰撞概率（一次 distill 几百条 note 时不容忽视），
+ * crypto 对应 16⁻⁶≈6e-8 且不可预测，几乎零成本。
+ */
 function allocAgentId(): string {
   const ts = Date.now().toString(36);
-  const rand = Math.floor(Math.random() * 36 ** 4)
-    .toString(36)
-    .padStart(4, '0');
+  // 3 字节 = 6 hex 字符，足够全局唯一且仍紧凑。
+  const rand = randomBytes(3).toString('hex');
   return `agent-${ts}-${rand}`;
 }
 
@@ -146,6 +151,120 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
   }
 }
 
+// ── 并发控制 ────────────────────────────────────────────────────────────────
+//
+// 多层防御：
+//   L1 进程内 mutex —— 同进程内 appendNote 按 repoPath 串行（最常见情形：
+//      MCP server / CLI / 蒸馏编排都跑在同一个 lore 进程里）。
+//   L2 跨进程 lockfile —— `.notes.json.lock` 用 O_EXCL（wx）独占创建；
+//      获不到等待并指数退避，超时则失败（绝不无锁写，避免 lost-update）。
+//   L3 mtime 校验 + 重试 —— read-modify-write 期间若文件 mtime 变了，
+//      说明别的进程刚写过，重读重做（读路径上的 last-writer-wins 防御）。
+//
+// 任一层单独不够：L1 抓不住跨进程；L2 lockfile 在 NFS / 强 kill 后会成僵尸锁；
+// L3 在 L1+L2 都失效时仍能保正确（代价是多一轮 IO）。
+
+const LOCK_FILENAME = '.notes.json.lock';
+const LOCK_STALE_MS = 5_000; // 锁文件超过 5s 视为僵尸（强 kill 残留）
+const LOCK_RETRY_BASE_MS = 10;
+const LOCK_RETRY_MAX_MS = 200;
+const LOCK_TOTAL_TIMEOUT_MS = 3_000; // 总等待超时——超过则失败，调用方可重试
+const APPEND_RETRY_LIMIT = 3;
+
+/** 进程内 mutex：repoPath → 当前正在 hold 的 promise 链尾。 */
+const _processMutex = new Map<string, Promise<unknown>>();
+
+/** 把 fn 排到 repoPath 的队尾，串行执行。返回 fn 的结果。 */
+async function withProcessMutex<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const prev = _processMutex.get(repoPath) ?? Promise.resolve();
+  // 不让前一个的失败传染下一个；用 .catch 吞掉，但当前 fn 自身错误正常抛。
+  const next = prev.then(fn, fn);
+  // 把"完成（无论成败）"的 promise 链给下一个等待者。
+  const tail = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  _processMutex.set(repoPath, tail);
+  try {
+    return await next;
+  } finally {
+    // 链尾若仍是当前 tail，清掉，避免内存常驻（Map 长期累积）。
+    if (_processMutex.get(repoPath) === tail) {
+      _processMutex.delete(repoPath);
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** O_EXCL 创建 lock 文件，返回 true=拿到锁，false=已被占。 */
+async function tryAcquireLockOnce(lockPath: string): Promise<boolean> {
+  try {
+    // 'wx' = O_WRONLY | O_CREAT | O_EXCL：已存在即失败。
+    const fh = await fs.open(lockPath, 'wx');
+    await fh.writeFile(`${process.pid}\n${Date.now()}\n`, 'utf8');
+    await fh.close();
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    // 目录不存在等错误：交给上层处理。
+    throw e;
+  }
+}
+
+/** 检查 lockfile 是否陈旧（pid 不存在或文件 mtime 太老），陈旧则清理。 */
+async function reapStaleLock(lockPath: string): Promise<void> {
+  try {
+    const st = await fs.stat(lockPath);
+    if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+      // 不验证 pid（kill -9 后 pid 复用；mtime 阈值更可靠）。
+      await fs.unlink(lockPath).catch(() => {});
+    }
+  } catch {
+    // ENOENT 等：锁已不在，无事。
+  }
+}
+
+/**
+ * 拿锁：指数退避重试，总超时后抛错。绝不无锁写——无锁写无法保证 read-modify-write 原子性，
+ * 会重新引入跨进程 lost-update。
+ * 返回 release 函数。
+ */
+async function acquireLock(repoPath: string): Promise<() => Promise<void>> {
+  const dir = path.join(path.resolve(repoPath), '.lore');
+  await fs.mkdir(dir, { recursive: true });
+  const lockPath = path.join(dir, LOCK_FILENAME);
+
+  const start = Date.now();
+  let delay = LOCK_RETRY_BASE_MS;
+
+  while (Date.now() - start < LOCK_TOTAL_TIMEOUT_MS) {
+    if (await tryAcquireLockOnce(lockPath)) {
+      return async () => {
+        await fs.unlink(lockPath).catch(() => {});
+      };
+    }
+    // 失败：清陈旧锁 + 退避。
+    await reapStaleLock(lockPath);
+    await sleep(delay + Math.floor(Math.random() * delay)); // jitter
+    delay = Math.min(delay * 2, LOCK_RETRY_MAX_MS);
+  }
+
+  throw new Error(`notes.json lock timeout after ${LOCK_TOTAL_TIMEOUT_MS}ms (${lockPath})`);
+}
+
+/** 读 mtime；不存在返回 0（表示"刚被创建"，下次读到非 0 即视为变化）。 */
+async function readMtime(filePath: string): Promise<number> {
+  try {
+    const st = await fs.stat(filePath);
+    return st.mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 class JsonNotesStore implements NotesStore {
   async load(repoPath: string): Promise<NotesFile> {
     return loadFile(repoPath);
@@ -162,70 +281,134 @@ class JsonNotesStore implements NotesStore {
       supersedes?: string;
     },
   ): Promise<{ id: string; updated: boolean; superseded: string | null }> {
-    // 写前重读：在最新磁盘内容上施加变更（并发安全的核心）。两个并发 append 各自重读 →
-    // 后写者看到前写者已落盘的 note，再原子写覆盖；先写者的 note 不丢（它已在磁盘上，
-    // 被后写者读入并保留）。前提：append 不修改别人的 note（除非显式 supersedes）。
-    const file = await loadFile(repoPath);
+    // L1 进程内串行 + L2/L3 跨进程防御。
+    return withProcessMutex(path.resolve(repoPath), () => this._appendLocked(repoPath, note));
+  }
 
-    const now = new Date().toISOString();
-    const title = note.title;
-    const files = note.files ?? [];
+  /** 实际的 read-modify-write，带跨进程锁 + mtime 重试。 */
+  private async _appendLocked(
+    repoPath: string,
+    note: {
+      kind: NoteKind;
+      title: string;
+      body: string;
+      files?: string[];
+      source: 'agent' | 'human';
+      supersedes?: string;
+    },
+  ): Promise<{ id: string; updated: boolean; superseded: string | null }> {
+    const notesPath = notesPathFor(repoPath);
 
-    let resultId: string;
-    let updated = false;
-    let superseded: string | null = null;
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < APPEND_RETRY_LIMIT; attempt++) {
+      const release = await acquireLock(repoPath);
+      try {
+        const mtimeBefore = await readMtime(notesPath);
+        const file = await loadFile(repoPath);
 
-    // 1. 防重：同 source='agent' 且 title 完全相同且 invalidAt===null → 更新而非追加。
-    //    （human 来源不做 title 防重：人工录入可能有意重复标题。契约只规定 agent 防重。）
-    const dup =
-      note.source === 'agent'
-        ? file.notes.find(
-            (n) => n.source === 'agent' && n.invalidAt === null && n.title === title,
-          )
-        : undefined;
+        // 拿锁后再读 mtime 一次；若与 loadFile 之间被改写（极少见，锁未拿到时的兜底窗口），
+        // 走重试路径。
+        const mtimeAfterLoad = await readMtime(notesPath);
+        if (mtimeAfterLoad !== mtimeBefore) {
+          // 数据竞争：重试。
+          lastErr = new Error('notes.json mtime changed during load — retrying');
+          continue;
+        }
 
-    if (dup) {
-      dup.body = note.body;
-      dup.files = files;
-      resultId = dup.id;
-      updated = true;
-    } else {
-      const id = allocAgentId();
-      const newNote: DistilledNote = {
-        id,
-        kind: note.kind,
-        title,
-        body: note.body,
-        files,
-        anchors: [],
-        sessionId: '',
-        validAt: now,
-        invalidAt: null,
-        supersededBy: null,
-        source: note.source,
-      };
-      file.notes.push(newNote);
-      resultId = id;
-    }
+        const result = applyAppend(file, note);
 
-    // 2. supersedes：给目标旧 note（仍有效者）打 invalidAt + supersededBy。
-    if (note.supersedes) {
-      const target = file.notes.find(
-        (n) => n.id === note.supersedes && n.invalidAt === null,
-      );
-      if (target && target.id !== resultId) {
-        target.invalidAt = now;
-        target.supersededBy = resultId;
-        superseded = target.id;
+        // 写前最后一次 mtime 校验（双保险）：拿锁失败的并发写者可能刚抢先写过。
+        const mtimeBeforeWrite = await readMtime(notesPath);
+        if (mtimeBeforeWrite !== mtimeAfterLoad) {
+          lastErr = new Error('notes.json mtime changed before write — retrying');
+          continue;
+        }
+
+        await atomicWrite(notesPath, JSON.stringify(file, null, 2) + '\n');
+        return result;
+      } finally {
+        await release();
       }
     }
 
-    // 3. 原子落盘（保留蒸馏字段 schemaVersion / distilledSessions / distilledAt）。
-    file.schemaVersion = NOTES_SCHEMA_VERSION;
-    await atomicWrite(notesPathFor(repoPath), JSON.stringify(file, null, 2) + '\n');
-
-    return { id: resultId, updated, superseded };
+    throw new Error(
+      `notes.json: failed to write after ${APPEND_RETRY_LIMIT} attempts due to concurrent contention (${String(lastErr)})`,
+    );
   }
+}
+
+/**
+ * 纯函数：把一个 append 应用到 NotesFile（防重 + supersede + 新增）。
+ * 抽出来便于单测，也让重试路径可重复执行（不带副作用直到 atomicWrite）。
+ */
+function applyAppend(
+  file: NotesFile,
+  note: {
+    kind: NoteKind;
+    title: string;
+    body: string;
+    files?: string[];
+    source: 'agent' | 'human';
+    supersedes?: string;
+  },
+): { id: string; updated: boolean; superseded: string | null } {
+  const now = new Date().toISOString();
+  const title = note.title;
+  const files = note.files ?? [];
+
+  let resultId: string;
+  let updated = false;
+  let superseded: string | null = null;
+
+  // 1. 防重：同 source='agent' 且 title 完全相同且 invalidAt===null → 更新而非追加。
+  //    （human 来源不做 title 防重：人工录入可能有意重复标题。契约只规定 agent 防重。）
+  const dup =
+    note.source === 'agent'
+      ? file.notes.find(
+          (n) => n.source === 'agent' && n.invalidAt === null && n.title === title,
+        )
+      : undefined;
+
+  if (dup) {
+    dup.body = note.body;
+    dup.files = files;
+    resultId = dup.id;
+    updated = true;
+  } else {
+    const id = allocAgentId();
+    const newNote: DistilledNote = {
+      id,
+      kind: note.kind,
+      title,
+      body: note.body,
+      files,
+      anchors: [],
+      sessionId: '',
+      validAt: now,
+      invalidAt: null,
+      supersededBy: null,
+      source: note.source,
+    };
+    file.notes.push(newNote);
+    resultId = id;
+  }
+
+  // 2. supersedes：给目标旧 note（仍有效者）打 invalidAt + supersededBy。
+  if (note.supersedes) {
+    const target = file.notes.find(
+      (n) => n.id === note.supersedes && n.invalidAt === null,
+    );
+    if (target && target.id !== resultId) {
+      target.invalidAt = now;
+      target.supersededBy = resultId;
+      superseded = target.id;
+    }
+  }
+
+  // 3. schemaVersion 维持（保留蒸馏字段 distilledSessions / distilledAt）。
+  file.schemaVersion = NOTES_SCHEMA_VERSION;
+
+  return { id: resultId, updated, superseded };
 }
 
 /** 共享单例 —— 无状态，安全复用（cli.ts 通过 `mod.notesStore` 取用）。 */
